@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/oxcode-cli",
+]
+resolver = "3"
+
+[workspace.package]
+authors = ["oxcode contributors"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/oxcode/oxcode"
+rust-version = "1.95"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+assert_cmd = "2.0.18"
+clap = { version = "4.5.53", features = ["derive"] }
+ignore = "0.4.25"
+oxgraph = { path = "/Users/snowmead/opt/oxgraph/crates/oxgraph", features = ["db"] }
+predicates = "3.1.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tree-sitter-language-pack = "1.8.1"
