@@ -1,0 +1,16 @@
+[package]
+name = "oxcode-model"
+version = "0.1.0"
+description = "Storage-neutral code graph model types for oxcode."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

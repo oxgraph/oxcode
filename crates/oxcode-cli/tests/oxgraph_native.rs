@@ -1,9 +1,9 @@
 use std::{fs, path::Path};
 
-use oxcode::{
-    GraphDirection, IndexStats, call_graph, describe_symbol, expand_query_result, query_project,
+use oxcode_core::{
+    GraphDirection, IndexStats, OxElementId, OxQueryLanguage, OxQueryResult, OxQueryValue,
+    call_graph, describe_symbol, expand_query_result, query_project,
 };
-use oxgraph::db::{ElementId, QueryLanguage, QueryValue};
 use tempfile::TempDir;
 
 #[test]
@@ -11,14 +11,14 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
     let temp = rust_project();
     seed_legacy_outputs(temp.path());
 
-    let stats = oxcode::index_project(temp.path()).expect("index project");
+    let stats = oxcode_core::index_project(temp.path()).expect("index project");
     assert_index_stats(&stats);
     assert!(temp.path().join(".oxcode/index.oxgdb/store.oxgdb").exists());
     assert!(!temp.path().join(".oxcode/index.sqlite").exists());
     assert!(!temp.path().join(".oxcode/forward.oxgsnap").exists());
     assert!(!temp.path().join(".oxcode/reverse.oxgsnap").exists());
 
-    let all = query_project(temp.path(), QueryLanguage::Oxql, "MATCH ELEMENTS").expect("all");
+    let all = query_project(temp.path(), OxQueryLanguage::Oxql, "MATCH ELEMENTS").expect("all");
     assert!(all.rows().len() >= 3);
 
     let entry = single_element_query(temp.path(), "MATCH ELEMENTS WHERE qualified_name = 'entry'");
@@ -29,7 +29,7 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
 
     let functions = query_project(
         temp.path(),
-        QueryLanguage::Oxql,
+        OxQueryLanguage::Oxql,
         "MATCH ELEMENTS WHERE kind = 'function'",
     )
     .expect("functions");
@@ -37,7 +37,7 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
 
     let outgoing = query_project(
         temp.path(),
-        QueryLanguage::Oxql,
+        OxQueryLanguage::Oxql,
         &format!("GRAPH calls WALK FROM {} DEPTH 1", entry.get()),
     )
     .expect("outgoing");
@@ -45,7 +45,7 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
 
     let incoming = query_project(
         temp.path(),
-        QueryLanguage::Oxql,
+        OxQueryLanguage::Oxql,
         &format!(
             "GRAPH calls WALK FROM {} DEPTH 1 DIRECTION incoming",
             helper.get()
@@ -84,7 +84,7 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
 
     let call_relations = query_project(
         temp.path(),
-        QueryLanguage::Oxql,
+        OxQueryLanguage::Oxql,
         "MATCH RELATIONS TYPE calls",
     )
     .expect("call relations");
@@ -115,19 +115,19 @@ fn assert_index_stats(stats: &IndexStats) {
     assert_eq!(stats.skipped_unsupported_files, 0);
 }
 
-fn single_element_query(root: &Path, query: &str) -> ElementId {
-    let result = query_project(root, QueryLanguage::Oxql, query).expect("query");
+fn single_element_query(root: &Path, query: &str) -> OxElementId {
+    let result = query_project(root, OxQueryLanguage::Oxql, query).expect("query");
     let rows = element_rows(&result);
     assert_eq!(rows.len(), 1, "{query} returned {rows:?}");
     rows[0]
 }
 
-fn element_rows(result: &oxgraph::db::QueryResult) -> Vec<ElementId> {
+fn element_rows(result: &OxQueryResult) -> Vec<OxElementId> {
     result
         .rows()
         .iter()
         .filter_map(|row| match row.values.as_slice() {
-            [QueryValue::Element(id)] => Some(*id),
+            [OxQueryValue::Element(id)] => Some(*id),
             _ => None,
         })
         .collect()

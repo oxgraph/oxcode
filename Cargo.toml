@@ -1,5 +1,7 @@
 [workspace]
 members = [
+  "crates/oxcode-core",
+  "crates/oxcode-model",
   "crates/oxcode-cli",
 ]
 resolver = "3"

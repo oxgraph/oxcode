@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use oxcode::{
-    Error, GraphDirection, call_graph, describe_symbol, expand_query_result, explain_project,
-    format_call_graph_report, format_expanded_query_report, format_query_value,
+use oxcode_core::{
+    Error, GraphDirection, OxQueryResult, ProjectIndex, call_graph, describe_symbol,
+    explain_project, format_call_graph_report, format_expanded_query_report, format_query_value,
     format_selector_matches, format_symbol_report, index_project, language_support,
     parse_graph_direction, parse_query_language, project_status, query_project,
 };
@@ -225,14 +225,16 @@ fn run() -> Result<()> {
             expand,
         } => {
             let language = parse_query_language(&language).map_err(anyhow::Error::msg)?;
-            let rows = query_project(path.clone(), language, &query)
-                .with_context(|| format!("executing query {query:?}"))?;
             if expand {
-                let report = expand_query_result(path, rows)?;
+                let report = ProjectIndex::open(path)?.query_expanded(language, &query)?;
                 println!("{}", format_expanded_query_report(&report));
             } else if table {
+                let rows = query_project(path, language, &query)
+                    .with_context(|| format!("executing query {query:?}"))?;
                 print_query_table(&rows);
             } else {
+                let rows = query_project(path, language, &query)
+                    .with_context(|| format!("executing query {query:?}"))?;
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             }
         }
@@ -322,7 +324,7 @@ fn print_call_graph(
 }
 
 /// Prints one compact query table.
-fn print_query_table(result: &oxgraph::db::QueryResult) {
+fn print_query_table(result: &OxQueryResult) {
     for row in result.rows() {
         let values = row
             .values

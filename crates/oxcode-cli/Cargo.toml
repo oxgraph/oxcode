@@ -12,13 +12,8 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-ignore.workspace = true
-oxgraph.workspace = true
-serde.workspace = true
+oxcode-core = { path = "../oxcode-core" }
 serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-tree-sitter-language-pack.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

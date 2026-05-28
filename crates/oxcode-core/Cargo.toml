@@ -1,0 +1,18 @@
+[package]
+name = "oxcode-core"
+version = "0.1.0"
+description = "OxGraph-native code indexing and navigation engine."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ignore.workspace = true
+oxcode-model = { path = "../oxcode-model" }
+oxgraph.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tree-sitter-language-pack.workspace = true
