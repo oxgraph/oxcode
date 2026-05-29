@@ -30,15 +30,17 @@ pub(crate) fn normalize_path(path: &Path) -> String {
         .join("/")
 }
 
+/// Directory names skipped during source discovery (generated, dependency,
+/// VCS, and the index store itself).
+pub(crate) const SKIP_DIR_NAMES: &[&str] =
+    &[".git", INDEX_DIR, "target", "node_modules", "vendor"];
+
 /// Skips generated, dependency, VCS, and index storage paths.
 pub(crate) fn should_skip_path(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
     relative.components().any(|component| {
         let part = component.as_os_str().to_string_lossy();
-        matches!(
-            part.as_ref(),
-            ".git" | ".oxcode" | "target" | "node_modules" | "vendor"
-        )
+        SKIP_DIR_NAMES.contains(&part.as_ref())
     })
 }
 use std::path::{Path, PathBuf};

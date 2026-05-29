@@ -39,17 +39,9 @@ pub(crate) fn discover_source_files(root: &Path) -> Vec<SourceFile> {
         }
         files.push(SourceFile {
             path: path.to_path_buf(),
-            recognized_unsupported: is_recognized_unsupported_source(path),
+            recognized_unsupported: crate::extract::is_recognized_unsupported(path),
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     files
-}
-
-/// Returns whether a file extension is known source text but lacks an extractor.
-fn is_recognized_unsupported_source(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some("ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "h" | "cpp")
-    )
 }

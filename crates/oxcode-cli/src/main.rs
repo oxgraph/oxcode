@@ -3,12 +3,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use oxcode_core::{
-    Error, GraphDirection, OxQueryResult, ProjectIndex, call_graph, describe_symbol,
-    explain_project, format_call_graph_report, format_expanded_query_report, format_query_value,
-    format_selector_matches, format_symbol_report, index_project, language_support,
-    parse_graph_direction, parse_query_language, project_status, query_project,
+    Error, GraphDirection, OxQueryLanguage, OxQueryResult, ProjectIndex, format_call_graph_report,
+    format_expanded_query_report, format_query_value, format_selector_matches,
+    format_symbol_report, index_project, language_support, project_status,
 };
 
 /// Generate and query code graphs stored in a native OxGraph database.
@@ -20,26 +19,96 @@ struct Cli {
     command: Command,
 }
 
+/// Project root, shared by every command via `--path`.
+#[derive(Debug, Args)]
+struct PathArg {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
+}
+
+/// Arguments shared by commands that take a root and a JSON toggle.
+#[derive(Debug, Args)]
+struct CommonArgs {
+    #[command(flatten)]
+    path: PathArg,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments shared by the call-graph walk commands.
+#[derive(Debug, Args)]
+struct WalkArgs {
+    /// Selector: element:<id>, name:<name>, file:<path>:<line>, or a qualified name.
+    selector: String,
+    /// Maximum hop depth.
+    #[arg(long, default_value_t = 1)]
+    depth: usize,
+    /// Maximum discovered symbol count.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+/// Query language accepted by `query`/`explain`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum QueryLang {
+    Oxql,
+    Cypher,
+}
+
+impl QueryLang {
+    const fn into_language(self) -> OxQueryLanguage {
+        match self {
+            Self::Oxql => OxQueryLanguage::Oxql,
+            Self::Cypher => OxQueryLanguage::Cypher,
+        }
+    }
+}
+
+/// Output format for `query`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    /// Pretty JSON of the raw result rows.
+    Json,
+    /// Tab-separated compact rows.
+    Table,
+    /// Expand OxGraph IDs into agent-readable code context.
+    Expand,
+}
+
+/// Traversal direction for `walk`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Direction {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+impl Direction {
+    const fn into_graph(self) -> GraphDirection {
+        match self {
+            Self::Outgoing => GraphDirection::Outgoing,
+            Self::Incoming => GraphDirection::Incoming,
+            Self::Both => GraphDirection::Both,
+        }
+    }
+}
+
 /// CLI commands.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Rebuild the project index.
     Index {
-        /// Project root.
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        common: CommonArgs,
     },
     /// Show native OxGraph database status.
     Status {
-        /// Project root.
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        common: CommonArgs,
     },
     /// Show languages with explicit extractors.
     Languages {
@@ -51,94 +120,49 @@ enum Command {
     Query {
         /// Query text.
         query: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Query language: oxql or cypher.
-        #[arg(long, default_value = "oxql")]
-        language: String,
-        /// Print a compact table instead of JSON.
-        #[arg(long)]
-        table: bool,
-        /// Expand OxGraph IDs into agent-readable code context.
-        #[arg(long)]
-        expand: bool,
+        #[command(flatten)]
+        path: PathArg,
+        /// Query language.
+        #[arg(long, value_enum, default_value_t = QueryLang::Oxql)]
+        language: QueryLang,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
     },
     /// Describe one symbol selector.
     Symbol {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
+        /// Selector: element:<id>, name:<name>, file:<path>:<line>, or a qualified name.
         selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        common: CommonArgs,
     },
     /// Show functions called by one symbol.
     Calls {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
-        selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Maximum hop depth.
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
-        /// Maximum discovered symbol count.
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: WalkArgs,
     },
     /// Show functions that call one symbol.
     Callers {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
-        selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Maximum hop depth.
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
-        /// Maximum discovered symbol count.
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: WalkArgs,
     },
     /// Walk the calls graph from one symbol.
     Walk {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
-        selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Traversal direction: outgoing, incoming, or both.
-        #[arg(long, default_value = "outgoing")]
-        direction: String,
-        /// Maximum hop depth.
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
-        /// Maximum discovered symbol count.
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: WalkArgs,
+        /// Traversal direction.
+        #[arg(long, value_enum, default_value_t = Direction::Outgoing)]
+        direction: Direction,
     },
     /// Explain an OxGraph database query plan.
     Explain {
         /// Query text.
         query: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Query language: oxql or cypher.
-        #[arg(long, default_value = "oxql")]
-        language: String,
+        #[command(flatten)]
+        path: PathArg,
+        /// Query language.
+        #[arg(long, value_enum, default_value_t = QueryLang::Oxql)]
+        language: QueryLang,
     },
 }
 
@@ -159,9 +183,9 @@ fn main() -> Result<()> {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Index { path, json } => {
-            let stats = index_project(path)?;
-            if json {
+        Command::Index { common } => {
+            let stats = index_project(&common.path.path)?;
+            if common.json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
                 println!(
@@ -175,11 +199,17 @@ fn run() -> Result<()> {
                         stats.skipped_unsupported_files
                     );
                 }
+                if stats.failed_files > 0 {
+                    println!("failed to index {} files", stats.failed_files);
+                }
+                if stats.partial_files > 0 {
+                    println!("{} files parsed with recoverable errors", stats.partial_files);
+                }
             }
         }
-        Command::Status { path, json } => {
-            let status = project_status(path)?;
-            if json {
+        Command::Status { common } => {
+            let status = project_status(&common.path.path)?;
+            if common.json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 println!("root {}", status.root.display());
@@ -221,101 +251,61 @@ fn run() -> Result<()> {
             query,
             path,
             language,
-            table,
-            expand,
+            format,
         } => {
-            let language = parse_query_language(&language).map_err(anyhow::Error::msg)?;
-            if expand {
-                let report = ProjectIndex::open(path)?.query_expanded(language, &query)?;
-                println!("{}", format_expanded_query_report(&report));
-            } else if table {
-                let rows = query_project(path, language, &query)
-                    .with_context(|| format!("executing query {query:?}"))?;
-                print_query_table(&rows);
-            } else {
-                let rows = query_project(path, language, &query)
-                    .with_context(|| format!("executing query {query:?}"))?;
-                println!("{}", serde_json::to_string_pretty(&rows)?);
+            let index = ProjectIndex::open(&path.path)?;
+            let language = language.into_language();
+            match format {
+                OutputFormat::Expand => {
+                    let report = index.query_expanded(language, &query)?;
+                    println!("{}", format_expanded_query_report(&report));
+                }
+                OutputFormat::Table => {
+                    let rows = index
+                        .query(language, &query)
+                        .with_context(|| format!("executing query {query:?}"))?;
+                    print_query_table(&rows);
+                }
+                OutputFormat::Json => {
+                    let rows = index
+                        .query(language, &query)
+                        .with_context(|| format!("executing query {query:?}"))?;
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
             }
         }
-        Command::Symbol {
-            selector,
-            path,
-            json,
-        } => {
-            let report = describe_symbol(path, &selector)?;
-            if json {
+        Command::Symbol { selector, common } => {
+            let report = ProjectIndex::open(&common.path.path)?.describe_symbol(&selector)?;
+            if common.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", format_symbol_report(&report));
             }
         }
-        Command::Calls {
-            selector,
-            path,
-            depth,
-            limit,
-            json,
-        } => {
-            print_call_graph(
-                path,
-                &selector,
-                GraphDirection::Outgoing,
-                depth,
-                limit,
-                json,
-            )?;
-        }
-        Command::Callers {
-            selector,
-            path,
-            depth,
-            limit,
-            json,
-        } => {
-            print_call_graph(
-                path,
-                &selector,
-                GraphDirection::Incoming,
-                depth,
-                limit,
-                json,
-            )?;
-        }
-        Command::Walk {
-            selector,
-            path,
-            direction,
-            depth,
-            limit,
-            json,
-        } => {
-            let direction = parse_graph_direction(&direction).map_err(anyhow::Error::msg)?;
-            print_call_graph(path, &selector, direction, depth, limit, json)?;
-        }
+        Command::Calls { args } => print_call_graph(&args, GraphDirection::Outgoing)?,
+        Command::Callers { args } => print_call_graph(&args, GraphDirection::Incoming)?,
+        Command::Walk { args, direction } => print_call_graph(&args, direction.into_graph())?,
         Command::Explain {
             query,
             path,
             language,
         } => {
-            let language = parse_query_language(&language).map_err(anyhow::Error::msg)?;
-            println!("{}", explain_project(path, language, &query)?);
+            let report = ProjectIndex::open(&path.path)?.explain(language.into_language(), &query)?;
+            println!("{report}");
         }
     }
     Ok(())
 }
 
-/// Prints one call graph report.
-fn print_call_graph(
-    path: PathBuf,
-    selector: &str,
-    direction: GraphDirection,
-    depth: usize,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let report = call_graph(path, selector, direction, depth, limit)?;
-    if json {
+/// Prints one call graph report for a walk command.
+fn print_call_graph(args: &WalkArgs, direction: GraphDirection) -> Result<()> {
+    let report = ProjectIndex::open(&args.common.path.path)?.call_graph(
+        &args.selector,
+        direction,
+        args.depth,
+        args.limit,
+    )?;
+    if args.common.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", format_call_graph_report(&report));
