@@ -34,7 +34,11 @@ pub struct SelectorParseError {
 
 impl core::fmt::Display for SelectorParseError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "invalid selector {:?}: {}", self.input, self.reason)
+        write!(
+            formatter,
+            "invalid selector {:?}: {}",
+            self.input, self.reason
+        )
     }
 }
 

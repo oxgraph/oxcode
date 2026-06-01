@@ -14,9 +14,8 @@ use tree_sitter_language_pack::{Node, Tree};
 use crate::{
     error::{Error, Result},
     extract::{
-        cargo,
+        ExtractionInput, LanguageExtractor, cargo,
         cst::{field, named_children, node_text, span},
-        ExtractionInput, LanguageExtractor,
     },
 };
 
@@ -39,7 +38,12 @@ impl LanguageExtractor for RustExtractor {
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction> {
         let scope = cargo::crate_module_scope(input.path, &input.relative_path);
         let tree = parse_rust(input.path, &input.source)?;
-        Ok(extract_rust(&input.relative_path, &scope, &input.source, &tree))
+        Ok(extract_rust(
+            &input.relative_path,
+            &scope,
+            &input.source,
+            &tree,
+        ))
     }
 }
 
@@ -63,7 +67,12 @@ fn parse_rust(path: &Path, source: &[u8]) -> Result<Tree> {
 ///
 /// `base_scope` is the crate-qualified module scope (`[crate, ..modules]`) that
 /// every qualified name in this file is anchored to.
-fn extract_rust(relative_path: &str, base_scope: &[String], source: &[u8], tree: &Tree) -> Extraction {
+fn extract_rust(
+    relative_path: &str,
+    base_scope: &[String],
+    source: &[u8],
+    tree: &Tree,
+) -> Extraction {
     let relative = relative_path.to_string();
     let file_key = format!("file:{relative}");
     let language = rust_language();
@@ -89,7 +98,15 @@ fn extract_rust(relative_path: &str, base_scope: &[String], source: &[u8], tree:
         references: Vec::new(),
     };
 
-    walker.visit_children(&root, &file_key, &file_key, base_scope, None);
+    walker.visit_children(
+        &root,
+        VisitContext {
+            parent_key: &file_key,
+            owner_key: &file_key,
+            scope: base_scope,
+            owner_type: None,
+        },
+    );
 
     let parse_status = if root.has_error() {
         FileParseStatus::Partial
@@ -116,203 +133,265 @@ struct RustWalker<'source> {
     references: Vec<UnresolvedReference>,
 }
 
+/// Traversal state threaded through the walker: the containing symbol
+/// (`parent_key`), the symbol that calls and references are attributed to
+/// (`owner_key`), the module `scope`, and the enclosing impl/trait `owner_type`
+/// used to qualify and kind methods.
+#[derive(Clone, Copy)]
+struct VisitContext<'a> {
+    parent_key: &'a str,
+    owner_key: &'a str,
+    scope: &'a [String],
+    owner_type: Option<&'a str>,
+}
+
+/// Describes a symbol to emit: its graph `kind`, the raw CST `raw_kind`, its
+/// `name`, and its fully `qualified_name`.
+struct SymbolSpec<'a> {
+    kind: NodeKind,
+    raw_kind: &'a str,
+    name: &'a str,
+    qualified_name: &'a str,
+}
+
 impl RustWalker<'_> {
     /// Visits all named children under `node`.
-    fn visit_children(
-        &mut self,
-        node: &Node,
-        parent_key: &str,
-        owner_key: &str,
-        scope: &[String],
-        owner_type: Option<&str>,
-    ) {
+    fn visit_children(&mut self, node: &Node, ctx: VisitContext<'_>) {
         for child in named_children(node) {
-            self.visit_node(&child, parent_key, owner_key, scope, owner_type);
+            self.visit_node(&child, ctx);
         }
     }
 
     /// Visits one CST node, emitting graph data when it represents code intent.
-    ///
-    /// `owner_key` is the symbol calls/references are attributed to; `owner_type`
-    /// is the enclosing impl/trait type used to qualify and kind methods.
-    fn visit_node(
-        &mut self,
-        node: &Node,
-        parent_key: &str,
-        owner_key: &str,
-        scope: &[String],
-        owner_type: Option<&str>,
-    ) {
+    fn visit_node(&mut self, node: &Node, ctx: VisitContext<'_>) {
         match node.kind().as_str() {
-            "mod_item" => self.visit_module(node, parent_key, scope),
-            "struct_item" => {
-                self.visit_named(node, parent_key, owner_key, scope, NodeKind::Struct, "struct_item");
-            }
-            "union_item" => {
-                self.visit_named(node, parent_key, owner_key, scope, NodeKind::Struct, "union_item");
-            }
-            "enum_item" => {
-                self.visit_named(node, parent_key, owner_key, scope, NodeKind::Enum, "enum_item");
-            }
-            "trait_item" => self.visit_trait(node, parent_key, scope),
-            "impl_item" => self.visit_impl(node, parent_key, owner_key, scope),
-            "function_item" => self.visit_function(node, parent_key, scope, owner_type, "function_item"),
-            "function_signature_item" => {
-                self.visit_function(node, parent_key, scope, owner_type, "function_signature_item");
-            }
-            "const_item" => {
-                self.visit_named(node, parent_key, owner_key, scope, NodeKind::Constant, "const_item");
-            }
-            "static_item" => {
-                self.visit_named(node, parent_key, owner_key, scope, NodeKind::Constant, "static_item");
-            }
-            "type_item" => {
-                self.visit_named(node, parent_key, owner_key, scope, NodeKind::TypeAlias, "type_item");
-            }
-            "macro_definition" => {
-                self.visit_named(node, parent_key, owner_key, scope, NodeKind::Macro, "macro_definition");
-            }
-            "use_declaration" => {
-                if let Some(argument) = field(node, "argument") {
-                    for target in use_targets(&argument, &[], self.source) {
-                        self.push_reference(node, owner_key, target, EdgeKind::Imports);
-                    }
-                }
-                self.visit_children(node, parent_key, owner_key, scope, owner_type);
-            }
-            "call_expression" => {
-                if let Some(function) = field(node, "function")
-                    && let Some(target) = callee_target(&function, self.source, owner_type)
-                {
-                    self.push_reference(node, owner_key, target, EdgeKind::Calls);
-                }
-                self.visit_children(node, parent_key, owner_key, scope, owner_type);
-            }
-            "macro_invocation" => {
-                if let Some(target) = macro_target(node, self.source) {
-                    self.push_reference(node, owner_key, target, EdgeKind::Calls);
-                }
-                self.visit_children(node, parent_key, owner_key, scope, owner_type);
-            }
-            _ => self.visit_children(node, parent_key, owner_key, scope, owner_type),
+            "mod_item" => self.visit_module(node, ctx),
+            "struct_item" => self.visit_named(node, ctx, NodeKind::Struct, "struct_item"),
+            "union_item" => self.visit_named(node, ctx, NodeKind::Struct, "union_item"),
+            "enum_item" => self.visit_named(node, ctx, NodeKind::Enum, "enum_item"),
+            "trait_item" => self.visit_trait(node, ctx),
+            "impl_item" => self.visit_impl(node, ctx),
+            "function_item" => self.visit_function(node, ctx, "function_item"),
+            "function_signature_item" => self.visit_function(node, ctx, "function_signature_item"),
+            "const_item" => self.visit_named(node, ctx, NodeKind::Constant, "const_item"),
+            "static_item" => self.visit_named(node, ctx, NodeKind::Constant, "static_item"),
+            "type_item" => self.visit_named(node, ctx, NodeKind::TypeAlias, "type_item"),
+            "macro_definition" => self.visit_named(node, ctx, NodeKind::Macro, "macro_definition"),
+            "use_declaration" => self.visit_use(node, ctx),
+            "call_expression" => self.visit_call(node, ctx),
+            "macro_invocation" => self.visit_macro(node, ctx),
+            _ => self.visit_children(node, ctx),
         }
     }
 
+    /// Emits import references for a `use` declaration, then recurses.
+    fn visit_use(&mut self, node: &Node, ctx: VisitContext<'_>) {
+        if let Some(argument) = field(node, "argument") {
+            for target in use_targets(&argument, &[], self.source) {
+                self.push_reference(node, ctx.owner_key, target, EdgeKind::Imports);
+            }
+        }
+        self.visit_children(node, ctx);
+    }
+
+    /// Emits a call reference for a `call_expression`, then recurses.
+    ///
+    /// The enclosing `owner_type` carried in `ctx` resolves `self`/`Self`
+    /// receivers to a concrete type so method calls resolve by receiver type.
+    fn visit_call(&mut self, node: &Node, ctx: VisitContext<'_>) {
+        if let Some(function) = field(node, "function")
+            && let Some(target) = callee_target(&function, self.source, ctx.owner_type)
+        {
+            self.push_reference(node, ctx.owner_key, target, EdgeKind::Calls);
+        }
+        self.visit_children(node, ctx);
+    }
+
+    /// Emits a call reference for a `macro_invocation`, then recurses.
+    fn visit_macro(&mut self, node: &Node, ctx: VisitContext<'_>) {
+        if let Some(target) = macro_target(node, self.source) {
+            self.push_reference(node, ctx.owner_key, target, EdgeKind::Calls);
+        }
+        self.visit_children(node, ctx);
+    }
+
     /// Emits a named item and keeps traversing with the current owner.
-    fn visit_named(
-        &mut self,
-        node: &Node,
-        parent_key: &str,
-        owner_key: &str,
-        scope: &[String],
-        kind: NodeKind,
-        raw_kind: &str,
-    ) {
+    fn visit_named(&mut self, node: &Node, ctx: VisitContext<'_>, kind: NodeKind, raw_kind: &str) {
         if let Some(name) = item_name(node, self.source) {
-            let qualified = qualify(scope, &name);
-            let symbol = self.push_symbol(node, kind, raw_kind, &name, &qualified);
-            self.push_edge(parent_key, &symbol.stable_key, EdgeKind::Contains);
+            let qualified = qualify(ctx.scope, &name);
+            let symbol = self.push_symbol(
+                node,
+                SymbolSpec {
+                    kind,
+                    raw_kind,
+                    name: &name,
+                    qualified_name: &qualified,
+                },
+            );
+            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
             let key = symbol.stable_key;
-            self.visit_children(node, &key, owner_key, scope, None);
+            self.visit_children(
+                node,
+                VisitContext {
+                    parent_key: &key,
+                    owner_key: ctx.owner_key,
+                    scope: ctx.scope,
+                    owner_type: None,
+                },
+            );
         }
     }
 
     /// Emits a module and recurses into its body with an extended scope.
-    fn visit_module(&mut self, node: &Node, parent_key: &str, scope: &[String]) {
+    fn visit_module(&mut self, node: &Node, ctx: VisitContext<'_>) {
         if let Some(name) = item_name(node, self.source) {
-            let qualified = qualify(scope, &name);
-            let symbol = self.push_symbol(node, NodeKind::Module, "mod_item", &name, &qualified);
-            self.push_edge(parent_key, &symbol.stable_key, EdgeKind::Contains);
-            let mut child_scope = scope.to_vec();
+            let qualified = qualify(ctx.scope, &name);
+            let symbol = self.push_symbol(
+                node,
+                SymbolSpec {
+                    kind: NodeKind::Module,
+                    raw_kind: "mod_item",
+                    name: &name,
+                    qualified_name: &qualified,
+                },
+            );
+            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
+            let mut child_scope = ctx.scope.to_vec();
             child_scope.push(name);
             let key = symbol.stable_key;
-            self.visit_children(node, &key, &key, &child_scope, None);
+            self.visit_children(
+                node,
+                VisitContext {
+                    parent_key: &key,
+                    owner_key: &key,
+                    scope: &child_scope,
+                    owner_type: None,
+                },
+            );
         }
     }
 
     /// Emits a trait and traverses its body, treating the trait as the owner
     /// type so trait methods (declarations and defaults) are `Method`s qualified
     /// `Trait::method`.
-    fn visit_trait(&mut self, node: &Node, parent_key: &str, scope: &[String]) {
+    fn visit_trait(&mut self, node: &Node, ctx: VisitContext<'_>) {
         if let Some(name) = item_name(node, self.source) {
-            let qualified = qualify(scope, &name);
-            let symbol = self.push_symbol(node, NodeKind::Trait, "trait_item", &name, &qualified);
-            self.push_edge(parent_key, &symbol.stable_key, EdgeKind::Contains);
+            let qualified = qualify(ctx.scope, &name);
+            let symbol = self.push_symbol(
+                node,
+                SymbolSpec {
+                    kind: NodeKind::Trait,
+                    raw_kind: "trait_item",
+                    name: &name,
+                    qualified_name: &qualified,
+                },
+            );
+            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
             let key = symbol.stable_key;
-            self.visit_children(node, &key, &key, scope, Some(&name));
+            self.visit_children(
+                node,
+                VisitContext {
+                    parent_key: &key,
+                    owner_key: &key,
+                    scope: ctx.scope,
+                    owner_type: Some(&name),
+                },
+            );
         }
     }
 
     /// Emits an implementation block and traverses methods with the impl's type
     /// as the owner type.
-    fn visit_impl(&mut self, node: &Node, parent_key: &str, _owner_key: &str, scope: &[String]) {
+    fn visit_impl(&mut self, node: &Node, ctx: VisitContext<'_>) {
         let target = impl_type_name(node, self.source).unwrap_or_else(|| "<impl>".to_string());
         let name = format!("impl {target}");
-        let qualified = qualify(scope, &name);
-        let symbol = self.push_symbol(node, NodeKind::ImplBlock, "impl_item", &name, &qualified);
-        self.push_edge(parent_key, &symbol.stable_key, EdgeKind::Contains);
+        let qualified = qualify(ctx.scope, &name);
+        let symbol = self.push_symbol(
+            node,
+            SymbolSpec {
+                kind: NodeKind::ImplBlock,
+                raw_kind: "impl_item",
+                name: &name,
+                qualified_name: &qualified,
+            },
+        );
+        self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
 
         if let Some(trait_name) = impl_trait_name(node, self.source) {
-            let trait_target =
-                reference_target(trait_name.clone(), vec![trait_name], None, ReferenceKind::Trait);
+            let trait_target = reference_target(
+                trait_name.clone(),
+                vec![trait_name],
+                None,
+                ReferenceKind::Trait,
+            );
             self.push_reference(node, &symbol.stable_key, trait_target, EdgeKind::Implements);
         }
 
         let key = symbol.stable_key;
-        self.visit_children(node, &key, &key, scope, Some(&target));
+        self.visit_children(
+            node,
+            VisitContext {
+                parent_key: &key,
+                owner_key: &key,
+                scope: ctx.scope,
+                owner_type: Some(&target),
+            },
+        );
     }
 
     /// Emits a free function or method and makes it the owner for nested calls.
-    fn visit_function(
-        &mut self,
-        node: &Node,
-        parent_key: &str,
-        scope: &[String],
-        owner_type: Option<&str>,
-        raw_kind: &str,
-    ) {
+    fn visit_function(&mut self, node: &Node, ctx: VisitContext<'_>, raw_kind: &str) {
         if let Some(name) = item_name(node, self.source) {
-            let kind = if owner_type.is_some() {
+            let kind = if ctx.owner_type.is_some() {
                 NodeKind::Method
             } else {
                 NodeKind::Function
             };
-            let qualified = owner_type.map_or_else(
-                || qualify(scope, &name),
-                |target| qualify_with_extra(scope, &[target, &name]),
+            let qualified = ctx.owner_type.map_or_else(
+                || qualify(ctx.scope, &name),
+                |target| qualify_with_extra(ctx.scope, &[target, &name]),
             );
-            let symbol = self.push_symbol(node, kind, raw_kind, &name, &qualified);
-            self.push_edge(parent_key, &symbol.stable_key, EdgeKind::Contains);
+            let symbol = self.push_symbol(
+                node,
+                SymbolSpec {
+                    kind,
+                    raw_kind,
+                    name: &name,
+                    qualified_name: &qualified,
+                },
+            );
+            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
             let key = symbol.stable_key;
             // Calls in the body keep the enclosing type so `self`/`Self`
             // receivers resolve to it.
-            self.visit_children(node, &key, &key, scope, owner_type);
+            self.visit_children(
+                node,
+                VisitContext {
+                    parent_key: &key,
+                    owner_key: &key,
+                    scope: ctx.scope,
+                    owner_type: ctx.owner_type,
+                },
+            );
         }
     }
 
     /// Pushes one symbol and returns a clone for immediate edge wiring.
-    fn push_symbol(
-        &mut self,
-        node: &Node,
-        kind: NodeKind,
-        raw_kind: &str,
-        name: &str,
-        qualified_name: &str,
-    ) -> SymbolNode {
+    fn push_symbol(&mut self, node: &Node, spec: SymbolSpec<'_>) -> SymbolNode {
         let span = span(node);
         let stable_key = format!(
             "symbol:{}:{}:{}:{}",
             self.file_path,
-            kind.as_str(),
-            qualified_name,
+            spec.kind.as_str(),
+            spec.qualified_name,
             span.start_byte
         );
         let symbol = SymbolNode {
             stable_key,
-            name: name.to_string(),
-            qualified_name: qualified_name.to_string(),
-            kind,
-            raw_kind: Some(raw_kind.to_string()),
+            name: spec.name.to_string(),
+            qualified_name: spec.qualified_name.to_string(),
+            kind: spec.kind,
+            raw_kind: Some(spec.raw_kind.to_string()),
             language: self.language.clone(),
             file_path: self.file_path.clone(),
             span,
@@ -419,7 +498,12 @@ fn callee_target(
             let qualifier = (!prefix.is_empty()).then(|| prefix.join("::"));
             let mut path = prefix;
             path.push(name);
-            Some(reference_target(path.join("::"), path, qualifier, ReferenceKind::Function))
+            Some(reference_target(
+                path.join("::"),
+                path,
+                qualifier,
+                ReferenceKind::Function,
+            ))
         }
         "generic_function" => {
             field(function, "function").and_then(|inner| callee_target(&inner, source, owner_type))
@@ -454,7 +538,8 @@ fn macro_target(node: &Node, source: &[u8]) -> Option<ReferenceTarget> {
     let macro_node = field(node, "macro")?;
     let raw = clean_path(node_text(&macro_node, source));
     let name = raw.rsplit("::").next().unwrap_or(&raw).to_string();
-    (!name.is_empty()).then(|| reference_target(name.clone(), vec![name], None, ReferenceKind::Macro))
+    (!name.is_empty())
+        .then(|| reference_target(name.clone(), vec![name], None, ReferenceKind::Macro))
 }
 
 /// Extracts the implemented type's base name from an `impl_item` `type` field.
@@ -491,7 +576,10 @@ fn base_type_name(node: &Node, source: &[u8]) -> Option<String> {
         "array_type" | "slice_type" => Some("<slice>".to_string()),
         "dynamic_type" => field(node, "trait")
             .and_then(|inner| base_type_name(&inner, source))
-            .map_or_else(|| Some("<dyn>".to_string()), |name| Some(format!("dyn {name}"))),
+            .map_or_else(
+                || Some("<dyn>".to_string()),
+                |name| Some(format!("dyn {name}")),
+            ),
         _ => {
             let text = clean_path(node_text(node, source));
             (!text.is_empty()).then_some(text)
@@ -662,7 +750,12 @@ mod tests {
     /// Parses a snippet and returns its extraction (crate-root `src/lib.rs`).
     fn extract(source: &str) -> Extraction {
         let tree = parse_rust(Path::new("src/lib.rs"), source.as_bytes()).expect("parse");
-        extract_rust("src/lib.rs", &["crate".to_string()], source.as_bytes(), &tree)
+        extract_rust(
+            "src/lib.rs",
+            &["crate".to_string()],
+            source.as_bytes(),
+            &tree,
+        )
     }
 
     fn reference<'a>(extraction: &'a Extraction, text_contains: &str) -> &'a UnresolvedReference {
@@ -704,9 +797,15 @@ mod tests {
     #[test]
     fn free_and_associated_calls_resolve_to_names() {
         let extraction = extract("fn entry() { helper(); Thing::new(); }");
-        assert_eq!(reference(&extraction, "helper()").target.path, vec!["helper".to_string()]);
+        assert_eq!(
+            reference(&extraction, "helper()").target.path,
+            vec!["helper".to_string()]
+        );
         let assoc = reference(&extraction, "Thing::new()");
-        assert_eq!(assoc.target.path, vec!["Thing".to_string(), "new".to_string()]);
+        assert_eq!(
+            assoc.target.path,
+            vec!["Thing".to_string(), "new".to_string()]
+        );
         assert_eq!(assoc.target.joined(), "Thing::new");
         assert_eq!(assoc.target.qualifier.as_deref(), Some("Thing"));
     }
@@ -721,11 +820,13 @@ mod tests {
             .expect("method");
         assert_eq!(method.qualified_name, "crate::Foo::run");
         // The Implements reference targets the trait base name.
-        assert!(extraction
-            .references
-            .iter()
-            .any(|reference| reference.kind == EdgeKind::Implements
-                && reference.target.last_segment() == Some("Trait")));
+        assert!(
+            extraction
+                .references
+                .iter()
+                .any(|reference| reference.kind == EdgeKind::Implements
+                    && reference.target.last_segment() == Some("Trait"))
+        );
     }
 
     #[test]
@@ -773,8 +874,14 @@ mod tests {
             "{imports:?}"
         );
         // Grouped imports expand per-leaf.
-        assert!(imports.iter().any(|(name, _)| *name == Some("g")), "{imports:?}");
-        assert!(imports.iter().any(|(name, _)| *name == Some("I")), "{imports:?}");
+        assert!(
+            imports.iter().any(|(name, _)| *name == Some("g")),
+            "{imports:?}"
+        );
+        assert!(
+            imports.iter().any(|(name, _)| *name == Some("I")),
+            "{imports:?}"
+        );
     }
 
     #[test]
@@ -783,9 +890,11 @@ mod tests {
         // has error nodes but the recoverable symbols are still extracted.
         let extraction = extract("fn entry() { helper(); }\nfn broken( {");
         assert_eq!(extraction.parse_status, FileParseStatus::Partial);
-        assert!(extraction
-            .nodes
-            .iter()
-            .any(|node| node.qualified_name == "crate::entry"));
+        assert!(
+            extraction
+                .nodes
+                .iter()
+                .any(|node| node.qualified_name == "crate::entry")
+        );
     }
 }

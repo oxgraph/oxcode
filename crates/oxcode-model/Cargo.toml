@@ -2,6 +2,7 @@
 name = "oxcode-model"
 version = "0.1.0"
 description = "Storage-neutral code graph model types for oxcode."
+publish = false
 
 authors.workspace = true
 edition.workspace = true

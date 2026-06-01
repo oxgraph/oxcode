@@ -2,13 +2,12 @@
 
 use std::path::Path;
 
-use oxgraph::db::{QueryLanguage, QueryResult};
-
 pub use oxcode_model::*;
 pub use oxgraph::db::{
     ElementId as OxElementId, QueryLanguage as OxQueryLanguage, QueryResult as OxQueryResult,
     QueryValue as OxQueryValue,
 };
+use oxgraph::db::{QueryLanguage, QueryResult};
 
 mod error;
 mod extract;
@@ -18,15 +17,16 @@ mod resolve;
 mod scan;
 mod store;
 
-pub use crate::error::{Error, Result};
-pub use crate::format::{
-    format_call_graph_report, format_expanded_query_report, format_query_value,
-    format_selector_matches, format_symbol_report,
-};
-pub use crate::paths::{DATABASE_DIR, INDEX_DIR, database_dir, index_dir};
-pub use crate::resolve::resolve_extractions;
-
 use crate::store::oxgraph::{OxGraphStore, ReadSession};
+pub use crate::{
+    error::{Error, Result},
+    format::{
+        format_call_graph_report, format_expanded_query_report, format_query_value,
+        format_selector_matches, format_symbol_report,
+    },
+    paths::{DATABASE_DIR, INDEX_DIR, database_dir, index_dir},
+    resolve::resolve_extractions,
+};
 
 /// Indexes one project root into a native OxGraph database.
 pub fn index_project(root: impl AsRef<Path>) -> Result<IndexStats> {

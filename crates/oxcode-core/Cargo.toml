@@ -2,6 +2,7 @@
 name = "oxcode-core"
 version = "0.1.0"
 description = "OxGraph-native code indexing and navigation engine."
+publish = false
 
 authors.workspace = true
 edition.workspace = true

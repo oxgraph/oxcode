@@ -1,10 +1,6 @@
 //! Language extractor registry and extraction orchestration.
 
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::OnceLock,
-};
+use std::{collections::HashMap, path::Path, sync::OnceLock};
 
 use oxcode_model::{Extraction, FileDiagnostic, FileParseStatus, LanguageSupport};
 

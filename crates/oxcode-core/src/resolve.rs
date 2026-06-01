@@ -189,6 +189,22 @@ impl SymbolIndex {
         self.keys.contains(key)
     }
 
+    /// Tier 2 of [`Self::resolve`]: walks the enclosing-module ancestors of the
+    /// reference's source, trying each scope prefix as a qualifier, and returns
+    /// the first match.
+    fn resolve_in_scope(&self, reference: &UnresolvedReference) -> Option<Resolution> {
+        let source_qualified = self.qualified_of.get(&reference.source_key)?;
+        let scope = enclosing_scope(source_qualified);
+        let joined = reference.target.joined();
+        for take in (1..=scope.len()).rev() {
+            let candidate = format!("{}::{}", scope[..take].join("::"), joined);
+            if let Some(targets) = self.by_qualified.get(&candidate) {
+                return Some(resolved(targets, ResolutionKind::Scoped));
+            }
+        }
+        None
+    }
+
     /// Resolves one reference through the tiers, returning the first match.
     fn resolve(&self, reference: &UnresolvedReference, imports: &ImportMap) -> Resolution {
         let target = &reference.target;
@@ -202,14 +218,8 @@ impl SymbolIndex {
         }
 
         // 2. Enclosing-module scope, walking up ancestors.
-        if let Some(source_qualified) = self.qualified_of.get(&reference.source_key) {
-            let scope = enclosing_scope(source_qualified);
-            for take in (1..=scope.len()).rev() {
-                let candidate = format!("{}::{}", scope[..take].join("::"), target.joined());
-                if let Some(targets) = self.by_qualified.get(&candidate) {
-                    return resolved(targets, ResolutionKind::Scoped);
-                }
-            }
+        if let Some(resolution) = self.resolve_in_scope(reference) {
+            return resolution;
         }
 
         // 3. In-scope imports (first path segment is an imported local name).
@@ -225,7 +235,11 @@ impl SymbolIndex {
 
         // 4. Receiver type (`Type::member` / `self.member` with a known type).
         if let Some(qualifier) = &target.qualifier {
-            let owner = qualifier.rsplit("::").next().unwrap_or(qualifier).to_string();
+            let owner = qualifier
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualifier)
+                .to_string();
             if let Some(targets) = self.by_type_member.get(&(owner, last.to_string())) {
                 return resolved(targets, ResolutionKind::Receiver);
             }
@@ -339,7 +353,10 @@ mod tests {
         let callee_key = callee.stable_key.clone();
         let resolved = resolve(
             vec![caller, callee],
-            vec![call(&caller_key, target(&["callee"], None, ReferenceKind::Function))],
+            vec![call(
+                &caller_key,
+                target(&["callee"], None, ReferenceKind::Function),
+            )],
         );
         let edge = resolved
             .edges
@@ -380,7 +397,10 @@ mod tests {
         // A bare `new()` with no receiver type -> simple tier, two candidates.
         let resolved = resolve(
             vec![new_a, new_b, caller],
-            vec![call(&caller_key, target(&["new"], None, ReferenceKind::Function))],
+            vec![call(
+                &caller_key,
+                target(&["new"], None, ReferenceKind::Function),
+            )],
         );
         let edges = resolved
             .edges
@@ -388,7 +408,11 @@ mod tests {
             .filter(|edge| edge.kind == EdgeKind::Calls)
             .collect::<Vec<_>>();
         assert_eq!(edges.len(), 2, "both candidates kept");
-        assert!(edges.iter().all(|edge| edge.resolution == ResolutionKind::Ambiguous));
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.resolution == ResolutionKind::Ambiguous)
+        );
     }
 
     #[test]
@@ -399,10 +423,12 @@ mod tests {
             vec![f],
             vec![call(&f_key, target(&["f"], None, ReferenceKind::Function))],
         );
-        assert!(resolved
-            .edges
-            .iter()
-            .any(|edge| edge.source_key == f_key && edge.target_key == f_key));
+        assert!(
+            resolved
+                .edges
+                .iter()
+                .any(|edge| edge.source_key == f_key && edge.target_key == f_key)
+        );
     }
 
     #[test]
@@ -413,7 +439,11 @@ mod tests {
         let caller_key = caller.stable_key.clone();
         let import = UnresolvedReference {
             source_key: caller_key.clone(),
-            target: target(&["crate", "a", "Bar"], Some("crate::a"), ReferenceKind::Import),
+            target: target(
+                &["crate", "a", "Bar"],
+                Some("crate::a"),
+                ReferenceKind::Import,
+            ),
             kind: EdgeKind::Imports,
             file_path: "src/lib.rs".to_string(),
             span: SourceSpan::default(),

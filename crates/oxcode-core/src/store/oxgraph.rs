@@ -12,14 +12,16 @@ use oxcode_model::{
     RelationProperty, Selector, SourceSpan, SymbolId, SymbolKey, SymbolReport, SymbolSummary,
     TraversedSymbol,
 };
-use oxgraph::db::{
-    Database, ElementId, PropertyKeyId, PropertySubject, PropertyValue, QueryLanguage, QueryResult,
-    QueryValue, RelationId, TraversalDirection, TraversalOptions,
-};
-use oxgraph::graph::{EdgeSourceGraph, EdgeTargetGraph, OutgoingGraph};
-use oxgraph::topology::{
-    CanonicalElementIdentity, CanonicalRelationIdentity, LocalElementIdentity,
-    LocalRelationIdentity,
+use oxgraph::{
+    db::{
+        Database, ElementId, PropertyKeyId, PropertySubject, PropertyValue, QueryLanguage,
+        QueryResult, QueryValue, RelationId, TraversalDirection, TraversalOptions,
+    },
+    graph::{EdgeSourceGraph, EdgeTargetGraph, OutgoingGraph},
+    topology::{
+        CanonicalElementIdentity, CanonicalRelationIdentity, LocalElementIdentity,
+        LocalRelationIdentity,
+    },
 };
 
 use crate::{
@@ -222,10 +224,13 @@ impl ReadSession<'_> {
             limit,
             include_start: false,
         };
-        let traversal = self.read.traverse_graph(projection_id, &[seed_id], options)?;
+        let traversal = self
+            .read
+            .traverse_graph(projection_id, &[seed_id], options)?;
         let mut depth_of = BTreeMap::from([(seed_id, 0_usize)]);
         for row in traversal.rows() {
-            if let Some(symbol) = symbol_summary_from_element(&self.read, element_keys, row.element)?
+            if let Some(symbol) =
+                symbol_summary_from_element(&self.read, element_keys, row.element)?
             {
                 depth_of.insert(row.element, row.depth);
                 symbols.push(TraversedSymbol {
@@ -240,36 +245,39 @@ impl ReadSession<'_> {
         // deterministic (sorted element/relation ids).
         let mut emitted = BTreeSet::new();
         let discovered_ids = depth_of.keys().copied().collect::<Vec<_>>();
+        let mut local_edges = Vec::new();
         for element in discovered_ids {
-            let Some(local) = graph.local_element_id(element) else {
+            if let Some(local) = graph.local_element_id(element) {
+                local_edges.extend(graph.outgoing_edges(local).collect::<Vec<_>>());
+            }
+        }
+        for local_edge in local_edges {
+            let source = graph.canonical_element_id(graph.source(local_edge));
+            let target = graph.canonical_element_id(graph.target(local_edge));
+            if !depth_of.contains_key(&target) {
                 continue;
-            };
-            for local_edge in graph.outgoing_edges(local).collect::<Vec<_>>() {
-                let source = graph.canonical_element_id(graph.source(local_edge));
-                let target = graph.canonical_element_id(graph.target(local_edge));
-                if !depth_of.contains_key(&target) {
-                    continue;
-                }
-                let relation = graph.canonical_relation_id(local_edge);
-                if !emitted.insert(relation) {
-                    continue;
-                }
-                let edge_depth = depth_of
-                    .get(&source)
-                    .copied()
-                    .unwrap_or(0)
-                    .max(depth_of.get(&target).copied().unwrap_or(0));
-                if let Some(edge) = call_edge_summary(
-                    &self.read,
-                    element_keys,
-                    relation_keys,
+            }
+            let relation = graph.canonical_relation_id(local_edge);
+            if !emitted.insert(relation) {
+                continue;
+            }
+            let edge_depth = depth_of
+                .get(&source)
+                .copied()
+                .unwrap_or(0)
+                .max(depth_of.get(&target).copied().unwrap_or(0));
+            if let Some(edge) = call_edge_summary(
+                &self.read,
+                element_keys,
+                relation_keys,
+                CallEdgeRef {
                     relation,
                     source,
                     target,
-                    Some(edge_depth),
-                )? {
-                    edges.push(edge);
-                }
+                    depth: Some(edge_depth),
+                },
+            )? {
+                edges.push(edge);
             }
         }
 
@@ -285,10 +293,7 @@ impl ReadSession<'_> {
     }
 
     pub(crate) fn expand_query_result(&self, result: &QueryResult) -> Result<ExpandedQueryReport> {
-        let graph = self
-            .read
-            .graph_projection_by_name(CALLS_PROJECTION)
-            .ok();
+        let graph = self.read.graph_projection_by_name(CALLS_PROJECTION).ok();
         let rows = result
             .rows()
             .iter()
@@ -436,8 +441,10 @@ fn resolve_selector_in_read(
     selector: &str,
 ) -> Result<Vec<SymbolSummary>> {
     match Selector::parse(selector) {
-        Ok(Selector::Element(id)) => symbol_summary_from_element(read, keys, ElementId::new(id.get()))
-            .map(|summary| summary.filter(is_agent_symbol).into_iter().collect()),
+        Ok(Selector::Element(id)) => {
+            symbol_summary_from_element(read, keys, ElementId::new(id.get()))
+                .map(|summary| summary.filter(is_agent_symbol).into_iter().collect())
+        }
         Ok(Selector::Name(name)) => {
             lookup_symbols_by_property(read, keys, ElementProperty::Name, keys.name, &name)
         }
@@ -467,7 +474,9 @@ fn lookup_symbols_by_property(
     let value_property = PropertyValue::Text(value.to_string());
     let index_name = format!("element_{}_eq", property.key());
     let subjects = match read.catalog().index_id(&index_name) {
-        Some(index_id) => read.lookup_index(index_id, oxgraph::db::IndexLookup::Equal(&value_property))?,
+        Some(index_id) => {
+            read.lookup_index(index_id, oxgraph::db::IndexLookup::Equal(&value_property))?
+        }
         None => read.lookup_property_equal(key, &value_property)?,
     };
     let mut symbols = subjects
@@ -505,8 +514,13 @@ fn resolve_file_line_selector(
     file_path: &str,
     line: usize,
 ) -> Result<Vec<SymbolSummary>> {
-    let mut symbols =
-        lookup_symbols_by_property(read, keys, ElementProperty::FilePath, keys.file_path, file_path)?;
+    let mut symbols = lookup_symbols_by_property(
+        read,
+        keys,
+        ElementProperty::FilePath,
+        keys.file_path,
+        file_path,
+    )?;
     symbols.retain(|symbol| {
         !matches!(symbol.kind, NodeKind::File | NodeKind::Unresolved)
             && symbol.definition.span.contains_line(line)
@@ -560,10 +574,12 @@ fn expand_query_value(
                         read,
                         element_keys,
                         relation_keys,
-                        *id,
-                        graph.canonical_element_id(graph.source(local)),
-                        graph.canonical_element_id(graph.target(local)),
-                        None,
+                        CallEdgeRef {
+                            relation: *id,
+                            source: graph.canonical_element_id(graph.source(local)),
+                            target: graph.canonical_element_id(graph.target(local)),
+                            depth: None,
+                        },
                     )
                 })
                 .transpose()?
@@ -582,28 +598,34 @@ fn expand_query_value(
     Ok(expanded)
 }
 
+/// Canonical identity of one call edge: its `relation` plus endpoint elements
+/// and traversal `depth`.
+struct CallEdgeRef {
+    relation: RelationId,
+    source: ElementId,
+    target: ElementId,
+    depth: Option<usize>,
+}
+
 /// Builds one call edge summary from canonical endpoint IDs.
 fn call_edge_summary(
     read: &oxgraph::db::ReadTransaction,
     element_keys: &ElementPropertyKeys,
     relation_keys: &RelationPropertyKeys,
-    relation: RelationId,
-    source: ElementId,
-    target: ElementId,
-    depth: Option<usize>,
+    edge: CallEdgeRef,
 ) -> Result<Option<CallEdgeSummary>> {
-    let Some(source) = symbol_summary_from_element(read, element_keys, source)? else {
+    let Some(source) = symbol_summary_from_element(read, element_keys, edge.source)? else {
         return Ok(None);
     };
-    let Some(target) = symbol_summary_from_element(read, element_keys, target)? else {
+    let Some(target) = symbol_summary_from_element(read, element_keys, edge.target)? else {
         return Ok(None);
     };
     Ok(Some(CallEdgeSummary {
-        relation_id: relation.get(),
-        depth,
+        relation_id: edge.relation.get(),
+        depth: edge.depth,
         source,
         target,
-        call_site: call_site_summary(read, relation_keys, relation),
+        call_site: call_site_summary(read, relation_keys, edge.relation),
     }))
 }
 
@@ -645,8 +667,12 @@ fn symbol_summary_from_element(
     let subject = PropertySubject::Element(id);
     let stable_key = require_text(read, subject, keys.stable_key, ElementProperty::StableKey)?;
     let name = require_text(read, subject, keys.name, ElementProperty::Name)?;
-    let qualified_name =
-        require_text(read, subject, keys.qualified_name, ElementProperty::QualifiedName)?;
+    let qualified_name = require_text(
+        read,
+        subject,
+        keys.qualified_name,
+        ElementProperty::QualifiedName,
+    )?;
     let kind_text = require_text(read, subject, keys.kind, ElementProperty::Kind)?;
     let kind = NodeKind::try_from(kind_text.as_str()).map_err(|_| Error::CorruptValue {
         kind: "node kind",
@@ -657,7 +683,12 @@ fn symbol_summary_from_element(
         start_byte: require_int(read, subject, keys.start_byte, ElementProperty::StartByte)?,
         end_byte: require_int(read, subject, keys.end_byte, ElementProperty::EndByte)?,
         start_line: require_int(read, subject, keys.start_line, ElementProperty::StartLine)?,
-        start_column: require_int(read, subject, keys.start_column, ElementProperty::StartColumn)?,
+        start_column: require_int(
+            read,
+            subject,
+            keys.start_column,
+            ElementProperty::StartColumn,
+        )?,
         end_line: require_int(read, subject, keys.end_line, ElementProperty::EndLine)?,
         end_column: require_int(read, subject, keys.end_column, ElementProperty::EndColumn)?,
     };
@@ -761,7 +792,9 @@ fn optional_usize_property(
 /// Uses the membership index rather than materializing query result rows.
 fn count_index(read: &oxgraph::db::ReadTransaction, name: &str) -> Result<usize> {
     match read.catalog().index_id(name) {
-        Some(index_id) => Ok(read.lookup_index(index_id, oxgraph::db::IndexLookup::All)?.len()),
+        Some(index_id) => Ok(read
+            .lookup_index(index_id, oxgraph::db::IndexLookup::All)?
+            .len()),
         None => Ok(0),
     }
 }

@@ -104,8 +104,14 @@ mod tests {
 
     #[test]
     fn module_segments_skip_crate_roots() {
-        assert_eq!(module_segments_from_relative("src/lib.rs"), Vec::<String>::new());
-        assert_eq!(module_segments_from_relative("src/main.rs"), Vec::<String>::new());
+        assert_eq!(
+            module_segments_from_relative("src/lib.rs"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            module_segments_from_relative("src/main.rs"),
+            Vec::<String>::new()
+        );
         assert_eq!(
             module_segments_from_relative("src/graph/mod.rs"),
             vec!["graph".to_string()]
