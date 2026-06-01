@@ -1,0 +1,33 @@
+suite: rust
+tasks:
+  - id: tokio-runtime-schedule
+    repo: tokio
+    repo_url: https://github.com/tokio-rs/tokio.git
+    question: "How does tokio schedule and run async tasks on its runtime?"
+    required_concepts: [runtime, schedule, task]
+    expected_files: [tokio/src/runtime]
+    expected_symbols: []
+
+  - id: ripgrep-ignore-discovery
+    repo: ripgrep
+    repo_url: https://github.com/BurntSushi/ripgrep.git
+    question: "How does ripgrep discover files and apply ignore rules before searching?"
+    required_concepts: [ignore, files, search]
+    expected_files: [crates]
+    expected_symbols: []
+
+  - id: hyper-connection-dispatch
+    repo: hyper
+    repo_url: https://github.com/hyperium/hyper.git
+    question: "How does hyper accept a connection and dispatch requests to a service?"
+    required_concepts: [connection, request, service]
+    expected_files: [src]
+    expected_symbols: []
+
+  - id: cargo-resolve-build
+    repo: cargo
+    repo_url: https://github.com/rust-lang/cargo.git
+    question: "How does Cargo resolve dependencies and build a package?"
+    required_concepts: [resolve, dependencies, build]
+    expected_files: [src/cargo]
+    expected_symbols: []

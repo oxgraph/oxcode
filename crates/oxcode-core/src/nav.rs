@@ -164,6 +164,9 @@ mod tests {
                     end_line: 1,
                     end_column: 10,
                 },
+                signature: Some("fn entry()".to_string()),
+                docstring: None,
+                source_preview: Some("fn entry() {}".to_string()),
             },
         };
 

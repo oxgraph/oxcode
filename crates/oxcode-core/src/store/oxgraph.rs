@@ -6,21 +6,20 @@ use std::{
 };
 
 use oxcode_model::{
-    CallEdgeSummary, CallGraphReport, CallSiteSummary, CatalogStatus, CodeLocation, EdgeKind,
-    ExpandedQueryReport, ExpandedQueryRow, ExpandedQueryValue, GraphDirection, NodeKind,
-    ProjectStatus, ResolvedEdge, ResolvedIndex, SourceSpan, SourceUnit, SymbolNode, SymbolSummary,
-    TraversedSymbol, UnresolvedReference,
+    CallEdgeSummary, CallGraphReport, CallSiteSummary, CatalogStatus, CodeLocation,
+    ContextFileSummary, ContextReport, EdgeKind, ExpandedQueryReport, ExpandedQueryRow,
+    ExpandedQueryValue, FileSearchReport, FileSummary, GraphDirection, NodeKind, ProjectStatus,
+    RelatedSymbol, RelationshipSummary, ResolvedEdge, ResolvedIndex, SourceSpan, SourceUnit,
+    SymbolNode, SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TraversedSymbol,
+    UnresolvedReference,
 };
 use oxgraph::db::{
     Database, ElementId, GraphProjectionDefinition, IndexDefinition, LabelId, ProjectionDefinition,
     PropertyFamily, PropertyKeyId, PropertySubject, PropertyType, PropertyValue, QueryLanguage,
     QueryResult, QueryValue, RelationId, RelationTypeId,
 };
-use oxgraph::graph::{EdgeSourceGraph, EdgeTargetGraph, IncomingGraph, OutgoingGraph};
-use oxgraph::topology::{
-    CanonicalElementIdentity, CanonicalRelationIdentity, LocalElementIdentity,
-    LocalRelationIdentity,
-};
+use oxgraph::graph::{EdgeSourceGraph, EdgeTargetGraph};
+use oxgraph::topology::{CanonicalElementIdentity, LocalRelationIdentity};
 
 use crate::{
     error::{Error, Result},
@@ -150,6 +149,206 @@ impl ReadSession<'_> {
         resolve_selector_in_read(&self.read, &keys, selector)
     }
 
+    /// Searches indexed symbols with an agent-friendly ranking.
+    pub(crate) fn search_symbols(&self, query: &str, limit: usize) -> Result<SymbolSearchReport> {
+        self.search_symbols_filtered(query, limit, &[])
+    }
+
+    /// Searches indexed symbols with optional kind filters.
+    pub(crate) fn search_symbols_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        kinds: &[String],
+    ) -> Result<SymbolSearchReport> {
+        let keys = ElementPropertyKeys::load(&self.read)?;
+        let terms = search_terms(query);
+        let normalized_query = query.trim().to_ascii_lowercase();
+        let kind_filter = kinds
+            .iter()
+            .map(|kind| kind.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let mut matches = self
+            .all_symbol_summaries(&keys)?
+            .into_iter()
+            .filter(is_agent_symbol)
+            .filter(|symbol| kind_filter.is_empty() || kind_filter.contains(&symbol.kind))
+            .filter_map(|symbol| {
+                if terms.is_empty() {
+                    Some(Ok(SymbolSearchMatch { score: 0, symbol }))
+                } else {
+                    symbol_search_score(&symbol, &terms, &normalized_query)
+                        .map(|score| Ok(SymbolSearchMatch { score, symbol }))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then(left.symbol.qualified_name.cmp(&right.symbol.qualified_name))
+                .then(
+                    left.symbol
+                        .definition
+                        .file_path
+                        .cmp(&right.symbol.definition.file_path),
+                )
+                .then(
+                    left.symbol
+                        .definition
+                        .start_byte
+                        .cmp(&right.symbol.definition.start_byte),
+                )
+        });
+        matches.truncate(limit);
+        Ok(SymbolSearchReport {
+            query: query.to_string(),
+            limit,
+            matches,
+        })
+    }
+
+    /// Searches indexed files with a lightweight structured summary.
+    pub(crate) fn search_files(&self, query: &str, limit: usize) -> Result<FileSearchReport> {
+        let keys = ElementPropertyKeys::load(&self.read)?;
+        let terms = search_terms(query);
+        let mut by_file = BTreeMap::<String, Vec<SymbolSummary>>::new();
+        for symbol in self
+            .all_symbol_summaries(&keys)?
+            .into_iter()
+            .filter(is_agent_symbol)
+        {
+            by_file
+                .entry(symbol.definition.file_path.clone())
+                .or_default()
+                .push(symbol);
+        }
+
+        let mut files = by_file
+            .into_iter()
+            .filter_map(|(path, mut symbols)| {
+                symbols.sort_by(|left, right| {
+                    left.definition
+                        .start_byte
+                        .cmp(&right.definition.start_byte)
+                        .then(left.qualified_name.cmp(&right.qualified_name))
+                });
+                let score = file_search_score(&path, &symbols, &terms)?;
+                let top_symbols = symbols
+                    .iter()
+                    .filter(|symbol| symbol.kind != "file")
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let symbol_count = symbols
+                    .iter()
+                    .filter(|symbol| symbol.kind != "file")
+                    .count();
+                Some(FileSummary {
+                    path,
+                    score,
+                    symbol_count,
+                    top_symbols,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        files.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then(left.path.cmp(&right.path))
+        });
+        files.truncate(limit);
+        Ok(FileSearchReport {
+            query: query.to_string(),
+            limit,
+            files,
+        })
+    }
+
+    /// Builds deterministic context for a task or question.
+    pub(crate) fn context(&self, query: &str, limit: usize, depth: usize) -> Result<ContextReport> {
+        let entry_report = self.search_symbols_filtered(
+            query,
+            limit.saturating_mul(3).max(limit),
+            &preferred_context_kinds(),
+        )?;
+        let entry_points = entry_report
+            .matches
+            .into_iter()
+            .filter(|entry| entry.symbol.kind != "file")
+            .take(limit)
+            .collect::<Vec<_>>();
+
+        let element_keys = ElementPropertyKeys::load(&self.read)?;
+        let relation_keys = RelationPropertyKeys::load(&self.read)?;
+        let mut related = BTreeMap::<u64, RelatedSymbol>::new();
+        let mut relationships = BTreeMap::<u64, RelationshipSummary>::new();
+        let entry_ids = entry_points
+            .iter()
+            .map(|entry| entry.symbol.id)
+            .collect::<BTreeSet<_>>();
+
+        for entry in &entry_points {
+            collect_context_relationships(
+                &self.read,
+                &element_keys,
+                &relation_keys,
+                entry.symbol.id,
+                depth,
+                &entry_ids,
+                &mut related,
+                &mut relationships,
+            )?;
+        }
+
+        let related_symbols = related.into_values().collect::<Vec<_>>();
+        let relationships = relationships.into_values().collect::<Vec<_>>();
+        let files = context_files(&entry_points, &related_symbols);
+        let summary = format!(
+            "found {} entry points, {} related symbols, and {} relationships for {:?}",
+            entry_points.len(),
+            related_symbols.len(),
+            relationships.len(),
+            query
+        );
+        Ok(ContextReport {
+            query: query.to_string(),
+            summary,
+            entry_points,
+            related_symbols,
+            relationships,
+            files,
+        })
+    }
+
+    /// Reads every symbol-like element from one read snapshot.
+    fn all_symbol_summaries(&self, keys: &ElementPropertyKeys) -> Result<Vec<SymbolSummary>> {
+        let result = self.execute_query(QueryLanguage::Oxql, "MATCH ELEMENTS")?;
+        result
+            .rows()
+            .iter()
+            .flat_map(|row| &row.values)
+            .filter_map(|value| match value {
+                QueryValue::Element(id) => Some(*id),
+                QueryValue::Relation(_)
+                | QueryValue::Incidence(_)
+                | QueryValue::Subject(_)
+                | QueryValue::Property(_)
+                | QueryValue::Text(_)
+                | QueryValue::Projection(_) => None,
+            })
+            .map(|id| symbol_summary_from_element(&self.read, keys, id))
+            .filter_map(|result| match result {
+                Ok(Some(symbol)) => Some(Ok(symbol)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
     pub(crate) fn resolve_one_symbol(&self, selector: &str) -> Result<SymbolSummary> {
         let keys = ElementPropertyKeys::load(&self.read)?;
         resolve_one_symbol_in_read(&self.read, &keys, selector)
@@ -172,31 +371,8 @@ impl ReadSession<'_> {
         }];
         let mut edges = Vec::new();
 
-        let Ok(graph) = self.read.graph_projection_by_name(schema::CALLS_PROJECTION) else {
-            return Ok(CallGraphReport {
-                selector: selector.to_string(),
-                seed,
-                direction,
-                depth,
-                limit,
-                symbols,
-                edges,
-            });
-        };
-        let Some(seed_local) = graph.local_element_id(seed_id) else {
-            return Ok(CallGraphReport {
-                selector: selector.to_string(),
-                seed,
-                direction,
-                depth,
-                limit,
-                symbols,
-                edges,
-            });
-        };
-
         let mut discovered = BTreeMap::from([(seed_id, 0_usize)]);
-        let mut queued = VecDeque::from([(seed_local, 0_usize)]);
+        let mut queued = VecDeque::from([(seed_id, 0_usize)]);
         let mut emitted_relations = BTreeSet::new();
 
         while let Some((current, current_depth)) = queued.pop_front() {
@@ -208,7 +384,6 @@ impl ReadSession<'_> {
                     &self.read,
                     &element_keys,
                     &relation_keys,
-                    &graph,
                     current,
                     current_depth,
                     limit,
@@ -225,7 +400,6 @@ impl ReadSession<'_> {
                     &self.read,
                     &element_keys,
                     &relation_keys,
-                    &graph,
                     current,
                     current_depth,
                     limit,
@@ -307,6 +481,12 @@ struct ElementPropertyKeys {
     end_line: PropertyKeyId,
     /// End column property.
     end_column: PropertyKeyId,
+    /// Optional signature property.
+    signature: Option<PropertyKeyId>,
+    /// Optional docstring property.
+    docstring: Option<PropertyKeyId>,
+    /// Optional source preview property.
+    source_preview: Option<PropertyKeyId>,
 }
 
 impl ElementPropertyKeys {
@@ -325,12 +505,19 @@ impl ElementPropertyKeys {
             start_column: require_property_key(read, "start_column")?,
             end_line: require_property_key(read, "end_line")?,
             end_column: require_property_key(read, "end_column")?,
+            signature: optional_property_key(read, "signature"),
+            docstring: optional_property_key(read, "docstring"),
+            source_preview: optional_property_key(read, "source_preview"),
         })
     }
 }
 
 /// Property keys needed for relation expansion.
 struct RelationPropertyKeys {
+    /// Source symbol stable key property.
+    source_key: PropertyKeyId,
+    /// Target symbol stable key property.
+    target_key: PropertyKeyId,
     /// Reference-site file path property.
     site_file_path: PropertyKeyId,
     /// Reference-site start line property.
@@ -353,6 +540,8 @@ impl RelationPropertyKeys {
     /// Loads required relation property keys from the catalog.
     fn load(read: &oxgraph::db::ReadTransaction) -> Result<Self> {
         Ok(Self {
+            source_key: require_property_key(read, "source_key")?,
+            target_key: require_property_key(read, "target_key")?,
             site_file_path: require_property_key(read, "site_file_path")?,
             site_start_line: require_property_key(read, "site_start_line")?,
             site_start_column: require_property_key(read, "site_start_column")?,
@@ -451,6 +640,529 @@ fn lookup_symbols_by_property(
     Ok(symbols)
 }
 
+/// Splits a user search query into normalized terms.
+fn search_terms(query: &str) -> Vec<String> {
+    let mut terms = BTreeSet::new();
+    let mut current = String::new();
+    let mut previous_lowercase = false;
+    for character in query.chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase() && previous_lowercase && !current.is_empty() {
+                terms.insert(current.to_ascii_lowercase());
+                current.clear();
+            }
+            previous_lowercase = character.is_ascii_lowercase() || character.is_ascii_digit();
+            current.push(character);
+        } else {
+            if !current.is_empty() {
+                terms.insert(current.to_ascii_lowercase());
+                current.clear();
+            }
+            previous_lowercase = false;
+        }
+    }
+    if !current.is_empty() {
+        terms.insert(current.to_ascii_lowercase());
+    }
+    terms.into_iter().filter(|term| term.len() > 1).collect()
+}
+
+/// Scores one symbol against normalized search terms.
+fn symbol_search_score(
+    symbol: &SymbolSummary,
+    terms: &[String],
+    normalized_query: &str,
+) -> Option<u32> {
+    let name = symbol.name.to_ascii_lowercase();
+    let qualified_name = symbol.qualified_name.to_ascii_lowercase();
+    let kind = symbol.kind.to_ascii_lowercase();
+    let file_path = symbol.definition.file_path.to_ascii_lowercase();
+    let signature = symbol
+        .signature
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let docstring = symbol
+        .docstring
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let searchable_tokens = symbol_search_tokens(symbol);
+    let mut score = 0_u32;
+
+    if qualified_name == normalized_query {
+        score += 2000;
+    }
+    if name == normalized_query {
+        score += 1800;
+    }
+    if terms
+        .iter()
+        .all(|term| token_or_substring_match(&searchable_tokens, &qualified_name, term))
+    {
+        score += 900;
+    }
+    if terms
+        .iter()
+        .all(|term| token_or_substring_match(&searchable_tokens, &name, term))
+    {
+        score += 800;
+    }
+    for term in terms {
+        if token_or_substring_match(&searchable_tokens, &name, term) {
+            score += 160;
+        }
+        if token_or_substring_match(&searchable_tokens, &qualified_name, term) {
+            score += 130;
+        }
+        if kind.contains(term) {
+            score += 45;
+        }
+        if signature.contains(term) {
+            score += 75;
+        }
+        if docstring.contains(term) {
+            score += 55;
+        }
+        if file_path.contains(term) {
+            score += 20;
+        }
+    }
+    score = score.saturating_add(kind_rank_bonus(&kind));
+    score = score.saturating_add(path_rank_bonus(&file_path, terms));
+    if is_test_like_path(&file_path) && !wants_test_like(terms) {
+        score /= 3;
+    }
+    if matches!(kind.as_str(), "file" | "module" | "impl_block") {
+        score /= 2;
+    }
+
+    (score > 0).then_some(score)
+}
+
+/// Tokenizes indexed symbol fields for search scoring.
+fn symbol_search_tokens(symbol: &SymbolSummary) -> BTreeSet<String> {
+    [
+        symbol.name.as_str(),
+        symbol.qualified_name.as_str(),
+        symbol.kind.as_str(),
+        symbol.definition.file_path.as_str(),
+        symbol.signature.as_deref().unwrap_or_default(),
+        symbol.docstring.as_deref().unwrap_or_default(),
+    ]
+    .into_iter()
+    .flat_map(search_terms)
+    .collect()
+}
+
+/// Returns whether one term matches a token or full field.
+fn token_or_substring_match(tokens: &BTreeSet<String>, field: &str, term: &str) -> bool {
+    tokens.contains(term) || field.contains(term)
+}
+
+/// Returns a deterministic kind ranking adjustment.
+fn kind_rank_bonus(kind: &str) -> u32 {
+    match kind {
+        "function" | "method" => 220,
+        "trait" | "struct" | "enum" => 160,
+        "type_alias" | "constant" | "macro" => 80,
+        "module" => 15,
+        "impl_block" => 5,
+        "file" => 0,
+        _ => 30,
+    }
+}
+
+/// Returns a deterministic path ranking adjustment.
+fn path_rank_bonus(file_path: &str, terms: &[String]) -> u32 {
+    let is_test_like = is_test_like_path(file_path);
+    if is_test_like && !wants_test_like(terms) {
+        return 0;
+    }
+    if file_path.starts_with("src/") || file_path.contains("/src/") {
+        120
+    } else if is_test_like {
+        30
+    } else {
+        60
+    }
+}
+
+/// Returns whether query terms ask for test-like paths.
+fn wants_test_like(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        matches!(
+            term.as_str(),
+            "test"
+                | "tests"
+                | "bench"
+                | "benches"
+                | "example"
+                | "examples"
+                | "fixture"
+                | "fixtures"
+        )
+    })
+}
+
+/// Returns whether a path belongs to a test-like tree.
+fn is_test_like_path(file_path: &str) -> bool {
+    file_path.contains("/tests/")
+        || file_path.starts_with("tests/")
+        || file_path.contains("/benches/")
+        || file_path.starts_with("benches/")
+        || file_path.contains("/examples/")
+        || file_path.starts_with("examples/")
+        || file_path.contains("/fixtures/")
+        || file_path.starts_with("fixtures/")
+}
+
+/// Scores one indexed file for file discovery.
+fn file_search_score(path: &str, symbols: &[SymbolSummary], terms: &[String]) -> Option<u32> {
+    if terms.is_empty() {
+        return Some(path_rank_bonus(&path.to_ascii_lowercase(), terms));
+    }
+
+    let path_lower = path.to_ascii_lowercase();
+    let path_tokens = search_terms(path);
+    let symbol_tokens = symbols
+        .iter()
+        .flat_map(symbol_search_tokens)
+        .collect::<BTreeSet<_>>();
+    let mut score = 0_u32;
+    for term in terms {
+        if path_tokens.iter().any(|token| token == term) {
+            score += 160;
+        }
+        if path_lower.contains(term) {
+            score += 100;
+        }
+        if symbol_tokens.contains(term) {
+            score += 80;
+        }
+    }
+    score = score.saturating_add(path_rank_bonus(&path_lower, terms));
+    (score > 0).then_some(score)
+}
+
+/// Default symbol kinds used as task context entry points.
+fn preferred_context_kinds() -> Vec<String> {
+    [
+        "function",
+        "method",
+        "trait",
+        "struct",
+        "enum",
+        "type_alias",
+        "constant",
+        "macro",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+/// Builds related context by walking direct graph relationships from one seed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps context graph traversal state explicit"
+)]
+fn collect_context_relationships(
+    read: &oxgraph::db::ReadTransaction,
+    element_keys: &ElementPropertyKeys,
+    relation_keys: &RelationPropertyKeys,
+    seed_id: u64,
+    max_depth: usize,
+    entry_ids: &BTreeSet<u64>,
+    related: &mut BTreeMap<u64, RelatedSymbol>,
+    relationships: &mut BTreeMap<u64, RelationshipSummary>,
+) -> Result<()> {
+    const MAX_RELATED_SYMBOLS: usize = 80;
+    const MAX_RELATIONSHIPS: usize = 200;
+
+    let mut queue = VecDeque::from([(ElementId::new(seed_id), 0_usize)]);
+    let mut visited = BTreeSet::from([seed_id]);
+    while let Some((current, current_depth)) = queue.pop_front() {
+        if current_depth >= max_depth || relationships.len() >= MAX_RELATIONSHIPS {
+            continue;
+        }
+        for kind in [
+            EdgeKind::Calls,
+            EdgeKind::Contains,
+            EdgeKind::References,
+            EdgeKind::Implements,
+        ] {
+            collect_context_edges(
+                read,
+                element_keys,
+                relation_keys,
+                kind,
+                current,
+                current_depth,
+                EdgeVisitDirection::Outgoing,
+                entry_ids,
+                &mut visited,
+                &mut queue,
+                related,
+                relationships,
+                MAX_RELATED_SYMBOLS,
+                MAX_RELATIONSHIPS,
+            )?;
+            if matches!(kind, EdgeKind::Contains | EdgeKind::References) {
+                continue;
+            }
+            collect_context_edges(
+                read,
+                element_keys,
+                relation_keys,
+                kind,
+                current,
+                current_depth,
+                EdgeVisitDirection::Incoming,
+                entry_ids,
+                &mut visited,
+                &mut queue,
+                related,
+                relationships,
+                MAX_RELATED_SYMBOLS,
+                MAX_RELATIONSHIPS,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps context graph traversal state explicit"
+)]
+fn collect_context_edges(
+    read: &oxgraph::db::ReadTransaction,
+    element_keys: &ElementPropertyKeys,
+    relation_keys: &RelationPropertyKeys,
+    kind: EdgeKind,
+    current: ElementId,
+    current_depth: usize,
+    direction: EdgeVisitDirection,
+    entry_ids: &BTreeSet<u64>,
+    visited: &mut BTreeSet<u64>,
+    queue: &mut VecDeque<(ElementId, usize)>,
+    related: &mut BTreeMap<u64, RelatedSymbol>,
+    relationships: &mut BTreeMap<u64, RelationshipSummary>,
+    max_related: usize,
+    max_relationships: usize,
+) -> Result<()> {
+    const MAX_CONTEXT_EDGES_PER_NODE: usize = 64;
+
+    let next_depth = current_depth + 1;
+    for edge in direct_relation_edges(
+        read,
+        element_keys,
+        relation_keys,
+        kind,
+        current,
+        direction,
+        MAX_CONTEXT_EDGES_PER_NODE,
+    ) {
+        if relationships.len() >= max_relationships {
+            break;
+        }
+        if let Some(summary) = relationship_summary_from_ids(
+            read,
+            element_keys,
+            relation_keys,
+            kind,
+            edge.relation,
+            edge.source,
+            edge.target,
+        )? {
+            relationships.entry(summary.relation_id).or_insert(summary);
+        }
+
+        let neighbor_id = edge.neighbor.get();
+        if entry_ids.contains(&neighbor_id) || related.len() >= max_related {
+            continue;
+        }
+        if let Some(symbol) = symbol_summary_from_element(read, element_keys, edge.neighbor)?
+            && is_context_related_symbol(&symbol)
+        {
+            related.entry(neighbor_id).or_insert_with(|| RelatedSymbol {
+                depth: next_depth,
+                reason: format!(
+                    "{} {} relationship",
+                    match direction {
+                        EdgeVisitDirection::Outgoing => "outgoing",
+                        EdgeVisitDirection::Incoming => "incoming",
+                    },
+                    kind.as_str()
+                ),
+                symbol,
+            });
+        }
+        if visited.insert(neighbor_id) {
+            queue.push_back((edge.neighbor, next_depth));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct DirectRelationEdge {
+    relation: RelationId,
+    source: ElementId,
+    target: ElementId,
+    neighbor: ElementId,
+}
+
+fn direct_relation_edges(
+    read: &oxgraph::db::ReadTransaction,
+    element_keys: &ElementPropertyKeys,
+    relation_keys: &RelationPropertyKeys,
+    kind: EdgeKind,
+    current: ElementId,
+    direction: EdgeVisitDirection,
+    limit: usize,
+) -> Vec<DirectRelationEdge> {
+    let Some(relation_type) = read.catalog().relation_type_id(kind.as_str()) else {
+        return Vec::new();
+    };
+    let Some(source_role) = read.catalog().role_id(schema::SOURCE_ROLE) else {
+        return Vec::new();
+    };
+    let Some(target_role) = read.catalog().role_id(schema::TARGET_ROLE) else {
+        return Vec::new();
+    };
+
+    let mut edges = Vec::new();
+    for incidence in read.element_incidences(current) {
+        if edges.len() >= limit {
+            break;
+        }
+        let current_is_source = incidence.role == source_role;
+        let current_is_target = incidence.role == target_role;
+        if matches!(direction, EdgeVisitDirection::Outgoing) && !current_is_source {
+            continue;
+        }
+        if matches!(direction, EdgeVisitDirection::Incoming) && !current_is_target {
+            continue;
+        }
+
+        let Some(relation) = read.relation(incidence.relation) else {
+            continue;
+        };
+        if relation.relation_type != Some(relation_type) {
+            continue;
+        }
+        let Some((source, target)) =
+            relation_endpoints(read, element_keys, relation_keys, relation.id)
+        else {
+            continue;
+        };
+        let neighbor = match direction {
+            EdgeVisitDirection::Outgoing => target,
+            EdgeVisitDirection::Incoming => source,
+        };
+        edges.push(DirectRelationEdge {
+            relation: relation.id,
+            source,
+            target,
+            neighbor,
+        });
+    }
+    edges
+}
+
+fn relation_endpoints(
+    read: &oxgraph::db::ReadTransaction,
+    element_keys: &ElementPropertyKeys,
+    relation_keys: &RelationPropertyKeys,
+    relation: RelationId,
+) -> Option<(ElementId, ElementId)> {
+    let subject = PropertySubject::Relation(relation);
+    let source_key = optional_text_property(read, subject, relation_keys.source_key)?;
+    let target_key = optional_text_property(read, subject, relation_keys.target_key)?;
+    let source = element_by_stable_key(read, element_keys, &source_key)?;
+    let target = element_by_stable_key(read, element_keys, &target_key)?;
+    Some((source, target))
+}
+
+fn element_by_stable_key(
+    read: &oxgraph::db::ReadTransaction,
+    keys: &ElementPropertyKeys,
+    stable_key: &str,
+) -> Option<ElementId> {
+    read.lookup_property_equal(
+        keys.stable_key,
+        &PropertyValue::Text(stable_key.to_owned()),
+    )
+    .ok()?
+    .into_iter()
+    .find_map(|subject| match subject {
+        PropertySubject::Element(id) => Some(id),
+        PropertySubject::Relation(_) | PropertySubject::Incidence(_) => None,
+    })
+}
+
+/// Builds one generic relationship summary from canonical endpoint IDs.
+fn relationship_summary_from_ids(
+    read: &oxgraph::db::ReadTransaction,
+    element_keys: &ElementPropertyKeys,
+    relation_keys: &RelationPropertyKeys,
+    kind: EdgeKind,
+    relation: RelationId,
+    source: ElementId,
+    target: ElementId,
+) -> Result<Option<RelationshipSummary>> {
+    let Some(source) = symbol_summary_from_element(read, element_keys, source)? else {
+        return Ok(None);
+    };
+    let Some(target) = symbol_summary_from_element(read, element_keys, target)? else {
+        return Ok(None);
+    };
+    Ok(Some(RelationshipSummary {
+        relation_id: relation.get(),
+        kind: kind.as_str().to_string(),
+        source,
+        target,
+        site: call_site_summary(read, relation_keys, relation),
+    }))
+}
+
+/// Returns whether one adjacent symbol is useful in context output.
+fn is_context_related_symbol(symbol: &SymbolSummary) -> bool {
+    !matches!(symbol.kind.as_str(), "file" | "unresolved_reference")
+}
+
+/// Aggregates file counts for context output.
+fn context_files(
+    entry_points: &[SymbolSearchMatch],
+    related_symbols: &[RelatedSymbol],
+) -> Vec<ContextFileSummary> {
+    let mut files = BTreeMap::<String, (usize, usize)>::new();
+    for entry in entry_points {
+        files
+            .entry(entry.symbol.definition.file_path.clone())
+            .or_default()
+            .0 += 1;
+    }
+    for related in related_symbols {
+        files
+            .entry(related.symbol.definition.file_path.clone())
+            .or_default()
+            .1 += 1;
+    }
+    files
+        .into_iter()
+        .map(
+            |(path, (matched_symbols, related_symbols))| ContextFileSummary {
+                path,
+                matched_symbols,
+                related_symbols,
+            },
+        )
+        .collect()
+}
+
 /// Resolves a `file:path:line` selector to the innermost matching symbol.
 fn resolve_file_line_selector(
     read: &oxgraph::db::ReadTransaction,
@@ -500,30 +1212,29 @@ fn visit_call_edges(
     read: &oxgraph::db::ReadTransaction,
     element_keys: &ElementPropertyKeys,
     relation_keys: &RelationPropertyKeys,
-    graph: &oxgraph::db::GraphProjection,
-    current: oxgraph::db::ProjectionElementId,
+    current: ElementId,
     current_depth: usize,
     limit: usize,
     direction: EdgeVisitDirection,
     discovered: &mut BTreeMap<ElementId, usize>,
-    queued: &mut VecDeque<(oxgraph::db::ProjectionElementId, usize)>,
+    queued: &mut VecDeque<(ElementId, usize)>,
     symbols: &mut Vec<TraversedSymbol>,
     emitted_relations: &mut BTreeSet<RelationId>,
     edges: &mut Vec<CallEdgeSummary>,
 ) -> Result<()> {
-    let local_edges = match direction {
-        EdgeVisitDirection::Outgoing => graph.outgoing_edges(current).collect::<Vec<_>>(),
-        EdgeVisitDirection::Incoming => graph.incoming_edges(current).collect::<Vec<_>>(),
-    };
+    const MAX_CALL_EDGES_PER_NODE: usize = 128;
+
     let next_depth = current_depth + 1;
-    for local_edge in local_edges {
-        let source_local = graph.source(local_edge);
-        let target_local = graph.target(local_edge);
-        let neighbor_local = match direction {
-            EdgeVisitDirection::Outgoing => target_local,
-            EdgeVisitDirection::Incoming => source_local,
-        };
-        let neighbor = graph.canonical_element_id(neighbor_local);
+    for edge in direct_relation_edges(
+        read,
+        element_keys,
+        relation_keys,
+        EdgeKind::Calls,
+        current,
+        direction,
+        MAX_CALL_EDGES_PER_NODE,
+    ) {
+        let neighbor = edge.neighbor;
         if let std::collections::btree_map::Entry::Vacant(entry) = discovered.entry(neighbor) {
             if symbols.len().saturating_sub(1) >= limit {
                 continue;
@@ -532,22 +1243,21 @@ fn visit_call_edges(
                 continue;
             };
             entry.insert(next_depth);
-            queued.push_back((neighbor_local, next_depth));
+            queued.push_back((neighbor, next_depth));
             symbols.push(TraversedSymbol {
                 depth: next_depth,
                 symbol,
             });
         }
 
-        let relation = graph.canonical_relation_id(local_edge);
-        if emitted_relations.insert(relation)
+        if emitted_relations.insert(edge.relation)
             && let Some(edge) = call_edge_summary(
                 read,
                 element_keys,
                 relation_keys,
-                relation,
-                graph.canonical_element_id(source_local),
-                graph.canonical_element_id(target_local),
+                edge.relation,
+                edge.source,
+                edge.target,
                 next_depth,
             )?
         {
@@ -712,6 +1422,15 @@ fn symbol_summary_from_element(
             end_line,
             end_column,
         },
+        signature: keys
+            .signature
+            .and_then(|key| optional_text_property(read, subject, key)),
+        docstring: keys
+            .docstring
+            .and_then(|key| optional_text_property(read, subject, key)),
+        source_preview: keys
+            .source_preview
+            .and_then(|key| optional_text_property(read, subject, key)),
     }))
 }
 
@@ -731,6 +1450,14 @@ fn require_property_key(
             item: "property",
             name: name.to_string(),
         })
+}
+
+/// Reads one optional property key by catalog name.
+fn optional_property_key(
+    read: &oxgraph::db::ReadTransaction,
+    name: &'static str,
+) -> Option<PropertyKeyId> {
+    read.catalog().property_key_id(name)
 }
 
 /// Reads one optional text property.
@@ -783,12 +1510,14 @@ pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<Pat
     let element_properties = register_element_properties(&mut writer)?;
     let relation_properties = register_relation_properties(&mut writer)?;
     define_property_indexes(&mut writer, &element_properties)?;
-    writer.define_projection(ProjectionDefinition::Graph(GraphProjectionDefinition {
-        name: schema::CALLS_PROJECTION.to_owned(),
-        relation_types: BTreeSet::from([relation_types[&EdgeKind::Calls]]),
-        source_role,
-        target_role,
-    }))?;
+    for kind in EdgeKind::ALL {
+        writer.define_projection(ProjectionDefinition::Graph(GraphProjectionDefinition {
+            name: kind.as_str().to_owned(),
+            relation_types: BTreeSet::from([relation_types[&kind]]),
+            source_role,
+            target_role,
+        }))?;
+    }
 
     let files = index
         .files
@@ -900,6 +1629,9 @@ fn register_element_properties(
         ("start_column", PropertyType::Integer),
         ("end_line", PropertyType::Integer),
         ("end_column", PropertyType::Integer),
+        ("signature", PropertyType::Text),
+        ("docstring", PropertyType::Text),
+        ("source_preview", PropertyType::Text),
         ("unresolved_source_key", PropertyType::Text),
         ("target_raw", PropertyType::Text),
         ("target_normalized", PropertyType::Text),
@@ -987,6 +1719,21 @@ fn set_symbol_properties(
     )?;
     set_text(writer, element, properties, "file_path", &node.file_path)?;
     set_span_properties(writer, element, properties, node.span)?;
+    if let Some(signature) = &node.signature {
+        set_text(writer, element, properties, "signature", signature)?;
+    }
+    if let Some(docstring) = &node.docstring {
+        set_text(writer, element, properties, "docstring", docstring)?;
+    }
+    if let Some(source_preview) = &node.source_preview {
+        set_text(
+            writer,
+            element,
+            properties,
+            "source_preview",
+            source_preview,
+        )?;
+    }
 
     if node.kind == NodeKind::File
         && let Some(file) = file

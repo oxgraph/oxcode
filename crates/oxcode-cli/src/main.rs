@@ -2,13 +2,15 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use oxcode_core::{
-    Error, GraphDirection, OxQueryResult, ProjectIndex, call_graph, describe_symbol,
-    explain_project, format_call_graph_report, format_expanded_query_report, format_query_value,
-    format_selector_matches, format_symbol_report, index_project, language_support,
-    parse_graph_direction, parse_query_language, project_status, query_project,
+    Error, GraphDirection, OxQueryResult, ProjectIndex, SymbolReport, SymbolSummary,
+    explain_project, format_call_graph_report, format_context_report, format_expanded_query_report,
+    format_file_search_report, format_query_value, format_selector_matches,
+    format_selector_not_found, format_symbol_report, format_symbol_search_report, index_project,
+    language_support, parse_graph_direction, parse_node_kind, parse_query_language, project_status,
+    query_project,
 };
 
 /// Generate and query code graphs stored in a native OxGraph database.
@@ -47,7 +49,58 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Execute an OxGraph database query.
+    /// Search indexed symbols by agent-friendly keywords.
+    Symbols {
+        /// Optional keyword query.
+        query: Option<String>,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Maximum candidate count.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Restrict results to one symbol kind. Repeat for multiple kinds.
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build task-oriented context from indexed symbols and relationships.
+    Context {
+        /// Task or question text.
+        query: String,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Maximum entry point count.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Relationship hop depth.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search indexed files by agent-friendly keywords.
+    Files {
+        /// Optional keyword query.
+        query: Option<String>,
+        /// Project root.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Maximum file count.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute a raw OxGraph database query.
+    #[command(
+        long_about = "Execute a raw OxGraph database query.\n\nAccepted OxQL profile:\n  CATALOG\n  MATCH ELEMENTS\n  MATCH ELEMENTS HAS LABEL <label>\n  MATCH ELEMENTS WHERE <property> = '<value>'\n  MATCH RELATIONS TYPE <type>\n  GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]\n\nUse `oxcode symbols <keywords>` for keyword discovery."
+    )]
     Query {
         /// Query text.
         query: String,
@@ -60,6 +113,9 @@ enum Command {
         /// Print a compact table instead of JSON.
         #[arg(long)]
         table: bool,
+        /// Print machine-readable JSON. This is the default for raw queries.
+        #[arg(long)]
+        json: bool,
         /// Expand OxGraph IDs into agent-readable code context.
         #[arg(long)]
         expand: bool,
@@ -129,7 +185,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Explain an OxGraph database query plan.
+    /// Explain a raw OxGraph database query plan.
+    #[command(
+        long_about = "Explain a raw OxGraph database query plan.\n\nAccepted OxQL profile:\n  CATALOG\n  MATCH ELEMENTS\n  MATCH ELEMENTS HAS LABEL <label>\n  MATCH ELEMENTS WHERE <property> = '<value>'\n  MATCH RELATIONS TYPE <type>\n  GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]\n\nUse `oxcode symbols <keywords>` for keyword discovery."
+    )]
     Explain {
         /// Query text.
         query: String,
@@ -217,13 +276,60 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::Symbols {
+            query,
+            path,
+            limit,
+            kinds,
+            json,
+        } => {
+            let query = query.unwrap_or_default();
+            validate_kinds(&kinds)?;
+            let report =
+                ProjectIndex::open(path)?.search_symbols_filtered(&query, limit, &kinds)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_symbol_search_report(&report));
+            }
+        }
+        Command::Context {
+            query,
+            path,
+            limit,
+            depth,
+            json,
+        } => {
+            let report = ProjectIndex::open(path)?.context(&query, limit, depth)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_context_report(&report));
+            }
+        }
+        Command::Files {
+            query,
+            path,
+            limit,
+            json,
+        } => {
+            let query = query.unwrap_or_default();
+            let report = ProjectIndex::open(path)?.search_files(&query, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_file_search_report(&report));
+            }
+        }
         Command::Query {
             query,
             path,
             language,
             table,
+            json: _json,
             expand,
         } => {
+            ensure_raw_query(&language, &query)?;
             let language = parse_query_language(&language).map_err(anyhow::Error::msg)?;
             if expand {
                 let report = ProjectIndex::open(path)?.query_expanded(language, &query)?;
@@ -243,12 +349,7 @@ fn run() -> Result<()> {
             path,
             json,
         } => {
-            let report = describe_symbol(path, &selector)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", format_symbol_report(&report));
-            }
+            print_symbol_resolution(path, &selector, json)?;
         }
         Command::Calls {
             selector,
@@ -257,7 +358,7 @@ fn run() -> Result<()> {
             limit,
             json,
         } => {
-            print_call_graph(
+            print_call_graph_resolution(
                 path,
                 &selector,
                 GraphDirection::Outgoing,
@@ -273,7 +374,7 @@ fn run() -> Result<()> {
             limit,
             json,
         } => {
-            print_call_graph(
+            print_call_graph_resolution(
                 path,
                 &selector,
                 GraphDirection::Incoming,
@@ -291,13 +392,14 @@ fn run() -> Result<()> {
             json,
         } => {
             let direction = parse_graph_direction(&direction).map_err(anyhow::Error::msg)?;
-            print_call_graph(path, &selector, direction, depth, limit, json)?;
+            print_call_graph_resolution(path, &selector, direction, depth, limit, json)?;
         }
         Command::Explain {
             query,
             path,
             language,
         } => {
+            ensure_raw_query(&language, &query)?;
             let language = parse_query_language(&language).map_err(anyhow::Error::msg)?;
             println!("{}", explain_project(path, language, &query)?);
         }
@@ -305,8 +407,36 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Prints one call graph report.
-fn print_call_graph(
+/// Prints one selector-aware symbol report.
+fn print_symbol_resolution(path: PathBuf, selector: &str, json: bool) -> Result<()> {
+    let index = ProjectIndex::open(path)?;
+    match index.resolve_selector(selector)?.as_slice() {
+        [symbol] => {
+            let report = SymbolReport {
+                selector: selector.to_string(),
+                symbol: symbol.clone(),
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "matched",
+                        "selector": selector,
+                        "report": report,
+                    }))?
+                );
+            } else {
+                print!("{}", format_symbol_report(&report));
+            }
+        }
+        [] => print_selector_not_found(selector, json)?,
+        matches => print_selector_ambiguous(selector, matches, json)?,
+    }
+    Ok(())
+}
+
+/// Prints one selector-aware call graph report.
+fn print_call_graph_resolution(
     path: PathBuf,
     selector: &str,
     direction: GraphDirection,
@@ -314,11 +444,85 @@ fn print_call_graph(
     limit: usize,
     json: bool,
 ) -> Result<()> {
-    let report = call_graph(path, selector, direction, depth, limit)?;
+    let index = ProjectIndex::open(path)?;
+    match index.resolve_selector(selector)?.as_slice() {
+        [symbol] => {
+            let mut report =
+                index.call_graph(&format!("element:{}", symbol.id), direction, depth, limit)?;
+            report.selector = selector.to_string();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "matched",
+                        "selector": selector,
+                        "report": report,
+                    }))?
+                );
+            } else {
+                print!("{}", format_call_graph_report(&report));
+            }
+        }
+        [] => print_selector_not_found(selector, json)?,
+        matches => print_selector_ambiguous(selector, matches, json)?,
+    }
+    Ok(())
+}
+
+/// Prints one ambiguous selector response.
+fn print_selector_ambiguous(selector: &str, matches: &[SymbolSummary], json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ambiguous",
+                "selector": selector,
+                "matches": matches,
+            }))?
+        );
     } else {
-        print!("{}", format_call_graph_report(&report));
+        print!("{}", format_selector_matches(selector, matches));
+    }
+    Ok(())
+}
+
+/// Prints one not-found selector response.
+fn print_selector_not_found(selector: &str, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "not_found",
+                "selector": selector,
+                "matches": [],
+            }))?
+        );
+    } else {
+        print!("{}", format_selector_not_found(selector));
+    }
+    Ok(())
+}
+
+/// Rejects obvious keyword search text passed to raw query commands.
+fn ensure_raw_query(language: &str, query: &str) -> Result<()> {
+    let first = query.split_whitespace().next().unwrap_or_default();
+    let first = first.to_ascii_uppercase();
+    let language = language.to_ascii_lowercase();
+    let looks_structured = match language.as_str() {
+        "oxql" => matches!(first.as_str(), "CATALOG" | "MATCH" | "GRAPH"),
+        "cypher" => first == "MATCH",
+        _ => true,
+    };
+    if !looks_structured {
+        bail!("query expects OxQL/Cypher; use oxcode symbols for keyword discovery");
+    }
+    Ok(())
+}
+
+/// Validates symbol kind filters before opening the index.
+fn validate_kinds(kinds: &[String]) -> Result<()> {
+    for kind in kinds {
+        parse_node_kind(kind).map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }

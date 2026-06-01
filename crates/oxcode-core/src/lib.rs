@@ -21,8 +21,9 @@ mod store;
 
 pub use crate::error::{Error, Result};
 pub use crate::format::{
-    format_call_graph_report, format_expanded_query_report, format_query_value,
-    format_selector_matches, format_symbol_report,
+    format_call_graph_report, format_context_report, format_expanded_query_report,
+    format_file_search_report, format_query_value, format_selector_matches,
+    format_selector_not_found, format_symbol_report, format_symbol_search_report,
 };
 pub use crate::paths::{DATABASE_DIR, INDEX_DIR, database_dir, index_dir};
 pub use crate::resolve::resolve_extractions;
@@ -98,6 +99,18 @@ pub fn parse_graph_direction(value: &str) -> std::result::Result<GraphDirection,
     }
 }
 
+/// Parses a node kind filter.
+pub fn parse_node_kind(value: &str) -> std::result::Result<NodeKind, String> {
+    NodeKind::parse(value).ok_or_else(|| {
+        let valid = NodeKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("unknown node kind {value}; expected one of: {valid}")
+    })
+}
+
 /// Opened project index facade.
 pub struct ProjectIndex {
     store: OxGraphStore,
@@ -115,6 +128,34 @@ impl ProjectIndex {
     pub fn resolve_selector(&self, selector: &str) -> Result<Vec<SymbolSummary>> {
         self.store
             .with_read(|read| nav::resolve_selector(read, selector))
+    }
+
+    /// Searches indexed symbols by agent-friendly keywords.
+    pub fn search_symbols(&self, query: &str, limit: usize) -> Result<SymbolSearchReport> {
+        self.store
+            .with_read(|read| read.search_symbols(query, limit))
+    }
+
+    /// Searches indexed symbols by keywords and kind filters.
+    pub fn search_symbols_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        kinds: &[String],
+    ) -> Result<SymbolSearchReport> {
+        self.store
+            .with_read(|read| read.search_symbols_filtered(query, limit, kinds))
+    }
+
+    /// Searches indexed files by keywords.
+    pub fn search_files(&self, query: &str, limit: usize) -> Result<FileSearchReport> {
+        self.store.with_read(|read| read.search_files(query, limit))
+    }
+
+    /// Builds deterministic task-oriented context.
+    pub fn context(&self, query: &str, limit: usize, depth: usize) -> Result<ContextReport> {
+        self.store
+            .with_read(|read| read.context(query, limit, depth))
     }
 
     /// Describes one selected symbol.
@@ -149,6 +190,40 @@ impl ProjectIndex {
 /// Resolves one selector into matching symbols.
 pub fn resolve_selector(root: impl AsRef<Path>, selector: &str) -> Result<Vec<SymbolSummary>> {
     ProjectIndex::open(root)?.resolve_selector(selector)
+}
+
+/// Searches indexed symbols by agent-friendly keywords.
+pub fn search_symbols(
+    root: impl AsRef<Path>,
+    query: &str,
+    limit: usize,
+) -> Result<SymbolSearchReport> {
+    ProjectIndex::open(root)?.search_symbols(query, limit)
+}
+
+/// Searches indexed symbols by keywords and kind filters.
+pub fn search_symbols_filtered(
+    root: impl AsRef<Path>,
+    query: &str,
+    limit: usize,
+    kinds: &[String],
+) -> Result<SymbolSearchReport> {
+    ProjectIndex::open(root)?.search_symbols_filtered(query, limit, kinds)
+}
+
+/// Searches indexed files by keywords.
+pub fn search_files(root: impl AsRef<Path>, query: &str, limit: usize) -> Result<FileSearchReport> {
+    ProjectIndex::open(root)?.search_files(query, limit)
+}
+
+/// Builds deterministic task-oriented context.
+pub fn context_project(
+    root: impl AsRef<Path>,
+    query: &str,
+    limit: usize,
+    depth: usize,
+) -> Result<ContextReport> {
+    ProjectIndex::open(root)?.context(query, limit, depth)
 }
 
 /// Describes one selected symbol.

@@ -228,6 +228,31 @@ impl NodeKind {
             Self::Macro => "macro",
         }
     }
+
+    /// Parses a stable storage representation.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "file" => Some(Self::File),
+            "module" => Some(Self::Module),
+            "namespace" => Some(Self::Namespace),
+            "package" => Some(Self::Package),
+            "class" => Some(Self::Class),
+            "struct" => Some(Self::Struct),
+            "enum" => Some(Self::Enum),
+            "trait" => Some(Self::Trait),
+            "interface" => Some(Self::Interface),
+            "impl_block" => Some(Self::ImplBlock),
+            "function" => Some(Self::Function),
+            "method" => Some(Self::Method),
+            "field" => Some(Self::Field),
+            "variable" => Some(Self::Variable),
+            "constant" => Some(Self::Constant),
+            "type_alias" => Some(Self::TypeAlias),
+            "macro" => Some(Self::Macro),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for NodeKind {
@@ -344,6 +369,12 @@ pub struct SymbolNode {
     pub file_path: String,
     /// Source span.
     pub span: SourceSpan,
+    /// Compact declaration or header.
+    pub signature: Option<String>,
+    /// Documentation comments directly attached to the symbol.
+    pub docstring: Option<String>,
+    /// Bounded source excerpt for agent-facing context.
+    pub source_preview: Option<String>,
 }
 
 /// A resolved symbolic edge.
@@ -568,6 +599,110 @@ pub struct SymbolSummary {
     pub language: String,
     /// Definition source location.
     pub definition: CodeLocation,
+    /// Compact declaration or header.
+    pub signature: Option<String>,
+    /// Documentation comments directly attached to the symbol.
+    pub docstring: Option<String>,
+    /// Bounded source excerpt for agent-facing context.
+    pub source_preview: Option<String>,
+}
+
+/// One scored symbol search candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolSearchMatch {
+    /// Higher values indicate a stronger match for the query.
+    pub score: u32,
+    /// Matching symbol.
+    pub symbol: SymbolSummary,
+}
+
+/// Agent-friendly symbol discovery report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolSearchReport {
+    /// Original search text.
+    pub query: String,
+    /// Maximum number of candidates requested.
+    pub limit: usize,
+    /// Ranked matching symbols.
+    pub matches: Vec<SymbolSearchMatch>,
+}
+
+/// One relationship expanded into code-aware context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipSummary {
+    /// OxGraph relation ID.
+    pub relation_id: u64,
+    /// Stored edge kind.
+    pub kind: String,
+    /// Source symbol.
+    pub source: SymbolSummary,
+    /// Target symbol.
+    pub target: SymbolSummary,
+    /// Optional source-reference site.
+    pub site: Option<CallSiteSummary>,
+}
+
+/// One symbol related to a task-oriented context entry point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelatedSymbol {
+    /// Shortest discovered hop depth.
+    pub depth: usize,
+    /// Why this symbol is included.
+    pub reason: String,
+    /// Related symbol.
+    pub symbol: SymbolSummary,
+}
+
+/// File-level summary for agent navigation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSummary {
+    /// Repository-relative file path.
+    pub path: String,
+    /// Matching score for file search.
+    pub score: u32,
+    /// Number of indexed symbols in the file, excluding the file node itself.
+    pub symbol_count: usize,
+    /// Top symbols in source order.
+    pub top_symbols: Vec<SymbolSummary>,
+}
+
+/// Agent-friendly file discovery report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSearchReport {
+    /// Original search text.
+    pub query: String,
+    /// Maximum number of files requested.
+    pub limit: usize,
+    /// Ranked matching files.
+    pub files: Vec<FileSummary>,
+}
+
+/// File contribution inside a task-oriented context report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFileSummary {
+    /// Repository-relative file path.
+    pub path: String,
+    /// Number of entry-point symbols in the file.
+    pub matched_symbols: usize,
+    /// Number of related symbols in the file.
+    pub related_symbols: usize,
+}
+
+/// Deterministic task-oriented context report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextReport {
+    /// Original task or question text.
+    pub query: String,
+    /// Compact deterministic summary of what was found.
+    pub summary: String,
+    /// Best matching symbols for the task.
+    pub entry_points: Vec<SymbolSearchMatch>,
+    /// Symbols adjacent to entry points.
+    pub related_symbols: Vec<RelatedSymbol>,
+    /// Relationships connecting entry points and adjacent symbols.
+    pub relationships: Vec<RelationshipSummary>,
+    /// Files represented by entry points and adjacent symbols.
+    pub files: Vec<ContextFileSummary>,
 }
 
 /// A symbol discovered during a bounded graph walk.

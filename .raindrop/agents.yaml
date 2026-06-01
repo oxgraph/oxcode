@@ -1,0 +1,21 @@
+oxcode-benchmark:
+  command: node scripts/agent-eval/replay-server.mjs
+
+  input:
+    task_id: string
+    task_file: string
+    repo_path: string
+    arm: string
+    run_index: number
+    suite_id: string
+
+  prefillFromTrace:
+    task_id: properties.task_id
+    task_file: properties.task_file
+    repo_path: properties.repo_path
+    arm: properties.arm
+    run_index: properties.run_index
+    suite_id: properties.suite_id
+
+  models:
+    - gpt-5.5

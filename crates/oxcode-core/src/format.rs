@@ -1,5 +1,6 @@
 use oxcode_model::{
-    CallGraphReport, CodeLocation, ExpandedQueryReport, SymbolReport, SymbolSummary,
+    CallGraphReport, CodeLocation, ContextReport, ExpandedQueryReport, FileSearchReport,
+    SymbolReport, SymbolSearchReport, SymbolSummary,
 };
 use oxgraph::db::{PropertySubject, QueryValue};
 
@@ -32,6 +33,105 @@ pub fn format_query_value(value: &QueryValue) -> String {
 pub fn format_symbol_report(report: &SymbolReport) -> String {
     let mut output = String::new();
     push_symbol_block(&mut output, "symbol", &report.symbol);
+    output
+}
+
+/// Formats one symbol search report for agent-facing CLI output.
+#[must_use]
+pub fn format_symbol_search_report(report: &SymbolSearchReport) -> String {
+    let mut output = String::new();
+    if report.matches.is_empty() {
+        output.push_str(&format!("no symbols matched {:?}\n", report.query));
+        return output;
+    }
+    for entry in &report.matches {
+        output.push_str(&format!(
+            "{} score={}\n",
+            symbol_inline(&entry.symbol),
+            entry.score
+        ));
+        push_symbol_metadata(&mut output, &entry.symbol, "  ");
+    }
+    output
+}
+
+/// Formats one file search report for agent-facing CLI output.
+#[must_use]
+pub fn format_file_search_report(report: &FileSearchReport) -> String {
+    let mut output = String::new();
+    if report.files.is_empty() {
+        output.push_str(&format!("no files matched {:?}\n", report.query));
+        return output;
+    }
+    for file in &report.files {
+        output.push_str(&format!(
+            "{} symbols={} score={}\n",
+            file.path, file.symbol_count, file.score
+        ));
+        for symbol in &file.top_symbols {
+            output.push_str(&format!("  {}\n", symbol_inline(symbol)));
+        }
+    }
+    output
+}
+
+/// Formats one task-oriented context report for agent-facing CLI output.
+#[must_use]
+pub fn format_context_report(report: &ContextReport) -> String {
+    let mut output = format!("context {:?}\n{}\n", report.query, report.summary);
+    output.push_str("entry points\n");
+    if report.entry_points.is_empty() {
+        output.push_str("  none\n");
+    }
+    for entry in &report.entry_points {
+        output.push_str(&format!(
+            "  {} score={}\n",
+            symbol_inline(&entry.symbol),
+            entry.score
+        ));
+        push_symbol_metadata(&mut output, &entry.symbol, "    ");
+    }
+    output.push_str("related symbols\n");
+    if report.related_symbols.is_empty() {
+        output.push_str("  none\n");
+    }
+    for related in &report.related_symbols {
+        output.push_str(&format!(
+            "  depth {} {} {}\n",
+            related.depth,
+            related.reason,
+            symbol_inline(&related.symbol)
+        ));
+    }
+    output.push_str("relationships\n");
+    if report.relationships.is_empty() {
+        output.push_str("  none\n");
+    }
+    for relationship in &report.relationships {
+        output.push_str(&format!(
+            "  {} relation:{} {} -> {}\n",
+            relationship.kind,
+            relationship.relation_id,
+            symbol_inline(&relationship.source),
+            symbol_inline(&relationship.target)
+        ));
+        if let Some(site) = &relationship.site {
+            output.push_str(&format!("    site {}\n", location_range(&site.location)));
+            if !site.text.is_empty() {
+                output.push_str(&format!("    expression {}\n", site.text));
+            }
+        }
+    }
+    output.push_str("files\n");
+    if report.files.is_empty() {
+        output.push_str("  none\n");
+    }
+    for file in &report.files {
+        output.push_str(&format!(
+            "  {} matched={} related={}\n",
+            file.path, file.matched_symbols, file.related_symbols
+        ));
+    }
     output
 }
 
@@ -125,7 +225,20 @@ pub fn format_selector_matches(selector: &str, matches: &[SymbolSummary]) -> Str
             symbol.qualified_name
         ));
     }
+    output.push_str(&format!(
+        "use oxcode symbols {:?} --path . to search candidates\n",
+        selector_search_query(selector)
+    ));
     output
+}
+
+/// Formats one selector miss for agent-facing CLI output.
+#[must_use]
+pub fn format_selector_not_found(selector: &str) -> String {
+    format!(
+        "selector {selector:?} did not match any symbol\nuse oxcode symbols {:?} --path . to search candidates\n",
+        selector_search_query(selector)
+    )
 }
 
 fn push_symbol_block(output: &mut String, label: &str, symbol: &SymbolSummary) {
@@ -136,6 +249,25 @@ fn push_symbol_block(output: &mut String, label: &str, symbol: &SymbolSummary) {
         "  defined at {}\n",
         location_range(&symbol.definition)
     ));
+    push_symbol_metadata(output, symbol, "  ");
+}
+
+fn push_symbol_metadata(output: &mut String, symbol: &SymbolSummary, indent: &str) {
+    if let Some(signature) = &symbol.signature {
+        output.push_str(&format!("{indent}signature {signature}\n"));
+    }
+    if let Some(docstring) = &symbol.docstring {
+        output.push_str(&format!(
+            "{indent}docs {}\n",
+            one_line_preview(docstring, 240)
+        ));
+    }
+    if let Some(source_preview) = &symbol.source_preview {
+        output.push_str(&format!(
+            "{indent}preview {}\n",
+            one_line_preview(source_preview, 240)
+        ));
+    }
 }
 
 /// Formats one symbol on a single line.
@@ -159,4 +291,17 @@ fn location_range(location: &CodeLocation) -> String {
         location.end_line,
         location.end_column
     )
+}
+
+fn selector_search_query(selector: &str) -> &str {
+    selector
+        .strip_prefix("name:")
+        .or_else(|| selector.strip_prefix("element:"))
+        .or_else(|| selector.strip_prefix("file:"))
+        .unwrap_or(selector)
+}
+
+fn one_line_preview(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(max_chars).collect()
 }

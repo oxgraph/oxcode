@@ -202,6 +202,9 @@ mod tests {
                 start_byte,
                 ..SourceSpan::default()
             },
+            signature: Some(format!("fn {qualified_name}()")),
+            docstring: None,
+            source_preview: Some(format!("fn {qualified_name}() {{}}")),
         }
     }
 }
