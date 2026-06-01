@@ -36,8 +36,6 @@ pub enum ElementProperty {
     Language,
     /// Repository-relative file path.
     FilePath,
-    /// Per-file parse quality (only set on `file` elements).
-    ParseQuality,
     /// Inclusive start byte.
     StartByte,
     /// Exclusive end byte.
@@ -76,7 +74,6 @@ impl ElementProperty {
         Self::RawKind,
         Self::Language,
         Self::FilePath,
-        Self::ParseQuality,
         Self::StartByte,
         Self::EndByte,
         Self::StartLine,
@@ -113,7 +110,6 @@ impl ElementProperty {
             Self::RawKind => "raw_kind",
             Self::Language => "language",
             Self::FilePath => "file_path",
-            Self::ParseQuality => "parse_quality",
             Self::StartByte => "start_byte",
             Self::EndByte => "end_byte",
             Self::StartLine => "start_line",
