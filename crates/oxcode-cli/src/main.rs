@@ -203,7 +203,10 @@ fn run() -> Result<()> {
                     println!("failed to index {} files", stats.failed_files);
                 }
                 if stats.partial_files > 0 {
-                    println!("{} files parsed with recoverable errors", stats.partial_files);
+                    println!(
+                        "{} files parsed with recoverable errors",
+                        stats.partial_files
+                    );
                 }
             }
         }
@@ -290,7 +293,8 @@ fn run() -> Result<()> {
             path,
             language,
         } => {
-            let report = ProjectIndex::open(&path.path)?.explain(language.into_language(), &query)?;
+            let report =
+                ProjectIndex::open(&path.path)?.explain(language.into_language(), &query)?;
             println!("{report}");
         }
     }

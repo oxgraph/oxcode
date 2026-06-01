@@ -1,10 +1,22 @@
 use std::{fs, path::Path};
 
 use oxcode_core::{
-    GraphDirection, IndexStats, OxElementId, OxQueryLanguage, OxQueryResult, OxQueryValue,
-    ProjectIndex,
+    ExpandedQueryValue, GraphDirection, IndexStats, OxElementId, OxQueryLanguage, OxQueryResult,
+    OxQueryValue, ProjectIndex,
 };
 use tempfile::TempDir;
+
+/// True when a query-expanded value is the untraversed `helper()` call edge:
+/// query expansion does not traverse, so the edge's depth is absent.
+fn is_untraversed_helper_call(value: &ExpandedQueryValue) -> bool {
+    value.call_edge.as_ref().is_some_and(|edge| {
+        edge.depth.is_none()
+            && edge
+                .call_site
+                .as_ref()
+                .is_some_and(|site| site.text == "helper()")
+    })
+}
 
 #[test]
 fn indexes_queries_and_traverses_with_native_oxgraph_database() {
@@ -25,12 +37,20 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
         .expect("all");
     assert!(all.rows().len() >= 3);
 
-    let entry = single_element_query(&index, "MATCH ELEMENTS WHERE qualified_name = 'crate::entry'");
-    let helper =
-        single_element_query(&index, "MATCH ELEMENTS WHERE qualified_name = 'crate::helper'");
+    let entry = single_element_query(
+        &index,
+        "MATCH ELEMENTS WHERE qualified_name = 'crate::entry'",
+    );
+    let helper = single_element_query(
+        &index,
+        "MATCH ELEMENTS WHERE qualified_name = 'crate::helper'",
+    );
 
     let functions = index
-        .query(OxQueryLanguage::Oxql, "MATCH ELEMENTS WHERE kind = 'function'")
+        .query(
+            OxQueryLanguage::Oxql,
+            "MATCH ELEMENTS WHERE kind = 'function'",
+        )
         .expect("functions");
     assert!(functions.rows().len() >= 2);
 
@@ -75,7 +95,8 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
         .call_graph("crate::helper", GraphDirection::Incoming, 1, 10)
         .expect("callers");
     assert!(callers.edges.iter().any(|edge| {
-        edge.source.qualified_name == "crate::entry" && edge.target.qualified_name == "crate::helper"
+        edge.source.qualified_name == "crate::entry"
+            && edge.target.qualified_name == "crate::helper"
     }));
 
     let both = index
@@ -92,18 +113,12 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
         .with_session(|session| {
             let relations = session.query(OxQueryLanguage::Oxql, "MATCH RELATIONS TYPE calls")?;
             let expanded = session.expand(&relations)?;
-            assert!(expanded.rows.iter().any(|row| {
-                row.values.iter().any(|value| {
-                    value.call_edge.as_ref().is_some_and(|edge| {
-                        // Query expansion did not traverse, so depth is absent.
-                        edge.depth.is_none()
-                            && edge
-                                .call_site
-                                .as_ref()
-                                .is_some_and(|site| site.text == "helper()")
-                    })
-                })
-            }));
+            assert!(
+                expanded
+                    .rows
+                    .iter()
+                    .any(|row| row.values.iter().any(is_untraversed_helper_call))
+            );
             Ok(())
         })
         .expect("session");
@@ -133,7 +148,11 @@ fn indexing_is_resilient_and_writes_a_gitignore() {
     // The generated index directory self-ignores so users do not commit it.
     let gitignore = temp.path().join(".oxcode/.gitignore");
     assert!(gitignore.exists(), "wrote .oxcode/.gitignore");
-    assert!(fs::read_to_string(&gitignore).expect("read gitignore").contains('*'));
+    assert!(
+        fs::read_to_string(&gitignore)
+            .expect("read gitignore")
+            .contains('*')
+    );
 }
 
 #[test]

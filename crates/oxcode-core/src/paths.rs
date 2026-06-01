@@ -32,8 +32,7 @@ pub(crate) fn normalize_path(path: &Path) -> String {
 
 /// Directory names skipped during source discovery (generated, dependency,
 /// VCS, and the index store itself).
-pub(crate) const SKIP_DIR_NAMES: &[&str] =
-    &[".git", INDEX_DIR, "target", "node_modules", "vendor"];
+pub(crate) const SKIP_DIR_NAMES: &[&str] = &[".git", INDEX_DIR, "target", "node_modules", "vendor"];
 
 /// Skips generated, dependency, VCS, and index storage paths.
 pub(crate) fn should_skip_path(root: &Path, path: &Path) -> bool {

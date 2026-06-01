@@ -445,7 +445,11 @@ fn set_property_text(
     key: &'static str,
     value: &str,
 ) -> Result<()> {
-    writer.set_property(subject, properties[key], PropertyValue::Text(value.to_string()))?;
+    writer.set_property(
+        subject,
+        properties[key],
+        PropertyValue::Text(value.to_string()),
+    )?;
     Ok(())
 }
 
@@ -470,7 +474,13 @@ fn set_relation_text(
     key: &'static str,
     value: &str,
 ) -> Result<()> {
-    set_property_text(writer, PropertySubject::Relation(relation), properties, key, value)
+    set_property_text(
+        writer,
+        PropertySubject::Relation(relation),
+        properties,
+        key,
+        value,
+    )
 }
 
 /// Sets a usize property on a relation as an OxGraph integer.
@@ -481,7 +491,13 @@ fn set_relation_usize(
     key: &'static str,
     value: usize,
 ) -> Result<()> {
-    set_property_int(writer, PropertySubject::Relation(relation), properties, key, value)
+    set_property_int(
+        writer,
+        PropertySubject::Relation(relation),
+        properties,
+        key,
+        value,
+    )
 }
 
 /// Sets a text property on an element.
@@ -492,7 +508,13 @@ fn set_text(
     key: &'static str,
     value: &str,
 ) -> Result<()> {
-    set_property_text(writer, PropertySubject::Element(element), properties, key, value)
+    set_property_text(
+        writer,
+        PropertySubject::Element(element),
+        properties,
+        key,
+        value,
+    )
 }
 
 /// Sets a usize property on an element as an OxGraph integer.
@@ -503,5 +525,11 @@ fn set_usize(
     key: &'static str,
     value: usize,
 ) -> Result<()> {
-    set_property_int(writer, PropertySubject::Element(element), properties, key, value)
+    set_property_int(
+        writer,
+        PropertySubject::Element(element),
+        properties,
+        key,
+        value,
+    )
 }

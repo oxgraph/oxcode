@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CodeLocation, GraphDirection, LanguageId, NodeKind, QualifiedName, SymbolId, SymbolKey};
+use crate::{
+    CodeLocation, GraphDirection, LanguageId, NodeKind, QualifiedName, SymbolId, SymbolKey,
+};
 
 /// Symbol details resolved from the OxGraph database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

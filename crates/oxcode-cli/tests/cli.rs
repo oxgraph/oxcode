@@ -72,7 +72,14 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
 
     Command::cargo_bin("oxcode")
         .expect("binary")
-        .args(["walk", "crate::helper", "--direction", "both", "--path", root])
+        .args([
+            "walk",
+            "crate::helper",
+            "--direction",
+            "both",
+            "--path",
+            root,
+        ])
         .assert()
         .success()
         .stdout(contains("walk calls direction=both"))

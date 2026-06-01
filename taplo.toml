@@ -1,0 +1,25 @@
+[formatting]
+align_entries = false
+array_auto_expand = true
+array_trailing_comma = true
+column_width = 100
+compact_arrays = true
+indent_tables = false
+reorder_arrays = false
+reorder_keys = false
+trailing_newline = true
+
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = [
+  "dependencies",
+  "dev-dependencies",
+  "build-dependencies",
+  "workspace.dependencies",
+  "target.*.dependencies",
+  "target.*.dev-dependencies",
+  "target.*.build-dependencies",
+]
+
+[rule.formatting]
+reorder_keys = true

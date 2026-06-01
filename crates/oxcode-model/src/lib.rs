@@ -20,14 +20,9 @@ mod schema;
 mod selector;
 mod span;
 
-pub use crate::extract::*;
-pub use crate::ids::*;
-pub use crate::index::*;
-pub use crate::kind::*;
-pub use crate::report::*;
-pub use crate::schema::*;
-pub use crate::selector::*;
-pub use crate::span::*;
+pub use crate::{
+    extract::*, ids::*, index::*, kind::*, report::*, schema::*, selector::*, span::*,
+};
 
 /// Error returned when a stored string does not match any enum variant.
 ///
@@ -89,7 +84,10 @@ mod tests {
             assert_eq!(kind.as_str().parse::<EdgeKind>().expect("parse"), kind);
         }
         assert_eq!(GraphDirection::default(), GraphDirection::Outgoing);
-        assert_eq!("both".parse::<GraphDirection>().expect("parse"), GraphDirection::Both);
+        assert_eq!(
+            "both".parse::<GraphDirection>().expect("parse"),
+            GraphDirection::Both
+        );
     }
 
     #[test]
@@ -110,8 +108,7 @@ mod tests {
             serde_json::to_string(&GraphDirection::Incoming).expect("json"),
             "\"incoming\""
         );
-        let parsed: NodeKind =
-            serde_json::from_str("\"impl_block\"").expect("from json");
+        let parsed: NodeKind = serde_json::from_str("\"impl_block\"").expect("from json");
         assert_eq!(parsed, NodeKind::ImplBlock);
     }
 
@@ -123,8 +120,7 @@ mod tests {
         keys.dedup();
         assert_eq!(keys.len(), total, "element property keys must be unique");
 
-        let mut relation_keys: Vec<&str> =
-            RelationProperty::ALL.iter().map(|p| p.key()).collect();
+        let mut relation_keys: Vec<&str> = RelationProperty::ALL.iter().map(|p| p.key()).collect();
         let relation_total = relation_keys.len();
         relation_keys.sort_unstable();
         relation_keys.dedup();
