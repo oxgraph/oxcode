@@ -16,4 +16,4 @@ Selectors may be qualified names, `name:<name>`, `element:<id>`, or `file:<path>
 
 The JSON output includes definition paths, line ranges, signatures, docstrings, source previews, and relationship call sites. Use those fields as evidence; do not open files just to recover line numbers or inspect a short definition preview already present in oxcode output.
 
-Do not pass plain English phrases to `query`; use `symbols` for keyword discovery. Use `query` only for raw OxQL such as `MATCH ELEMENTS WHERE qualified_name = 'entry'`, `MATCH RELATIONS TYPE calls`, or `GRAPH calls WALK FROM <element-id> DEPTH 2 DIRECTION both LIMIT 100`.
+Do not pass plain English phrases to `query`; use `symbols` for keyword discovery. Use `query` only for raw OxQL such as `MATCH ELEMENTS WHERE qualified_name = 'crate::entry'`, `MATCH RELATIONS TYPE calls`, or `GRAPH calls WALK FROM <element-id> DEPTH 2 DIRECTION both LIMIT 100`.

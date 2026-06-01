@@ -1,0 +1,44 @@
+repos:
+  - repo: local
+    hooks:
+      - id: fmt-check
+        name: cargo +nightly fmt --check
+        entry: just fmt-check
+        language: system
+        pass_filenames: false
+        types_or: [rust]
+
+      - id: fmt-toml-check
+        name: taplo format --check (alphabetised deps)
+        entry: just fmt-toml-check
+        language: system
+        pass_filenames: false
+        types: [toml]
+
+      - id: clippy
+        name: clippy (strict, no allow escapes)
+        entry: just lint
+        language: system
+        pass_filenames: false
+        types_or: [rust, toml]
+
+      - id: deny
+        name: cargo deny (advisories, bans, sources)
+        entry: just deny
+        language: system
+        pass_filenames: false
+        types: [toml]
+
+      - id: no-clippy-allow
+        name: reject #[allow(clippy::...)] in sources
+        entry: bash -c '! grep -RnE "#\s*\[\s*allow\s*\(\s*clippy::" --include="*.rs" crates/ 2>/dev/null'
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: test
+        name: cargo test (pre-push only)
+        entry: just test
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

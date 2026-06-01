@@ -1,0 +1,3 @@
+# Default reviewers for all paths. CODEOWNER approval is not required by branch
+# rules until a second maintainer joins the org.
+* @snowmead

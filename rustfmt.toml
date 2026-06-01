@@ -1,0 +1,15 @@
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+unstable_features = true
+
+# Imports: nightly auto-grouping and crate granularity.
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+reorder_imports = true
+reorder_modules = true
+
+# Comments and docs.
+comment_width = 100
+format_code_in_doc_comments = true
+wrap_comments = true

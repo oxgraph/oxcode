@@ -3,14 +3,13 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use oxcode_core::{
-    Error, GraphDirection, OxQueryResult, ProjectIndex, SymbolReport, SymbolSummary,
-    explain_project, format_call_graph_report, format_context_report, format_expanded_query_report,
+    Error, GraphDirection, NodeKind, OxQueryLanguage, OxQueryResult, ProjectIndex, SymbolReport,
+    SymbolSummary, format_call_graph_report, format_context_report, format_expanded_query_report,
     format_file_search_report, format_query_value, format_selector_matches,
     format_selector_not_found, format_symbol_report, format_symbol_search_report, index_project,
-    language_support, parse_graph_direction, parse_node_kind, parse_query_language, project_status,
-    query_project,
+    language_support, project_status,
 };
 
 /// Generate and query code graphs stored in a native OxGraph database.
@@ -22,26 +21,96 @@ struct Cli {
     command: Command,
 }
 
+/// Project root, shared by every command via `--path`.
+#[derive(Debug, Args)]
+struct PathArg {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
+}
+
+/// Arguments shared by commands that take a root and a JSON toggle.
+#[derive(Debug, Args)]
+struct CommonArgs {
+    #[command(flatten)]
+    path: PathArg,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments shared by the call-graph walk commands.
+#[derive(Debug, Args)]
+struct WalkArgs {
+    /// Selector: element:<id>, name:<name>, file:<path>:<line>, or a qualified name.
+    selector: String,
+    /// Maximum hop depth.
+    #[arg(long, default_value_t = 1)]
+    depth: usize,
+    /// Maximum discovered symbol count.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+/// Query language accepted by `query`/`explain`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum QueryLang {
+    Oxql,
+    Cypher,
+}
+
+impl QueryLang {
+    const fn into_language(self) -> OxQueryLanguage {
+        match self {
+            Self::Oxql => OxQueryLanguage::Oxql,
+            Self::Cypher => OxQueryLanguage::Cypher,
+        }
+    }
+}
+
+/// Output format for `query`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    /// Pretty JSON of the raw result rows.
+    Json,
+    /// Tab-separated compact rows.
+    Table,
+    /// Expand OxGraph IDs into agent-readable code context.
+    Expand,
+}
+
+/// Traversal direction for `walk`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Direction {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+impl Direction {
+    const fn into_graph(self) -> GraphDirection {
+        match self {
+            Self::Outgoing => GraphDirection::Outgoing,
+            Self::Incoming => GraphDirection::Incoming,
+            Self::Both => GraphDirection::Both,
+        }
+    }
+}
+
 /// CLI commands.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Rebuild the project index.
     Index {
-        /// Project root.
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        common: CommonArgs,
     },
     /// Show native OxGraph database status.
     Status {
-        /// Project root.
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        common: CommonArgs,
     },
     /// Show languages with explicit extractors.
     Languages {
@@ -49,13 +118,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Execute an OxGraph database query.
+    #[command(
+        long_about = "Execute a raw OxGraph database query.\n\nAccepted OxQL profile:\n  CATALOG\n  MATCH ELEMENTS\n  MATCH ELEMENTS HAS LABEL <label>\n  MATCH ELEMENTS WHERE <property> = '<value>'\n  MATCH RELATIONS TYPE <type>\n  GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]\n\nUse `oxcode symbols <keywords>` for keyword discovery."
+    )]
+    Query {
+        /// Query text.
+        query: String,
+        #[command(flatten)]
+        path: PathArg,
+        /// Query language.
+        #[arg(long, value_enum, default_value_t = QueryLang::Oxql)]
+        language: QueryLang,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+        /// Print machine-readable JSON. This is accepted for agent ergonomics;
+        /// raw query JSON is already the default format.
+        #[arg(long)]
+        json: bool,
+    },
     /// Search indexed symbols by agent-friendly keywords.
     Symbols {
         /// Optional keyword query.
         query: Option<String>,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
+        #[command(flatten)]
+        path: PathArg,
         /// Maximum candidate count.
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -70,9 +158,8 @@ enum Command {
     Context {
         /// Task or question text.
         query: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
+        #[command(flatten)]
+        path: PathArg,
         /// Maximum entry point count.
         #[arg(long, default_value_t = 8)]
         limit: usize,
@@ -87,9 +174,8 @@ enum Command {
     Files {
         /// Optional keyword query.
         query: Option<String>,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
+        #[command(flatten)]
+        path: PathArg,
         /// Maximum file count.
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -97,107 +183,43 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Execute a raw OxGraph database query.
-    #[command(
-        long_about = "Execute a raw OxGraph database query.\n\nAccepted OxQL profile:\n  CATALOG\n  MATCH ELEMENTS\n  MATCH ELEMENTS HAS LABEL <label>\n  MATCH ELEMENTS WHERE <property> = '<value>'\n  MATCH RELATIONS TYPE <type>\n  GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]\n\nUse `oxcode symbols <keywords>` for keyword discovery."
-    )]
-    Query {
-        /// Query text.
-        query: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Query language: oxql or cypher.
-        #[arg(long, default_value = "oxql")]
-        language: String,
-        /// Print a compact table instead of JSON.
-        #[arg(long)]
-        table: bool,
-        /// Print machine-readable JSON. This is the default for raw queries.
-        #[arg(long)]
-        json: bool,
-        /// Expand OxGraph IDs into agent-readable code context.
-        #[arg(long)]
-        expand: bool,
-    },
     /// Describe one symbol selector.
     Symbol {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
+        /// Selector: element:<id>, name:<name>, file:<path>:<line>, or a qualified name.
         selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        common: CommonArgs,
     },
     /// Show functions called by one symbol.
     Calls {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
-        selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Maximum hop depth.
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
-        /// Maximum discovered symbol count.
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: WalkArgs,
     },
     /// Show functions that call one symbol.
     Callers {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
-        selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Maximum hop depth.
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
-        /// Maximum discovered symbol count.
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: WalkArgs,
     },
     /// Walk the calls graph from one symbol.
     Walk {
-        /// Selector: element:<id>, qualified name, name:<name>, or file:<path>:<line>.
-        selector: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Traversal direction: outgoing, incoming, or both.
-        #[arg(long, default_value = "outgoing")]
-        direction: String,
-        /// Maximum hop depth.
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
-        /// Maximum discovered symbol count.
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
-        /// Print machine-readable JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        args: WalkArgs,
+        /// Traversal direction.
+        #[arg(long, value_enum, default_value_t = Direction::Outgoing)]
+        direction: Direction,
     },
-    /// Explain a raw OxGraph database query plan.
+    /// Explain an OxGraph database query plan.
     #[command(
         long_about = "Explain a raw OxGraph database query plan.\n\nAccepted OxQL profile:\n  CATALOG\n  MATCH ELEMENTS\n  MATCH ELEMENTS HAS LABEL <label>\n  MATCH ELEMENTS WHERE <property> = '<value>'\n  MATCH RELATIONS TYPE <type>\n  GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]\n\nUse `oxcode symbols <keywords>` for keyword discovery."
     )]
     Explain {
         /// Query text.
         query: String,
-        /// Project root.
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Query language: oxql or cypher.
-        #[arg(long, default_value = "oxql")]
-        language: String,
+        #[command(flatten)]
+        path: PathArg,
+        /// Query language.
+        #[arg(long, value_enum, default_value_t = QueryLang::Oxql)]
+        language: QueryLang,
     },
 }
 
@@ -218,9 +240,9 @@ fn main() -> Result<()> {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Index { path, json } => {
-            let stats = index_project(path)?;
-            if json {
+        Command::Index { common } => {
+            let stats = index_project(&common.path.path)?;
+            if common.json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
                 println!(
@@ -234,11 +256,20 @@ fn run() -> Result<()> {
                         stats.skipped_unsupported_files
                     );
                 }
+                if stats.failed_files > 0 {
+                    println!("failed to index {} files", stats.failed_files);
+                }
+                if stats.partial_files > 0 {
+                    println!(
+                        "{} files parsed with recoverable errors",
+                        stats.partial_files
+                    );
+                }
             }
         }
-        Command::Status { path, json } => {
-            let status = project_status(path)?;
-            if json {
+        Command::Status { common } => {
+            let status = project_status(&common.path.path)?;
+            if common.json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 println!("root {}", status.root.display());
@@ -276,6 +307,35 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::Query {
+            query,
+            path,
+            language,
+            format,
+            json: _json,
+        } => {
+            ensure_raw_query(language, &query)?;
+            let index = ProjectIndex::open(&path.path)?;
+            let language = language.into_language();
+            match format {
+                OutputFormat::Expand => {
+                    let report = index.query_expanded(language, &query)?;
+                    println!("{}", format_expanded_query_report(&report));
+                }
+                OutputFormat::Table => {
+                    let rows = index
+                        .query(language, &query)
+                        .with_context(|| format!("executing query {query:?}"))?;
+                    print_query_table(&rows);
+                }
+                OutputFormat::Json => {
+                    let rows = index
+                        .query(language, &query)
+                        .with_context(|| format!("executing query {query:?}"))?;
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+            }
+        }
         Command::Symbols {
             query,
             path,
@@ -284,9 +344,9 @@ fn run() -> Result<()> {
             json,
         } => {
             let query = query.unwrap_or_default();
-            validate_kinds(&kinds)?;
+            let kinds = parse_kinds(&kinds)?;
             let report =
-                ProjectIndex::open(path)?.search_symbols_filtered(&query, limit, &kinds)?;
+                ProjectIndex::open(&path.path)?.search_symbols_filtered(&query, limit, &kinds)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -300,7 +360,7 @@ fn run() -> Result<()> {
             depth,
             json,
         } => {
-            let report = ProjectIndex::open(path)?.context(&query, limit, depth)?;
+            let report = ProjectIndex::open(&path.path)?.context(&query, limit, depth)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -314,101 +374,54 @@ fn run() -> Result<()> {
             json,
         } => {
             let query = query.unwrap_or_default();
-            let report = ProjectIndex::open(path)?.search_files(&query, limit)?;
+            let report = ProjectIndex::open(&path.path)?.search_files(&query, limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", format_file_search_report(&report));
             }
         }
-        Command::Query {
-            query,
-            path,
-            language,
-            table,
-            json: _json,
-            expand,
-        } => {
-            ensure_raw_query(&language, &query)?;
-            let language = parse_query_language(&language).map_err(anyhow::Error::msg)?;
-            if expand {
-                let report = ProjectIndex::open(path)?.query_expanded(language, &query)?;
-                println!("{}", format_expanded_query_report(&report));
-            } else if table {
-                let rows = query_project(path, language, &query)
-                    .with_context(|| format!("executing query {query:?}"))?;
-                print_query_table(&rows);
-            } else {
-                let rows = query_project(path, language, &query)
-                    .with_context(|| format!("executing query {query:?}"))?;
-                println!("{}", serde_json::to_string_pretty(&rows)?);
-            }
+        Command::Symbol { selector, common } => {
+            print_symbol_resolution(&common.path.path, &selector, common.json)?;
         }
-        Command::Symbol {
-            selector,
-            path,
-            json,
-        } => {
-            print_symbol_resolution(path, &selector, json)?;
-        }
-        Command::Calls {
-            selector,
-            path,
-            depth,
-            limit,
-            json,
-        } => {
-            print_call_graph_resolution(
-                path,
-                &selector,
-                GraphDirection::Outgoing,
-                depth,
-                limit,
-                json,
-            )?;
-        }
-        Command::Callers {
-            selector,
-            path,
-            depth,
-            limit,
-            json,
-        } => {
-            print_call_graph_resolution(
-                path,
-                &selector,
-                GraphDirection::Incoming,
-                depth,
-                limit,
-                json,
-            )?;
-        }
-        Command::Walk {
-            selector,
-            path,
-            direction,
-            depth,
-            limit,
-            json,
-        } => {
-            let direction = parse_graph_direction(&direction).map_err(anyhow::Error::msg)?;
-            print_call_graph_resolution(path, &selector, direction, depth, limit, json)?;
+        Command::Calls { args } => print_call_graph_resolution(&args, GraphDirection::Outgoing)?,
+        Command::Callers { args } => print_call_graph_resolution(&args, GraphDirection::Incoming)?,
+        Command::Walk { args, direction } => {
+            print_call_graph_resolution(&args, direction.into_graph())?
         }
         Command::Explain {
             query,
             path,
             language,
         } => {
-            ensure_raw_query(&language, &query)?;
-            let language = parse_query_language(&language).map_err(anyhow::Error::msg)?;
-            println!("{}", explain_project(path, language, &query)?);
+            ensure_raw_query(language, &query)?;
+            let report =
+                ProjectIndex::open(&path.path)?.explain(language.into_language(), &query)?;
+            println!("{report}");
         }
     }
     Ok(())
 }
 
+/// Prints one compact query table.
+fn print_query_table(result: &OxQueryResult) {
+    for row in result.rows() {
+        let values = row
+            .values
+            .iter()
+            .map(format_query_value)
+            .collect::<Vec<_>>();
+        println!("{}", values.join("\t"));
+    }
+}
+
+/// Returns a compact exists/missing label.
+fn exists_text(value: bool) -> &'static str {
+    if value { "exists" } else { "missing" }
+}
+
 /// Prints one selector-aware symbol report.
-fn print_symbol_resolution(path: PathBuf, selector: &str, json: bool) -> Result<()> {
+fn print_symbol_resolution(path: &std::path::Path, selector: &str, json: bool) -> Result<()> {
     let index = ProjectIndex::open(path)?;
     match index.resolve_selector(selector)?.as_slice() {
         [symbol] => {
@@ -436,26 +449,23 @@ fn print_symbol_resolution(path: PathBuf, selector: &str, json: bool) -> Result<
 }
 
 /// Prints one selector-aware call graph report.
-fn print_call_graph_resolution(
-    path: PathBuf,
-    selector: &str,
-    direction: GraphDirection,
-    depth: usize,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let index = ProjectIndex::open(path)?;
-    match index.resolve_selector(selector)?.as_slice() {
+fn print_call_graph_resolution(args: &WalkArgs, direction: GraphDirection) -> Result<()> {
+    let index = ProjectIndex::open(&args.common.path.path)?;
+    match index.resolve_selector(&args.selector)?.as_slice() {
         [symbol] => {
-            let mut report =
-                index.call_graph(&format!("element:{}", symbol.id), direction, depth, limit)?;
-            report.selector = selector.to_string();
-            if json {
+            let mut report = index.call_graph(
+                &format!("element:{}", symbol.id),
+                direction,
+                args.depth,
+                args.limit,
+            )?;
+            report.selector.clone_from(&args.selector);
+            if args.common.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "status": "matched",
-                        "selector": selector,
+                        "selector": args.selector,
                         "report": report,
                     }))?
                 );
@@ -463,8 +473,8 @@ fn print_call_graph_resolution(
                 print!("{}", format_call_graph_report(&report));
             }
         }
-        [] => print_selector_not_found(selector, json)?,
-        matches => print_selector_ambiguous(selector, matches, json)?,
+        [] => print_selector_not_found(&args.selector, args.common.json)?,
+        matches => print_selector_ambiguous(&args.selector, matches, args.common.json)?,
     }
     Ok(())
 }
@@ -504,14 +514,12 @@ fn print_selector_not_found(selector: &str, json: bool) -> Result<()> {
 }
 
 /// Rejects obvious keyword search text passed to raw query commands.
-fn ensure_raw_query(language: &str, query: &str) -> Result<()> {
+fn ensure_raw_query(language: QueryLang, query: &str) -> Result<()> {
     let first = query.split_whitespace().next().unwrap_or_default();
     let first = first.to_ascii_uppercase();
-    let language = language.to_ascii_lowercase();
-    let looks_structured = match language.as_str() {
-        "oxql" => matches!(first.as_str(), "CATALOG" | "MATCH" | "GRAPH"),
-        "cypher" => first == "MATCH",
-        _ => true,
+    let looks_structured = match language {
+        QueryLang::Oxql => matches!(first.as_str(), "CATALOG" | "MATCH" | "GRAPH"),
+        QueryLang::Cypher => first == "MATCH",
     };
     if !looks_structured {
         bail!("query expects OxQL/Cypher; use oxcode symbols for keyword discovery");
@@ -519,27 +527,27 @@ fn ensure_raw_query(language: &str, query: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validates symbol kind filters before opening the index.
-fn validate_kinds(kinds: &[String]) -> Result<()> {
+/// Parses symbol kind filters before opening the index.
+fn parse_kinds(kinds: &[String]) -> Result<Vec<NodeKind>> {
+    let mut parsed = Vec::with_capacity(kinds.len());
     for kind in kinds {
-        parse_node_kind(kind).map_err(anyhow::Error::msg)?;
+        let parsed_kind = kind.parse::<NodeKind>().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid symbol kind {kind:?}; valid kinds are {}",
+                valid_kind_names().join(", ")
+            )
+        })?;
+        if !NodeKind::ALL.contains(&parsed_kind) {
+            bail!(
+                "invalid symbol kind {kind:?}; valid kinds are {}",
+                valid_kind_names().join(", ")
+            );
+        }
+        parsed.push(parsed_kind);
     }
-    Ok(())
+    Ok(parsed)
 }
 
-/// Prints one compact query table.
-fn print_query_table(result: &OxQueryResult) {
-    for row in result.rows() {
-        let values = row
-            .values
-            .iter()
-            .map(format_query_value)
-            .collect::<Vec<_>>();
-        println!("{}", values.join("\t"));
-    }
-}
-
-/// Returns a compact exists/missing label.
-fn exists_text(value: bool) -> &'static str {
-    if value { "exists" } else { "missing" }
+fn valid_kind_names() -> Vec<&'static str> {
+    NodeKind::ALL.iter().map(|kind| kind.as_str()).collect()
 }

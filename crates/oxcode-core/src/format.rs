@@ -1,6 +1,6 @@
 use oxcode_model::{
-    CallGraphReport, CodeLocation, ContextReport, ExpandedQueryReport, FileSearchReport,
-    SymbolReport, SymbolSearchReport, SymbolSummary,
+    CallEdgeSummary, CallGraphReport, CodeLocation, ContextReport, ExpandedQueryReport,
+    ExpandedQueryValue, FileSearchReport, SymbolReport, SymbolSearchReport, SymbolSummary,
 };
 use oxgraph::db::{PropertySubject, QueryValue};
 
@@ -151,7 +151,8 @@ pub fn format_call_graph_report(report: &CallGraphReport) -> String {
     for edge in &report.edges {
         output.push_str(&format!(
             "  depth {} relation:{}\n",
-            edge.depth, edge.relation_id
+            depth_label(edge.depth),
+            edge.relation_id
         ));
         output.push_str(&format!(
             "    {} -> {}\n",
@@ -184,33 +185,45 @@ pub fn format_expanded_query_report(report: &ExpandedQueryReport) -> String {
     for (index, row) in report.rows.iter().enumerate() {
         output.push_str(&format!("row {}\n", index + 1));
         for value in &row.values {
-            output.push_str(&format!("  {}\n", value.raw));
-            if let Some(symbol) = &value.symbol {
-                output.push_str(&format!("    {}\n", symbol_inline(symbol)));
-                output.push_str(&format!(
-                    "    defined at {}\n",
-                    location_range(&symbol.definition)
-                ));
-            }
-            if let Some(edge) = &value.call_edge {
-                output.push_str(&format!(
-                    "    calls {} -> {}\n",
-                    symbol_inline(&edge.source),
-                    symbol_inline(&edge.target)
-                ));
-                if let Some(call_site) = &edge.call_site {
-                    output.push_str(&format!(
-                        "    called from {}\n",
-                        location_range(&call_site.location)
-                    ));
-                    if !call_site.text.is_empty() {
-                        output.push_str(&format!("    expression {}\n", call_site.text));
-                    }
-                }
-            }
+            push_query_value(&mut output, value);
         }
     }
     output
+}
+
+/// Formats one expanded query value — its raw text, resolved symbol, and any
+/// call edge — into `output`.
+fn push_query_value(output: &mut String, value: &ExpandedQueryValue) {
+    output.push_str(&format!("  {}\n", value.raw));
+    if let Some(symbol) = &value.symbol {
+        output.push_str(&format!("    {}\n", symbol_inline(symbol)));
+        output.push_str(&format!(
+            "    defined at {}\n",
+            location_range(&symbol.definition)
+        ));
+    }
+    if let Some(edge) = &value.call_edge {
+        push_call_edge(output, edge);
+    }
+}
+
+/// Formats one call edge — its endpoints and originating call site — into
+/// `output`.
+fn push_call_edge(output: &mut String, edge: &CallEdgeSummary) {
+    output.push_str(&format!(
+        "    calls {} -> {}\n",
+        symbol_inline(&edge.source),
+        symbol_inline(&edge.target)
+    ));
+    if let Some(call_site) = &edge.call_site {
+        output.push_str(&format!(
+            "    called from {}\n",
+            location_range(&call_site.location)
+        ));
+        if !call_site.text.is_empty() {
+            output.push_str(&format!("    expression {}\n", call_site.text));
+        }
+    }
 }
 
 /// Formats selector ambiguity matches for agent-facing CLI output.
@@ -286,11 +299,16 @@ fn location_range(location: &CodeLocation) -> String {
     format!(
         "{}:{}:{}-{}:{}",
         location.file_path,
-        location.start_line,
-        location.start_column,
-        location.end_line,
-        location.end_column
+        location.span.start_line,
+        location.span.start_column,
+        location.span.end_line,
+        location.span.end_column
     )
+}
+
+/// Formats a traversal hop depth, using `-` for query-expanded edges.
+fn depth_label(depth: Option<usize>) -> String {
+    depth.map_or_else(|| "-".to_string(), |depth| depth.to_string())
 }
 
 fn selector_search_query(selector: &str) -> &str {
