@@ -51,7 +51,8 @@ pub fn format_call_graph_report(report: &CallGraphReport) -> String {
     for edge in &report.edges {
         output.push_str(&format!(
             "  depth {} relation:{}\n",
-            edge.depth, edge.relation_id
+            depth_label(edge.depth),
+            edge.relation_id
         ));
         output.push_str(&format!(
             "    {} -> {}\n",
@@ -154,9 +155,14 @@ fn location_range(location: &CodeLocation) -> String {
     format!(
         "{}:{}:{}-{}:{}",
         location.file_path,
-        location.start_line,
-        location.start_column,
-        location.end_line,
-        location.end_column
+        location.span.start_line,
+        location.span.start_column,
+        location.span.end_line,
+        location.span.end_column
     )
+}
+
+/// Formats a traversal hop depth, using `-` for query-expanded edges.
+fn depth_label(depth: Option<usize>) -> String {
+    depth.map_or_else(|| "-".to_string(), |depth| depth.to_string())
 }

@@ -11,7 +11,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
 
     Command::cargo_bin("oxcode")
         .expect("binary")
-        .args(["index", root])
+        .args(["index", "--path", root])
         .assert()
         .success()
         .stdout(contains("indexed"))
@@ -19,7 +19,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
 
     Command::cargo_bin("oxcode")
         .expect("binary")
-        .args(["status", root])
+        .args(["status", "--path", root])
         .assert()
         .success()
         .stdout(contains("database exists"))
@@ -36,7 +36,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
         .expect("binary")
         .args([
             "query",
-            "MATCH ELEMENTS WHERE qualified_name = 'entry'",
+            "MATCH ELEMENTS WHERE qualified_name = 'crate::entry'",
             "--path",
             root,
         ])
@@ -46,7 +46,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
 
     Command::cargo_bin("oxcode")
         .expect("binary")
-        .args(["symbol", "entry", "--path", root])
+        .args(["symbol", "crate::entry", "--path", root])
         .assert()
         .success()
         .stdout(contains("symbol element:"))
@@ -55,7 +55,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
 
     Command::cargo_bin("oxcode")
         .expect("binary")
-        .args(["calls", "entry", "--path", root])
+        .args(["calls", "crate::entry", "--path", root])
         .assert()
         .success()
         .stdout(contains("walk calls direction=outgoing"))
@@ -64,7 +64,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
 
     Command::cargo_bin("oxcode")
         .expect("binary")
-        .args(["callers", "helper", "--path", root])
+        .args(["callers", "crate::helper", "--path", root])
         .assert()
         .success()
         .stdout(contains("walk calls direction=incoming"))
@@ -72,7 +72,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
 
     Command::cargo_bin("oxcode")
         .expect("binary")
-        .args(["walk", "helper", "--direction", "both", "--path", root])
+        .args(["walk", "crate::helper", "--direction", "both", "--path", root])
         .assert()
         .success()
         .stdout(contains("walk calls direction=both"))
@@ -83,7 +83,8 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
         .args([
             "query",
             "MATCH RELATIONS TYPE calls",
-            "--expand",
+            "--format",
+            "expand",
             "--path",
             root,
         ])
@@ -99,6 +100,38 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
         .assert()
         .success()
         .stdout(contains("scan elements"));
+
+    // A compact table is one output mode among the `--format` enum.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args([
+            "query",
+            "MATCH ELEMENTS WHERE qualified_name = 'crate::entry'",
+            "--format",
+            "table",
+            "--path",
+            root,
+        ])
+        .assert()
+        .success()
+        .stdout(contains("element:"));
+}
+
+#[test]
+fn cli_rejects_invalid_value_enums() {
+    // Output format and direction are value enums, so a bad value is a hard
+    // error rather than a silently-ignored flag.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["query", "MATCH ELEMENTS", "--format", "bogus"])
+        .assert()
+        .failure();
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["walk", "crate::entry", "--direction", "sideways"])
+        .assert()
+        .failure();
 }
 
 fn rust_project() -> TempDir {

@@ -33,8 +33,10 @@ pub enum Error {
     Database(#[from] DbError),
 
     /// Integer conversion overflowed.
-    #[error("integer value {value} cannot be represented in the target type")]
+    #[error("property {key} value {value} cannot be represented in the target type")]
     IntegerOverflow {
+        /// Property whose value overflowed.
+        key: &'static str,
         /// Overflowing value.
         value: usize,
     },
@@ -53,6 +55,15 @@ pub enum Error {
     MissingProperty {
         /// Missing property name.
         name: String,
+    },
+
+    /// A stored value does not belong to oxcode's typed vocabulary.
+    #[error("database {kind} value {value:?} is not recognized")]
+    CorruptValue {
+        /// The vocabulary the value should have belonged to.
+        kind: &'static str,
+        /// The unrecognized stored value.
+        value: String,
     },
 
     /// A selector did not match any symbol.
@@ -79,5 +90,20 @@ impl Error {
             path: path.into(),
             source,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_overflow_names_the_offending_property() {
+        let message = Error::IntegerOverflow {
+            key: "start_byte",
+            value: usize::MAX,
+        }
+        .to_string();
+        assert!(message.contains("start_byte"), "{message}");
     }
 }

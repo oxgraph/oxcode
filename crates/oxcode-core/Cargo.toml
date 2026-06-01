@@ -13,6 +13,9 @@ rust-version.workspace = true
 ignore.workspace = true
 oxcode-model = { path = "../oxcode-model" }
 oxgraph.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tree-sitter-language-pack.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
