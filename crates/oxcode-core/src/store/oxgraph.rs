@@ -446,13 +446,12 @@ fn resolve_selector_in_read(
                 .map(|summary| summary.filter(is_agent_symbol).into_iter().collect())
         }
         Ok(Selector::Name(name)) => {
-            lookup_symbols_by_property(read, keys, ElementProperty::Name, keys.name, &name)
+            lookup_symbols_by_property(read, keys, ElementProperty::Name, &name)
         }
         Ok(Selector::QualifiedName(qualified)) => lookup_symbols_by_property(
             read,
             keys,
             ElementProperty::QualifiedName,
-            keys.qualified_name,
             qualified.as_str(),
         ),
         Ok(Selector::FileLine { path, line }) => {
@@ -462,23 +461,28 @@ fn resolve_selector_in_read(
     }
 }
 
-/// Looks up symbols by one exact text property, consulting the property's
-/// equality index when one is defined (falling back to a full property scan).
+/// Looks up symbols by one exact text property via the property's equality
+/// index.
+///
+/// Every property passed here is in [`ElementProperty::INDEXED`], so the write
+/// path always defines its `element_<key>_eq` index. A missing index therefore
+/// means catalog drift and fails loudly rather than silently scanning.
 fn lookup_symbols_by_property(
     read: &oxgraph::db::ReadTransaction,
     keys: &ElementPropertyKeys,
     property: ElementProperty,
-    key: PropertyKeyId,
     value: &str,
 ) -> Result<Vec<SymbolSummary>> {
     let value_property = PropertyValue::Text(value.to_string());
     let index_name = format!("element_{}_eq", property.key());
-    let subjects = match read.catalog().index_id(&index_name) {
-        Some(index_id) => {
-            read.lookup_index(index_id, oxgraph::db::IndexLookup::Equal(&value_property))?
-        }
-        None => read.lookup_property_equal(key, &value_property)?,
-    };
+    let index_id = read
+        .catalog()
+        .index_id(&index_name)
+        .ok_or(Error::MissingCatalog {
+            item: "index",
+            name: index_name,
+        })?;
+    let subjects = read.lookup_index(index_id, oxgraph::db::IndexLookup::Equal(&value_property))?;
     let mut symbols = subjects
         .into_iter()
         .filter_map(|subject| match subject {
@@ -514,13 +518,7 @@ fn resolve_file_line_selector(
     file_path: &str,
     line: usize,
 ) -> Result<Vec<SymbolSummary>> {
-    let mut symbols = lookup_symbols_by_property(
-        read,
-        keys,
-        ElementProperty::FilePath,
-        keys.file_path,
-        file_path,
-    )?;
+    let mut symbols = lookup_symbols_by_property(read, keys, ElementProperty::FilePath, file_path)?;
     symbols.retain(|symbol| {
         !matches!(symbol.kind, NodeKind::File | NodeKind::Unresolved)
             && symbol.definition.span.contains_line(line)
