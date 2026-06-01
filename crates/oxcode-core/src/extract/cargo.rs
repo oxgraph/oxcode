@@ -64,7 +64,7 @@ fn nearest_crate(file: &Path) -> (String, Option<PathBuf>) {
 /// Reads `[package].name` from a manifest, tolerating virtual workspaces.
 fn package_name(manifest: &Path) -> Option<String> {
     let text = std::fs::read_to_string(manifest).ok()?;
-    let value = text.parse::<toml::Value>().ok()?;
+    let value = toml::from_str::<toml::Value>(&text).ok()?;
     value
         .get("package")?
         .get("name")?
