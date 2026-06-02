@@ -12,7 +12,7 @@ use oxcode_model::{
     GraphDirection, LanguageId, NodeKind, ProjectStatus, QualifiedName, RelatedSymbol,
     RelationProperty, RelationshipSummary, SOURCE_ROLE, Selector, SourcePath, SourceSpan, SymbolId,
     SymbolKey, SymbolReport, SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE,
-    TraversedSymbol,
+    TraversedSymbol, projection_name,
 };
 use oxgraph::{
     db::{
@@ -27,6 +27,7 @@ use oxgraph::{
 };
 
 use crate::{
+    GraphWalk,
     error::{Error, Result},
     format::format_query_value,
     paths::{canonical_root, database_dir},
@@ -34,7 +35,7 @@ use crate::{
 
 mod write;
 
-pub(crate) use write::rebuild_database;
+pub(crate) use write::{apply_delta, rebuild_database};
 use write::{label_index_name, type_index_name};
 
 /// Returns project database status.
@@ -373,6 +374,41 @@ impl ReadSession<'_> {
         depth: usize,
         limit: usize,
     ) -> Result<CallGraphReport> {
+        self.traverse(
+            selector,
+            CALLS_PROJECTION,
+            GraphWalk {
+                direction,
+                depth,
+                limit,
+            },
+        )
+    }
+
+    /// Traverses the projection for `edge_kind` from a seed — the same engine as
+    /// [`ReadSession::call_graph`] generalized to any code edge kind.
+    pub(crate) fn navigate(
+        &self,
+        selector: &str,
+        edge_kind: EdgeKind,
+        walk: GraphWalk,
+    ) -> Result<CallGraphReport> {
+        self.traverse(selector, &projection_name(edge_kind), walk)
+    }
+
+    /// Traverses one named graph projection from a seed, hydrating the reachable
+    /// symbols and the edges among them into a report.
+    pub(crate) fn traverse(
+        &self,
+        selector: &str,
+        projection: &str,
+        walk: GraphWalk,
+    ) -> Result<CallGraphReport> {
+        let GraphWalk {
+            direction,
+            depth,
+            limit,
+        } = walk;
         let element_keys = self.element_keys;
         let relation_keys = self.relation_keys;
         let seed = resolve_one_symbol_in_read(&self.read, element_keys, selector)?;
@@ -388,10 +424,10 @@ impl ReadSession<'_> {
         let projection = self
             .read
             .catalog()
-            .projection_id(CALLS_PROJECTION)
+            .projection_id(projection)
             .and_then(|id| {
                 self.read
-                    .graph_projection_by_name(CALLS_PROJECTION)
+                    .graph_projection_by_name(projection)
                     .ok()
                     .map(|graph| (id, graph))
             })

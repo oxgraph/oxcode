@@ -14,6 +14,8 @@ rust-version.workspace = true
 ignore.workspace = true
 oxcode-model = { path = "../oxcode-model" }
 oxgraph.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tree-sitter-language-pack.workspace = true

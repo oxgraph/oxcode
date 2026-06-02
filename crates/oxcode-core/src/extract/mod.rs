@@ -5,7 +5,9 @@ use std::{collections::HashMap, path::Path, sync::OnceLock};
 use oxcode_model::{Extraction, FileDiagnostic, FileParseStatus, LanguageSupport};
 
 use crate::{
+    cache::{CacheEntry, ExtractionCache},
     error::{Error, Result},
+    manifest::content_hash,
     paths::normalize_relative_path,
     scan,
 };
@@ -129,11 +131,15 @@ pub(crate) struct IndexInput {
 /// A file that fails to read or whose extractor errors is recorded as a
 /// [`FileDiagnostic`] and skipped; the rest of the project still indexes. Only
 /// catastrophic failures (not per-file ones) propagate as `Err`.
-pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
+pub(crate) fn extract_project(
+    root: &Path,
+    cache: &ExtractionCache,
+) -> Result<(IndexInput, ExtractionCache)> {
     let registry = registry();
     let mut extractions = Vec::new();
     let mut skipped_unsupported_files = 0_usize;
     let mut diagnostics = Vec::new();
+    let mut next_cache = ExtractionCache::empty(cache.scope_token);
 
     for file in scan::discover_source_files(root) {
         let Some(extractor) = registry.extractor_for(&file.path) else {
@@ -155,6 +161,29 @@ pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
                 continue;
             }
         };
+        let hash = content_hash(&source);
+
+        // Reuse the cached extraction when this file's content is unchanged,
+        // skipping the (expensive) parse; otherwise extract and cache the result.
+        if let Some(entry) = cache.lookup(&relative_path, hash) {
+            if entry.partial {
+                diagnostics.push(FileDiagnostic {
+                    path: relative_path.clone(),
+                    status: FileParseStatus::Partial,
+                    message: Some("recoverable parse errors; symbols are partial".to_string()),
+                });
+            }
+            extractions.push(entry.extraction.clone());
+            next_cache.files.insert(
+                relative_path,
+                CacheEntry {
+                    hash,
+                    partial: entry.partial,
+                    extraction: entry.extraction.clone(),
+                },
+            );
+            continue;
+        }
 
         match extractor.extract(ExtractionInput {
             path: &file.path,
@@ -162,13 +191,22 @@ pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
             source,
         }) {
             Ok(extraction) => {
-                if extraction.parse_status == FileParseStatus::Partial {
+                let partial = extraction.parse_status == FileParseStatus::Partial;
+                if partial {
                     diagnostics.push(FileDiagnostic {
-                        path: relative_path,
+                        path: relative_path.clone(),
                         status: FileParseStatus::Partial,
                         message: Some("recoverable parse errors; symbols are partial".to_string()),
                     });
                 }
+                next_cache.files.insert(
+                    relative_path,
+                    CacheEntry {
+                        hash,
+                        partial,
+                        extraction: extraction.clone(),
+                    },
+                );
                 extractions.push(extraction);
             }
             Err(error) => diagnostics.push(FileDiagnostic {
@@ -180,11 +218,14 @@ pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
     }
 
     extractions.sort_by(|left, right| left.file.path.cmp(&right.file.path));
-    Ok(IndexInput {
-        extractions,
-        skipped_unsupported_files,
-        diagnostics,
-    })
+    Ok((
+        IndexInput {
+            extractions,
+            skipped_unsupported_files,
+            diagnostics,
+        },
+        next_cache,
+    ))
 }
 
 /// Returns explicit extractor support.
@@ -214,6 +255,34 @@ mod tests {
     #[test]
     fn registry_is_a_shared_singleton() {
         assert!(std::ptr::eq(registry(), registry()));
+    }
+
+    #[test]
+    fn extraction_cache_reuses_unchanged_and_reextracts_changed_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("cargo");
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        let lib = root.join("src/lib.rs");
+        std::fs::write(&lib, "pub fn alpha() {}\n").expect("lib");
+
+        let scope = crate::manifest::scope_token(root).expect("scope");
+        let (first, cache) =
+            extract_project(root, &ExtractionCache::empty(scope)).expect("first extract");
+        assert!(cache.files.contains_key("src/lib.rs"));
+
+        // Unchanged content: the cached extraction is reused and identical.
+        let (second, _) = extract_project(root, &cache).expect("cached extract");
+        assert_eq!(first.extractions, second.extractions);
+
+        // Changed content: the cache misses and the new extraction reflects it.
+        std::fs::write(&lib, "pub fn beta() {}\n").expect("edit");
+        let (third, _) = extract_project(root, &cache).expect("changed extract");
+        assert_ne!(first.extractions, third.extractions);
     }
 
     #[test]

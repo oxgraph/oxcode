@@ -885,6 +885,8 @@ dependencies = [
  "ignore",
  "oxcode-model",
  "oxgraph",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",
@@ -901,9 +903,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c50a9ed967a5f0f516b5292db6ad4ac197e06adbd049a9e889c41dda538ed44"
+checksum = "468cc5d6ce0a90be3d0a353d4923435f0d5207bd6a44c83eaa8e96d03bfa31c4"
 dependencies = [
  "oxgraph-db",
  "oxgraph-graph",
@@ -949,9 +951,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-db"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c19eb5d3bd84a2b96e2fe287e2ed3b23939029d9ad1c81b32ceaefd4a4e018d4"
+checksum = "4af9ac3ace84fbafb7af0984575a94c0ab69477b30e6fe59d8d8a77ba8ab3d96"
 dependencies = [
  "oxgraph-algo",
  "oxgraph-csc",
@@ -963,7 +965,7 @@ dependencies = [
  "oxgraph-snapshot",
  "oxgraph-topology",
  "serde",
- "serde_json",
+ "zerocopy",
 ]
 
 [[package]]

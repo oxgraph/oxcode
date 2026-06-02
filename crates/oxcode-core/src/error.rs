@@ -81,6 +81,10 @@ pub enum Error {
         /// Candidate matches.
         matches: Vec<SymbolSummary>,
     },
+
+    /// A text navigation query could not be parsed.
+    #[error("{0}")]
+    InvalidQuery(String),
 }
 
 impl Error {

@@ -14,6 +14,17 @@ pub enum PropertyKind {
 
 /// Catalog name of the `calls` graph projection.
 pub const CALLS_PROJECTION: &str = "calls";
+
+/// Returns the catalog name of the graph projection for `edge_kind`. The
+/// `calls` projection keeps its historical name; every other kind is
+/// `edges_<kind>`, so navigation can traverse any code edge kind.
+#[must_use]
+pub fn projection_name(edge_kind: crate::EdgeKind) -> String {
+    match edge_kind {
+        crate::EdgeKind::Calls => CALLS_PROJECTION.to_owned(),
+        other => format!("edges_{}", other.as_str()),
+    }
+}
 /// Role name for the source endpoint of a relation.
 pub const SOURCE_ROLE: &str = "source";
 /// Role name for the target endpoint of a relation.

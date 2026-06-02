@@ -8,14 +8,14 @@ use std::{
 };
 
 use oxcode_model::{
-    CALLS_PROJECTION, EdgeKind, ElementProperty, NodeKind, PropertyKind, RelationProperty,
-    ResolvedEdge, ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE,
-    UnresolvedReference,
+    EdgeKind, ElementProperty, NodeKind, PropertyKind, RelationProperty, ResolvedEdge,
+    ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE, UnresolvedReference,
+    projection_name,
 };
 use oxgraph::db::{
     Database, ElementId, GraphProjectionDefinition, IndexDefinition, LabelId, ProjectionDefinition,
     PropertyFamily, PropertyKeyId, PropertySubject, PropertyType, PropertyValue, RelationId,
-    RelationTypeId,
+    RelationTypeId, RoleId,
 };
 
 use crate::{
@@ -80,12 +80,14 @@ pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<Pat
     let relation_properties = register_relation_properties(&mut writer)?;
     define_property_indexes(&mut writer, &element_properties)?;
     define_count_indexes(&mut writer, &labels, unresolved_label, &relation_types)?;
-    writer.define_projection(ProjectionDefinition::Graph(GraphProjectionDefinition {
-        name: CALLS_PROJECTION.to_owned(),
-        relation_types: BTreeSet::from([relation_types[&EdgeKind::Calls]]),
-        source_role,
-        target_role,
-    }))?;
+    for kind in EdgeKind::ALL {
+        writer.define_projection(ProjectionDefinition::Graph(GraphProjectionDefinition {
+            name: projection_name(kind),
+            relation_types: BTreeSet::from([relation_types[&kind]]),
+            source_role,
+            target_role,
+        }))?;
+    }
 
     let mut elements = BTreeMap::new();
     for node in &index.nodes {
@@ -130,6 +132,183 @@ pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<Pat
             .map_err(|source| Error::fs(&backup_directory, source))?;
     }
     Ok(database_directory)
+}
+
+/// Catalog id maps loaded by name from an existing database, used by the
+/// incremental [`apply_delta`] path instead of re-registering the catalog.
+struct CatalogMaps {
+    /// Symbol-kind labels by node kind.
+    labels: BTreeMap<NodeKind, LabelId>,
+    /// The diagnostic `unresolved_reference` label.
+    unresolved_label: LabelId,
+    /// Edge relation types by edge kind.
+    relation_types: BTreeMap<EdgeKind, RelationTypeId>,
+    /// Element property keys by stable name.
+    element_properties: BTreeMap<&'static str, PropertyKeyId>,
+    /// Relation property keys by stable name.
+    relation_properties: BTreeMap<&'static str, PropertyKeyId>,
+    /// The source incidence role.
+    source_role: RoleId,
+    /// The target incidence role.
+    target_role: RoleId,
+    /// The `stable_key` property key.
+    stable_key: PropertyKeyId,
+    /// The `kind` property key.
+    kind: PropertyKeyId,
+}
+
+/// Applies a resolved index to an existing database in place, preserving the
+/// element id of every symbol whose stable key is unchanged, tombstoning removed
+/// symbols, and fully replacing edges and unresolved diagnostics. Falls back to a
+/// full rebuild when the on-disk catalog does not match the current schema.
+pub(crate) fn apply_delta(root: &Path, index: &ResolvedIndex) -> Result<PathBuf> {
+    let database_directory = database_dir(root);
+    let mut database = Database::open(&database_directory)?;
+
+    let Some(maps) = load_catalog_maps(&database) else {
+        return rebuild_database(root, index);
+    };
+    let (current_symbols, current_relations) = read_current_state(&database, &maps);
+
+    let new_symbol_keys: BTreeSet<&str> = index
+        .nodes
+        .iter()
+        .map(|node| node.stable_key.as_str())
+        .collect();
+
+    let mut writer = database.begin_write()?;
+
+    // Edges and unresolved diagnostics are regenerated every run, so replace them
+    // wholesale: tombstone all current relations and unresolved elements.
+    for relation in current_relations {
+        writer.tombstone_relation(relation)?;
+    }
+    for (key, &(id, is_unresolved)) in &current_symbols {
+        if is_unresolved || !new_symbol_keys.contains(key.as_str()) {
+            writer.tombstone_element(id)?;
+        }
+    }
+
+    let mut elements = BTreeMap::new();
+    for node in &index.nodes {
+        let element = match current_symbols.get(&node.stable_key) {
+            Some(&(id, false)) => {
+                clear_symbol_optionals(&mut writer, id, &maps.element_properties)?;
+                id
+            }
+            _ => {
+                let element = writer.create_element()?;
+                writer.add_element_label(element, maps.labels[&node.kind])?;
+                element
+            }
+        };
+        set_symbol_properties(&mut writer, element, &maps.element_properties, node)?;
+        elements.insert(node.stable_key.clone(), element);
+    }
+
+    for unresolved in &index.unresolved {
+        let element = writer.create_element()?;
+        writer.add_element_label(element, maps.unresolved_label)?;
+        set_unresolved_properties(&mut writer, element, &maps.element_properties, unresolved)?;
+    }
+
+    for edge in &index.edges {
+        let (Some(&source), Some(&target)) = (
+            elements.get(&edge.source_key),
+            elements.get(&edge.target_key),
+        ) else {
+            continue;
+        };
+        let relation = writer.create_relation()?;
+        writer.set_relation_type(relation, maps.relation_types[&edge.kind])?;
+        set_relation_properties(&mut writer, relation, &maps.relation_properties, edge)?;
+        writer.create_incidence(relation, source, maps.source_role)?;
+        writer.create_incidence(relation, target, maps.target_role)?;
+    }
+
+    writer.commit()?;
+    database.validate()?;
+    Ok(database_directory)
+}
+
+/// Loads catalog id maps by name; returns `None` on any missing entry (schema
+/// drift), so the caller can fall back to a full rebuild.
+fn load_catalog_maps(database: &Database) -> Option<CatalogMaps> {
+    let read = database.begin_read();
+    let catalog = read.catalog();
+    let mut labels = BTreeMap::new();
+    for kind in NodeKind::ALL {
+        labels.insert(kind, catalog.label_id(kind.as_str())?);
+    }
+    let mut relation_types = BTreeMap::new();
+    for kind in EdgeKind::ALL {
+        relation_types.insert(kind, catalog.relation_type_id(kind.as_str())?);
+    }
+    let mut element_properties = BTreeMap::new();
+    for property in ElementProperty::ALL {
+        element_properties.insert(property.key(), catalog.property_key_id(property.key())?);
+    }
+    let mut relation_properties = BTreeMap::new();
+    for property in RelationProperty::ALL {
+        relation_properties.insert(property.key(), catalog.property_key_id(property.key())?);
+    }
+    Some(CatalogMaps {
+        unresolved_label: catalog.label_id(NodeKind::Unresolved.as_str())?,
+        source_role: catalog.role_id(SOURCE_ROLE)?,
+        target_role: catalog.role_id(TARGET_ROLE)?,
+        stable_key: *element_properties.get("stable_key")?,
+        kind: *element_properties.get("kind")?,
+        labels,
+        relation_types,
+        element_properties,
+        relation_properties,
+    })
+}
+
+/// Snapshot of an existing database's symbols and relations for the delta:
+/// stable key -> (element id, is-unresolved), plus all relation ids.
+type CurrentState = (BTreeMap<String, (ElementId, bool)>, Vec<RelationId>);
+
+/// Snapshots current symbols (stable key -> (id, is_unresolved)) and current
+/// relation ids from an existing database.
+fn read_current_state(database: &Database, maps: &CatalogMaps) -> CurrentState {
+    let read = database.begin_read();
+    let mut symbols = BTreeMap::new();
+    for id in read.element_ids() {
+        let subject = PropertySubject::Element(id);
+        let Some(stable_key) = read_text(&read, subject, maps.stable_key) else {
+            continue;
+        };
+        let is_unresolved = read_text(&read, subject, maps.kind)
+            .is_some_and(|value| value == NodeKind::Unresolved.as_str());
+        symbols.insert(stable_key, (id, is_unresolved));
+    }
+    (symbols, read.relation_ids())
+}
+
+/// Reads a text property value, if present.
+fn read_text(
+    read: &oxgraph::db::ReadTransaction,
+    subject: PropertySubject,
+    key: PropertyKeyId,
+) -> Option<String> {
+    match read.property(subject, key) {
+        Some(PropertyValue::Text(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Removes the optional symbol properties so a reused element never retains a
+/// stale value (for example a docstring removed by an edit).
+fn clear_symbol_optionals(
+    writer: &mut oxgraph::db::WriteTransaction<'_>,
+    element: ElementId,
+    properties: &BTreeMap<&'static str, PropertyKeyId>,
+) -> Result<()> {
+    for key in ["raw_kind", "signature", "docstring", "source_preview"] {
+        writer.remove_property(PropertySubject::Element(element), properties[key])?;
+    }
+    Ok(())
 }
 
 /// Writes a `.gitignore` that ignores the whole index directory, so users do
