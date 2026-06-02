@@ -13,9 +13,9 @@ use oxcode_model::{
     projection_name,
 };
 use oxgraph::db::{
-    Database, ElementId, GraphProjectionDefinition, IndexDefinition, LabelId, ProjectionDefinition,
-    PropertyFamily, PropertyKeyId, PropertySubject, PropertyType, PropertyValue, RelationId,
-    RelationTypeId, RoleId,
+    Database, ElementId, GraphProjectionDefinition, IndexDefinition, IndexId, LabelId,
+    ProjectionDefinition, PropertyFamily, PropertyKeyId, PropertySubject, PropertyType,
+    PropertyValue, RelationId, RelationTypeId, RoleId,
 };
 
 use crate::{
@@ -42,33 +42,25 @@ pub(super) fn type_index_name(kind: EdgeKind) -> String {
 }
 
 /// Rebuilds the native OxGraph database for one resolved index.
+///
+/// The WAL engine is crash-safe natively (atomic superblock publish + log
+/// recovery), so the rebuild writes straight into the database directory with a
+/// `Database::create` + a single write transaction — no temp-dir/backup-dir
+/// swap-and-recover dance. A stale directory from a prior run is removed first so
+/// the create starts from a clean slate.
 pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<PathBuf> {
     let index_directory = index_dir(root);
     let database_directory = database_dir(root);
-    let temp_directory = index_directory.join("index.oxgdb.tmp");
-    let backup_directory = index_directory.join("index.oxgdb.old");
     std::fs::create_dir_all(&index_directory)
         .map_err(|source| Error::fs(&index_directory, source))?;
     write_index_gitignore(&index_directory)?;
 
-    // Recover from a crash between the two swap renames: the live database is
-    // gone but a validated copy survives in the backup. Promote it before any
-    // deletion so the backup machinery cannot destroy the only copy.
-    if !database_directory.exists()
-        && backup_directory.exists()
-        && Database::validate_path(&backup_directory).is_ok()
-    {
-        std::fs::rename(&backup_directory, &database_directory)
-            .map_err(|source| Error::fs(&backup_directory, source))?;
+    if database_directory.exists() {
+        std::fs::remove_dir_all(&database_directory)
+            .map_err(|source| Error::fs(&database_directory, source))?;
     }
 
-    for stale in [&temp_directory, &backup_directory] {
-        if stale.exists() {
-            std::fs::remove_dir_all(stale).map_err(|source| Error::fs(stale, source))?;
-        }
-    }
-
-    let mut database = Database::create(&temp_directory)?;
+    let mut database = Database::create(&database_directory)?;
     let mut writer = database.begin_write()?;
 
     let source_role = writer.register_role(SOURCE_ROLE)?;
@@ -118,19 +110,10 @@ pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<Pat
     }
 
     writer.commit()?;
-    database.validate()?;
-    drop(database);
-
-    if database_directory.exists() {
-        std::fs::rename(&database_directory, &backup_directory)
-            .map_err(|source| Error::fs(&database_directory, source))?;
-    }
-    std::fs::rename(&temp_directory, &database_directory)
-        .map_err(|source| Error::fs(&temp_directory, source))?;
-    if backup_directory.exists() {
-        std::fs::remove_dir_all(&backup_directory)
-            .map_err(|source| Error::fs(&backup_directory, source))?;
-    }
+    // Fold the commit into a fresh base so the delta-log does not carry the whole
+    // rebuild across future reindexes (the auto-checkpoint policy would also fold
+    // it eventually; doing it here bounds the log immediately after a full build).
+    database.checkpoint()?;
     Ok(database_directory)
 }
 
@@ -151,16 +134,21 @@ struct CatalogMaps {
     source_role: RoleId,
     /// The target incidence role.
     target_role: RoleId,
-    /// The `stable_key` property key.
-    stable_key: PropertyKeyId,
-    /// The `kind` property key.
-    kind: PropertyKeyId,
+    /// The `element_stable_key_eq` equality index, probed per symbol to resolve
+    /// an existing element id without scanning the whole database.
+    stable_key_index: IndexId,
 }
 
 /// Applies a resolved index to an existing database in place, preserving the
 /// element id of every symbol whose stable key is unchanged, tombstoning removed
 /// symbols, and fully replacing edges and unresolved diagnostics. Falls back to a
 /// full rebuild when the on-disk catalog does not match the current schema.
+///
+/// Existing element ids are resolved by probing the native `stable_key` equality
+/// index per symbol (`O(log n)` each) — the engine has real index lookups now, so
+/// there is no in-memory whole-database `stable_key -> id` map. Removed symbols
+/// and the prior run's unresolved diagnostics are the complement of the reused
+/// (kept) ids over the current element set; relations are regenerated wholesale.
 pub(crate) fn apply_delta(root: &Path, index: &ResolvedIndex) -> Result<PathBuf> {
     let database_directory = database_dir(root);
     let mut database = Database::open(&database_directory)?;
@@ -168,35 +156,48 @@ pub(crate) fn apply_delta(root: &Path, index: &ResolvedIndex) -> Result<PathBuf>
     let Some(maps) = load_catalog_maps(&database) else {
         return rebuild_database(root, index);
     };
-    let (current_symbols, current_relations) = read_current_state(&database, &maps);
 
-    let new_symbol_keys: BTreeSet<&str> = index
-        .nodes
-        .iter()
-        .map(|node| node.stable_key.as_str())
+    // Resolve the element id to reuse for each new node by probing the native
+    // stable_key index (an unchanged symbol keeps its id). A node with no current
+    // match mints a fresh element below.
+    let read = database.begin_read();
+    let mut reuse = BTreeMap::new();
+    for node in &index.nodes {
+        if let Some(id) = lookup_element_by_stable_key(&read, &maps, &node.stable_key) {
+            reuse.insert(node.stable_key.clone(), id);
+        }
+    }
+    // The kept set is exactly the reused element ids; every other current element
+    // (a removed resolved symbol, or any prior unresolved diagnostic — which is
+    // always regenerated fresh) is tombstoned. Relations are replaced wholesale.
+    let kept: BTreeSet<ElementId> = reuse.values().copied().collect();
+    let stale_elements: Vec<ElementId> = read
+        .element_ids()
+        .into_iter()
+        .filter(|id| !kept.contains(id))
         .collect();
+    let current_relations = read.relation_ids();
+    drop(read);
 
     let mut writer = database.begin_write()?;
 
     // Edges and unresolved diagnostics are regenerated every run, so replace them
-    // wholesale: tombstone all current relations and unresolved elements.
+    // wholesale: tombstone all current relations and every non-reused element.
     for relation in current_relations {
         writer.tombstone_relation(relation)?;
     }
-    for (key, &(id, is_unresolved)) in &current_symbols {
-        if is_unresolved || !new_symbol_keys.contains(key.as_str()) {
-            writer.tombstone_element(id)?;
-        }
+    for id in stale_elements {
+        writer.tombstone_element(id)?;
     }
 
     let mut elements = BTreeMap::new();
     for node in &index.nodes {
-        let element = match current_symbols.get(&node.stable_key) {
-            Some(&(id, false)) => {
+        let element = match reuse.get(&node.stable_key) {
+            Some(&id) => {
                 clear_symbol_optionals(&mut writer, id, &maps.element_properties)?;
                 id
             }
-            _ => {
+            None => {
                 let element = writer.create_element()?;
                 writer.add_element_label(element, maps.labels[&node.kind])?;
                 element
@@ -227,7 +228,10 @@ pub(crate) fn apply_delta(root: &Path, index: &ResolvedIndex) -> Result<PathBuf>
     }
 
     writer.commit()?;
-    database.validate()?;
+    // Bound the delta-log: fold this reindex into a fresh base (the auto-policy
+    // would also fold eventually, but doing it here keeps the log from growing
+    // unbounded across repeated incremental reindexes).
+    database.checkpoint()?;
     Ok(database_directory)
 }
 
@@ -256,8 +260,7 @@ fn load_catalog_maps(database: &Database) -> Option<CatalogMaps> {
         unresolved_label: catalog.label_id(NodeKind::Unresolved.as_str())?,
         source_role: catalog.role_id(SOURCE_ROLE)?,
         target_role: catalog.role_id(TARGET_ROLE)?,
-        stable_key: *element_properties.get("stable_key")?,
-        kind: *element_properties.get("kind")?,
+        stable_key_index: catalog.index_id("element_stable_key_eq")?,
         labels,
         relation_types,
         element_properties,
@@ -265,37 +268,21 @@ fn load_catalog_maps(database: &Database) -> Option<CatalogMaps> {
     })
 }
 
-/// Snapshot of an existing database's symbols and relations for the delta:
-/// stable key -> (element id, is-unresolved), plus all relation ids.
-type CurrentState = (BTreeMap<String, (ElementId, bool)>, Vec<RelationId>);
-
-/// Snapshots current symbols (stable key -> (id, is_unresolved)) and current
-/// relation ids from an existing database.
-fn read_current_state(database: &Database, maps: &CatalogMaps) -> CurrentState {
-    let read = database.begin_read();
-    let mut symbols = BTreeMap::new();
-    for id in read.element_ids() {
-        let subject = PropertySubject::Element(id);
-        let Some(stable_key) = read_text(&read, subject, maps.stable_key) else {
-            continue;
-        };
-        let is_unresolved = read_text(&read, subject, maps.kind)
-            .is_some_and(|value| value == NodeKind::Unresolved.as_str());
-        symbols.insert(stable_key, (id, is_unresolved));
-    }
-    (symbols, read.relation_ids())
-}
-
-/// Reads a text property value, if present.
-fn read_text(
+/// Resolves the element id of a stored symbol by its stable key via the native
+/// equality index (`O(log n)`), or `None` when no current element carries it.
+fn lookup_element_by_stable_key(
     read: &oxgraph::db::ReadTransaction,
-    subject: PropertySubject,
-    key: PropertyKeyId,
-) -> Option<String> {
-    match read.property(subject, key) {
-        Some(PropertyValue::Text(value)) => Some(value.clone()),
-        _ => None,
-    }
+    maps: &CatalogMaps,
+    stable_key: &str,
+) -> Option<ElementId> {
+    let value = PropertyValue::Text(stable_key.to_string());
+    read.lookup_index(maps.stable_key_index, oxgraph::db::IndexLookup::Equal(&value))
+        .ok()?
+        .into_iter()
+        .find_map(|subject| match subject {
+            PropertySubject::Element(id) => Some(id),
+            PropertySubject::Relation(_) | PropertySubject::Incidence(_) => None,
+        })
 }
 
 /// Removes the optional symbol properties so a reused element never retains a

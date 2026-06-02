@@ -1562,24 +1562,30 @@ fn require_relation_key(
 }
 
 /// Reads one optional text property.
+///
+/// The native read returns `Option<Cow<PropertyValue>>` (base records borrow,
+/// overlay records own); matching the borrowed `PropertyValue` covers both.
 fn optional_text_property(
     read: &oxgraph::db::ReadTransaction,
     subject: PropertySubject,
     key: PropertyKeyId,
 ) -> Option<String> {
-    match read.property(subject, key) {
+    match read.property(subject, key).as_deref() {
         Some(PropertyValue::Text(value)) => Some(value.clone()),
         Some(PropertyValue::Boolean(_) | PropertyValue::Integer(_)) | None => None,
     }
 }
 
 /// Reads one optional unsigned integer property.
+///
+/// The native read returns `Option<Cow<PropertyValue>>` (base records borrow,
+/// overlay records own); matching the borrowed `PropertyValue` covers both.
 fn optional_usize_property(
     read: &oxgraph::db::ReadTransaction,
     subject: PropertySubject,
     key: PropertyKeyId,
 ) -> Option<usize> {
-    match read.property(subject, key) {
+    match read.property(subject, key).as_deref() {
         Some(PropertyValue::Integer(value)) => usize::try_from(*value).ok(),
         Some(PropertyValue::Boolean(_) | PropertyValue::Text(_)) | None => None,
     }

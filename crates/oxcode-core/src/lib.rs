@@ -377,6 +377,48 @@ mod tests {
     }
 
     #[test]
+    fn incremental_reindex_tombstones_a_removed_symbol() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        );
+        write_file(root, "src/lib.rs", "pub mod a;\n");
+        // a.rs starts with two symbols; the second is removed by the edit below.
+        write_file(root, "src/a.rs", "pub fn keep() {}\npub fn drop_me() {}\n");
+
+        index_project(root).expect("first index");
+        {
+            let index = ProjectIndex::open(root).expect("open");
+            assert_eq!(
+                index.resolve_selector("name:drop_me").expect("resolve").len(),
+                1,
+                "removed symbol is present before the edit"
+            );
+        }
+
+        // Rewrite a.rs dropping `drop_me` (but keeping `keep`). The complement-
+        // based tombstoning must delete the removed symbol's element while reusing
+        // the surviving one.
+        write_file(root, "src/a.rs", "pub fn keep() {}\n");
+        index_project(root).expect("incremental index");
+
+        let index = ProjectIndex::open(root).expect("reopen");
+        assert_eq!(
+            index.resolve_selector("name:drop_me").expect("resolve").len(),
+            0,
+            "removed symbol resolves to zero matches after an incremental reindex"
+        );
+        assert_eq!(
+            index.resolve_selector("name:keep").expect("resolve").len(),
+            1,
+            "surviving symbol in the edited file is retained"
+        );
+    }
+
+    #[test]
     fn navigate_generalizes_traversal_to_each_edge_kind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
