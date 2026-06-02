@@ -3,7 +3,7 @@
 //! structure from raw node text — method names, impl types, traits, and import
 //! paths all come from typed field children.
 
-use std::path::Path;
+use std::{path::Path, str};
 
 use oxcode_model::{
     EdgeKind, Extraction, FileParseStatus, LanguageId, NodeKind, ReferenceKind, ReferenceTarget,
@@ -87,6 +87,9 @@ fn extract_rust(
         language: language.clone(),
         file_path: relative.clone(),
         span: span(&root),
+        signature: None,
+        docstring: None,
+        source_preview: None,
     };
 
     let mut walker = RustWalker {
@@ -395,6 +398,9 @@ impl RustWalker<'_> {
             language: self.language.clone(),
             file_path: self.file_path.clone(),
             span,
+            signature: symbol_signature(node, self.source),
+            docstring: symbol_docstring(node, self.source),
+            source_preview: symbol_source_preview(node, self.source),
         };
         self.nodes.push(symbol.clone());
         symbol
@@ -431,6 +437,103 @@ impl RustWalker<'_> {
             reason: None,
         });
     }
+}
+
+/// Returns a compact item declaration suitable for search output.
+fn symbol_signature(node: &Node, source: &[u8]) -> Option<String> {
+    let text = strip_leading_metadata(node_text(node, source));
+    let header = text
+        .split('{')
+        .next()
+        .unwrap_or(text.as_str())
+        .split(';')
+        .next()
+        .unwrap_or(text.as_str());
+    bounded_text(&compact_source_text(header), 300)
+}
+
+/// Returns contiguous Rust doc comments directly attached to an item.
+fn symbol_docstring(node: &Node, source: &[u8]) -> Option<String> {
+    let source = str::from_utf8(source).ok()?;
+    let before = source.get(..node.start_byte()).unwrap_or_default();
+    let mut lines = Vec::new();
+    for line in before.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[") && lines.is_empty() {
+            continue;
+        }
+        if let Some(doc) = clean_doc_comment(trimmed) {
+            lines.push(doc);
+            continue;
+        }
+        break;
+    }
+    lines.reverse();
+
+    if lines.is_empty() {
+        for line in node_text(node, source.as_bytes()).lines() {
+            let trimmed = line.trim();
+            if let Some(doc) = clean_doc_comment(trimmed) {
+                lines.push(doc);
+                continue;
+            }
+            if trimmed.starts_with("#[") || trimmed.is_empty() {
+                continue;
+            }
+            break;
+        }
+    }
+
+    bounded_text(&lines.join("\n"), 800)
+}
+
+/// Returns a bounded source excerpt for an indexed symbol.
+fn symbol_source_preview(node: &Node, source: &[u8]) -> Option<String> {
+    let text = node_text(node, source);
+    let preview = text
+        .lines()
+        .map(str::trim_end)
+        .skip_while(|line| line.trim().is_empty())
+        .take(24)
+        .collect::<Vec<_>>()
+        .join("\n");
+    bounded_text(&preview, 1200)
+}
+
+/// Removes leading doc and attribute metadata from a declaration-like string.
+fn strip_leading_metadata(text: &str) -> String {
+    text.lines()
+        .skip_while(|line| {
+            let trimmed = line.trim();
+            trimmed.is_empty()
+                || trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("#[")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Cleans one Rust doc comment line.
+fn clean_doc_comment(line: &str) -> Option<String> {
+    line.strip_prefix("///")
+        .or_else(|| line.strip_prefix("//!"))
+        .map(str::trim_start)
+        .map(ToOwned::to_owned)
+        .filter(|line| !line.is_empty())
+}
+
+/// Returns bounded non-empty text.
+fn bounded_text(text: &str, max_chars: usize) -> Option<String> {
+    let compact = text.trim();
+    if compact.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    for character in compact.chars().take(max_chars) {
+        output.push(character);
+    }
+    Some(output)
 }
 
 /// Returns a node name from its `name` field or first identifier-like child.

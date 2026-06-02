@@ -1,0 +1,9 @@
+suite: smoke
+tasks:
+  - id: smoke-entry-helper
+    repo: smoke-rust
+    repo_path: fixtures/smoke-rust
+    question: "How does `entry` reach `helper`?"
+    required_concepts: [entry, helper, calls]
+    expected_files: [src/lib.rs]
+    expected_symbols: [entry, helper]

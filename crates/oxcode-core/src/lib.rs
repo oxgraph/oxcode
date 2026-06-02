@@ -21,8 +21,9 @@ use crate::store::oxgraph::{OxGraphStore, ReadSession};
 pub use crate::{
     error::{Error, Result},
     format::{
-        format_call_graph_report, format_expanded_query_report, format_query_value,
-        format_selector_matches, format_symbol_report,
+        format_call_graph_report, format_context_report, format_expanded_query_report,
+        format_file_search_report, format_query_value, format_selector_matches,
+        format_selector_not_found, format_symbol_report, format_symbol_search_report,
     },
     paths::{DATABASE_DIR, INDEX_DIR, database_dir, index_dir},
     resolve::resolve_extractions,
@@ -92,6 +93,28 @@ impl ProjectIndex {
         self.store.with_read(|read| read.resolve_selector(selector))
     }
 
+    /// Searches indexed symbols with optional kind filters.
+    pub fn search_symbols_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        kinds: &[NodeKind],
+    ) -> Result<SymbolSearchReport> {
+        self.store
+            .with_read(|read| read.search_symbols_filtered(query, limit, kinds))
+    }
+
+    /// Searches indexed source files.
+    pub fn search_files(&self, query: &str, limit: usize) -> Result<FileSearchReport> {
+        self.store.with_read(|read| read.search_files(query, limit))
+    }
+
+    /// Builds deterministic task-oriented context.
+    pub fn context(&self, query: &str, limit: usize, depth: usize) -> Result<ContextReport> {
+        self.store
+            .with_read(|read| read.context(query, limit, depth))
+    }
+
     /// Describes one selected symbol.
     pub fn describe_symbol(&self, selector: &str) -> Result<SymbolReport> {
         self.store.with_read(|read| read.describe_symbol(selector))
@@ -144,6 +167,26 @@ impl Session<'_> {
     /// Resolves one selector into matching symbols.
     pub fn resolve_selector(&self, selector: &str) -> Result<Vec<SymbolSummary>> {
         self.read.resolve_selector(selector)
+    }
+
+    /// Searches indexed symbols with optional kind filters.
+    pub fn search_symbols_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        kinds: &[NodeKind],
+    ) -> Result<SymbolSearchReport> {
+        self.read.search_symbols_filtered(query, limit, kinds)
+    }
+
+    /// Searches indexed source files.
+    pub fn search_files(&self, query: &str, limit: usize) -> Result<FileSearchReport> {
+        self.read.search_files(query, limit)
+    }
+
+    /// Builds deterministic task-oriented context.
+    pub fn context(&self, query: &str, limit: usize, depth: usize) -> Result<ContextReport> {
+        self.read.context(query, limit, depth)
     }
 
     /// Describes one selected symbol.

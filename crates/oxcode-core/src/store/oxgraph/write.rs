@@ -269,6 +269,21 @@ fn set_symbol_properties(
         node.language.as_str(),
     )?;
     set_text(writer, element, properties, "file_path", &node.file_path)?;
+    if let Some(signature) = &node.signature {
+        set_text(writer, element, properties, "signature", signature)?;
+    }
+    if let Some(docstring) = &node.docstring {
+        set_text(writer, element, properties, "docstring", docstring)?;
+    }
+    if let Some(source_preview) = &node.source_preview {
+        set_text(
+            writer,
+            element,
+            properties,
+            "source_preview",
+            source_preview,
+        )?;
+    }
     set_span_properties(writer, element, properties, node.span)?;
     Ok(())
 }

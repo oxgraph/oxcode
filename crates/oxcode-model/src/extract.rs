@@ -72,6 +72,12 @@ pub struct SymbolNode {
     pub file_path: String,
     /// Source span.
     pub span: SourceSpan,
+    /// Compact declaration or header.
+    pub signature: Option<String>,
+    /// Documentation comments directly attached to the symbol.
+    pub docstring: Option<String>,
+    /// Bounded source excerpt for agent-facing context.
+    pub source_preview: Option<String>,
 }
 
 /// A resolved symbolic edge.
