@@ -356,6 +356,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -794,6 +803,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -901,9 +919,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c50a9ed967a5f0f516b5292db6ad4ac197e06adbd049a9e889c41dda538ed44"
+checksum = "c142e428f4cd65dbcd03191c988588d77bdcfcf619457cd2a17262affb76e36a"
 dependencies = [
  "oxgraph-db",
  "oxgraph-graph",
@@ -913,9 +931,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-algo"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "431f132f065831da73f2a7735213f2d0a8a8bef6279866420a24986140f15a0e"
+checksum = "839a0c9f84762b0704ec88f11459230a3eb415d5969fd22ad18fe581c11cef05"
 dependencies = [
  "oxgraph-graph",
  "oxgraph-hyper",
@@ -924,9 +942,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-csc"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60042ba451c54a7938a140278090f7e6dc2493c88db89223eaabfac6190a9882"
+checksum = "c3ceec0dba584a6f703a5d85c725cc0a36a50586705b3090fa938ef5de720836"
 dependencies = [
  "oxgraph-csr",
  "oxgraph-graph",
@@ -937,9 +955,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-csr"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd94b1eae461b53a8c74ea465347ffe1cb5ab76a5eb239a03dde0cb26dbde6e8"
+checksum = "8074744000a74549391d254e57f4c180c557c55566bea08f12ea6976d322e458"
 dependencies = [
  "oxgraph-graph",
  "oxgraph-layout-util",
@@ -949,46 +967,49 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-db"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c19eb5d3bd84a2b96e2fe287e2ed3b23939029d9ad1c81b32ceaefd4a4e018d4"
+checksum = "c63c273f185f530837a8e86f07aa8630e0c1a00944eea15d4bdde80904f38d0f"
 dependencies = [
+ "crc32c",
  "oxgraph-algo",
  "oxgraph-csc",
  "oxgraph-csr",
  "oxgraph-graph",
  "oxgraph-hyper",
  "oxgraph-hyper-bcsr",
+ "oxgraph-mmap",
  "oxgraph-property",
  "oxgraph-snapshot",
  "oxgraph-topology",
  "serde",
- "serde_json",
+ "yoke",
+ "zerocopy",
 ]
 
 [[package]]
 name = "oxgraph-graph"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93cbf261554d3482e6341b42eb0ef131bffbea2ff6cc73a8308317065e6ced39"
+checksum = "9922a5f6abfeb579519d54d4a61c739eec646339979f8cceca7ba3517914d6d7"
 dependencies = [
  "oxgraph-topology",
 ]
 
 [[package]]
 name = "oxgraph-hyper"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d369883497b7f5281097a0b810fbb5482b6f4c502b8bb3bed9cc1c1d4301a3b1"
+checksum = "73f57d304fc086fe4020f6ca477bc1f0b64d976e5685700726ca6ee439f161fd"
 dependencies = [
  "oxgraph-topology",
 ]
 
 [[package]]
 name = "oxgraph-hyper-bcsr"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4a715223391d5dae8252aee271ee7d49f07106f011ea9bcf4e04ea904466a40"
+checksum = "608c3b97b8e14f7b186ff79b0b8b3bf22e42f46c55a8aeb8082f897875f73870"
 dependencies = [
  "oxgraph-hyper",
  "oxgraph-layout-util",
@@ -998,18 +1019,27 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-layout-util"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa4cc158d6124eb7c1d33de61da50731bebef21eb98b77d1a1e772f1fc04b538"
+checksum = "ae1756a294b182e48923e91c08a4e3f7b7626a9227cc8a36347ffdf524ee0371"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
-name = "oxgraph-property"
-version = "0.2.0"
+name = "oxgraph-mmap"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c79f344100cc3c4efc3361e2619a4282f162f2e985da9de9d51705e279dd42a5"
+checksum = "3236843598ceb89e243ad3dab032cea3ef4d6d3f4c919fa7577e4998672da8ab"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
+name = "oxgraph-property"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17d08035b938c8f030070e95138eb5584bc4c235ccdee13b4e225164895fffda"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1022,9 +1052,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-snapshot"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "408a1f32aeded393a695d940996b6e4d04954d6baa39163ca7e5967a4b66d447"
+checksum = "7a83d07c1ad6fe00efecba086664a7e87b16d5d9d17d157c1c28c5f85a4244b7"
 dependencies = [
  "oxgraph-layout-util",
  "zerocopy",
@@ -1032,9 +1062,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-topology"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1afeba01863cdc5f7a3cbead167dbf7415283043e5f40952d9a55e8be73b7d16"
+checksum = "74e85dfa888d284765b581aea405ec316e77f03888a73f49030a6550f4774cb8"
 
 [[package]]
 name = "percent-encoding"
@@ -1339,6 +1369,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "stable_deref_trait"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
 name = "streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1365,6 +1401,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "synstructure"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1969,6 +2016,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "yoke"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+dependencies = [
+ "stable_deref_trait",
+ "yoke-derive",
+ "zerofrom",
+]
+
+[[package]]
+name = "yoke-derive"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1986,6 +2056,27 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zerofrom"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272"
+dependencies = [
+ "zerofrom-derive",
+]
+
+[[package]]
+name = "zerofrom-derive"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
 ]
 
 [[package]]

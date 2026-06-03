@@ -14,7 +14,7 @@ anyhow = "1.0.100"
 assert_cmd = "2.0.18"
 clap = { version = "4.5.53", features = ["derive"] }
 ignore = "0.4.25"
-oxgraph = { version = "0.2.0", features = ["db", "graph", "topology"] }
+oxgraph = { version = "0.2.4", features = ["db", "graph", "topology"] }
 predicates = "3.1.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
