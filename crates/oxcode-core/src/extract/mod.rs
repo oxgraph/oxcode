@@ -17,8 +17,8 @@ mod cst;
 mod rust;
 
 /// Source-language file extensions oxcode recognizes, whether or not an
-/// extractor exists yet. The subset that has an extractor is derived from the
-/// [`Registry`]; a recognized extension with no extractor is reported as a
+/// extractor exists for them. The subset that has an extractor is derived from
+/// the [`Registry`]; a recognized extension with no extractor is reported as a
 /// skipped unsupported file rather than silently ignored.
 pub(crate) const RECOGNIZED_SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "h", "cpp", "cc", "hpp",
@@ -38,9 +38,8 @@ pub(crate) struct ExtractionInput<'a> {
 ///
 /// Extractors are registered once in a process-global [`Registry`] keyed by
 /// file extension (see [`registry`]); dispatch is therefore an extension-map
-/// lookup, not a linear scan. Implementors are zero-cost stateless markers
-/// today, but the `Send + Sync` bound keeps the door open for extractors that
-/// cache parser/query state in the shared registry.
+/// lookup, not a linear scan. The `Send + Sync` bound lets the shared registry
+/// hold extractors that cache parser/query state.
 pub(crate) trait LanguageExtractor: Send + Sync {
     /// Stable language ID.
     fn language_id(&self) -> oxcode_model::LanguageId;
@@ -106,7 +105,7 @@ pub(crate) fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Registry::build)
 }
 
-/// Returns whether `path` is a recognized source file with no extractor yet.
+/// Returns whether `path` is a recognized source file with no extractor.
 pub(crate) fn is_recognized_unsupported(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -287,7 +286,7 @@ mod tests {
 
     #[test]
     fn recognized_unsupported_excludes_supported_languages() {
-        // Recognized source, no extractor yet -> unsupported.
+        // Recognized source, no extractor -> unsupported.
         assert!(is_recognized_unsupported(Path::new("app.py")));
         // Recognized source with an extractor -> not unsupported.
         assert!(!is_recognized_unsupported(Path::new("lib.rs")));

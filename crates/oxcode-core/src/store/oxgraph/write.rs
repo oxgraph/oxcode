@@ -43,11 +43,10 @@ pub(super) fn type_index_name(kind: EdgeKind) -> String {
 
 /// Rebuilds the native OxGraph database for one resolved index.
 ///
-/// The WAL engine is crash-safe natively (atomic superblock publish + log
+/// The database is crash-safe natively (atomic superblock publish + log
 /// recovery), so the rebuild writes straight into the database directory with a
-/// `Database::create` + a single write transaction — no temp-dir/backup-dir
-/// swap-and-recover dance. A stale directory from a prior run is removed first so
-/// the create starts from a clean slate.
+/// `Database::create` + a single write transaction. A stale directory from a
+/// prior run is removed first so the create starts from a clean slate.
 pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<PathBuf> {
     let index_directory = index_dir(root);
     let database_directory = database_dir(root);
@@ -111,8 +110,8 @@ pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<Pat
 
     writer.commit()?;
     // Fold the commit into a fresh base so the delta-log does not carry the whole
-    // rebuild across future reindexes (the auto-checkpoint policy would also fold
-    // it eventually; doing it here bounds the log immediately after a full build).
+    // rebuild across future reindexes, bounding the log immediately after a full
+    // build.
     database.checkpoint()?;
     Ok(database_directory)
 }
@@ -145,10 +144,9 @@ struct CatalogMaps {
 /// full rebuild when the on-disk catalog does not match the current schema.
 ///
 /// Existing element ids are resolved by probing the native `stable_key` equality
-/// index per symbol (`O(log n)` each) — the engine has real index lookups now, so
-/// there is no in-memory whole-database `stable_key -> id` map. Removed symbols
-/// and the prior run's unresolved diagnostics are the complement of the reused
-/// (kept) ids over the current element set; relations are regenerated wholesale.
+/// index per symbol (`O(log n)` each). Removed symbols and the prior run's
+/// unresolved diagnostics are the complement of the reused (kept) ids over the
+/// current element set; relations are regenerated wholesale.
 pub(crate) fn apply_delta(root: &Path, index: &ResolvedIndex) -> Result<PathBuf> {
     let database_directory = database_dir(root);
     let mut database = Database::open(&database_directory)?;
@@ -228,9 +226,8 @@ pub(crate) fn apply_delta(root: &Path, index: &ResolvedIndex) -> Result<PathBuf>
     }
 
     writer.commit()?;
-    // Bound the delta-log: fold this reindex into a fresh base (the auto-policy
-    // would also fold eventually, but doing it here keeps the log from growing
-    // unbounded across repeated incremental reindexes).
+    // Bound the delta-log: fold this reindex into a fresh base so the log does not
+    // grow unbounded across repeated incremental reindexes.
     database.checkpoint()?;
     Ok(database_directory)
 }
