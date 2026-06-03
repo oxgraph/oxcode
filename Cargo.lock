@@ -921,7 +921,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph"
-version = "0.2.2"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c142e428f4cd65dbcd03191c988588d77bdcfcf619457cd2a17262affb76e36a"
 dependencies = [
  "oxgraph-db",
  "oxgraph-graph",
@@ -931,7 +933,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-algo"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "839a0c9f84762b0704ec88f11459230a3eb415d5969fd22ad18fe581c11cef05"
 dependencies = [
  "oxgraph-graph",
  "oxgraph-hyper",
@@ -940,7 +944,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-csc"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3ceec0dba584a6f703a5d85c725cc0a36a50586705b3090fa938ef5de720836"
 dependencies = [
  "oxgraph-csr",
  "oxgraph-graph",
@@ -951,7 +957,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-csr"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8074744000a74549391d254e57f4c180c557c55566bea08f12ea6976d322e458"
 dependencies = [
  "oxgraph-graph",
  "oxgraph-layout-util",
@@ -961,7 +969,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-db"
-version = "0.2.1"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c63c273f185f530837a8e86f07aa8630e0c1a00944eea15d4bdde80904f38d0f"
 dependencies = [
  "crc32c",
  "oxgraph-algo",
@@ -981,21 +991,27 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-graph"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9922a5f6abfeb579519d54d4a61c739eec646339979f8cceca7ba3517914d6d7"
 dependencies = [
  "oxgraph-topology",
 ]
 
 [[package]]
 name = "oxgraph-hyper"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73f57d304fc086fe4020f6ca477bc1f0b64d976e5685700726ca6ee439f161fd"
 dependencies = [
  "oxgraph-topology",
 ]
 
 [[package]]
 name = "oxgraph-hyper-bcsr"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "608c3b97b8e14f7b186ff79b0b8b3bf22e42f46c55a8aeb8082f897875f73870"
 dependencies = [
  "oxgraph-hyper",
  "oxgraph-layout-util",
@@ -1005,21 +1021,27 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-layout-util"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae1756a294b182e48923e91c08a4e3f7b7626a9227cc8a36347ffdf524ee0371"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
 name = "oxgraph-mmap"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3236843598ceb89e243ad3dab032cea3ef4d6d3f4c919fa7577e4998672da8ab"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "oxgraph-property"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17d08035b938c8f030070e95138eb5584bc4c235ccdee13b4e225164895fffda"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1032,7 +1054,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-snapshot"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a83d07c1ad6fe00efecba086664a7e87b16d5d9d17d157c1c28c5f85a4244b7"
 dependencies = [
  "oxgraph-layout-util",
  "zerocopy",
@@ -1040,7 +1064,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-topology"
-version = "0.2.0"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74e85dfa888d284765b581aea405ec316e77f03888a73f49030a6550f4774cb8"
 
 [[package]]
 name = "percent-encoding"
