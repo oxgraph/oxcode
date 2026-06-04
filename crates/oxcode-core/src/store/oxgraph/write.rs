@@ -1,21 +1,31 @@
-//! Database write path: rebuilds the OxGraph store from a resolved index and
-//! derives the whole catalog (labels, relation types, properties, indexes) from
-//! the model's typed schema.
+//! Db write path: reconciles the OxGraph store from a resolved index against a
+//! declarative [`Schema`].
+//!
+//! The schema (roles, labels, relation types, typed property keys, equality
+//! indexes, and graph projections) is declared once from the model's typed
+//! catalog and applied idempotently inside the write transaction. The body then
+//! drives the engine's identity-reconcile verbs:
+//!
+//! * [`Writer::upsert_element`] resolves-or-mints each symbol by its stable key, so an unchanged
+//!   symbol keeps its element id across reindexes (`O(change)`);
+//! * [`Writer::retain`] tombstones the vanished complement (the prune step);
+//! * [`Writer::upsert_relation`] resolves-or-mints each edge by a deterministic per-edge key,
+//!   reusing the relation id when the edge is unchanged.
+//!
+//! There is one path: a cold store simply upserts everything and prunes nothing.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
 use oxcode_model::{
-    CALLS_PROJECTION, EdgeKind, ElementProperty, NodeKind, PropertyKind, RelationProperty,
-    ResolvedEdge, ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE,
-    UnresolvedReference,
+    EdgeKind, ElementProperty, NodeKind, PropertyKind, RelationProperty, ResolvedEdge,
+    ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE, UnresolvedReference,
+    projection_name,
 };
 use oxgraph::db::{
-    Database, ElementId, GraphProjectionDefinition, IndexDefinition, LabelId, ProjectionDefinition,
-    PropertyFamily, PropertyKeyId, PropertySubject, PropertyType, PropertyValue, RelationId,
-    RelationTypeId,
+    Bound, Db, DbError, ElementId, Int, PropertyFamily, RelationId, Schema, Text, Writer,
 };
 
 use crate::{
@@ -23,113 +33,232 @@ use crate::{
     paths::{database_dir, index_dir},
 };
 
-/// Maps a model property kind to the OxGraph storage type.
-const fn property_type(kind: PropertyKind) -> PropertyType {
+/// Equality index name resolving an element by its [`ElementProperty::StableKey`].
+const STABLE_KEY_INDEX: &str = "element_stable_key_eq";
+/// Equality index name resolving a relation by its [`RelationProperty::EdgeStableKey`].
+const EDGE_KEY_INDEX: &str = "relation_edge_key_eq";
+
+/// Equality index name for one indexed element property key.
+pub(super) fn element_index_name(key: &str) -> String {
+    format!("element_{key}_eq")
+}
+
+/// Equality index name over the [`RelationProperty::EdgeKind`] property, consulted
+/// to count relations of a given edge kind.
+pub(super) fn edge_kind_index_name() -> String {
+    format!("relation_{}_eq", RelationProperty::EdgeKind.key())
+}
+
+/// Builds the declarative code-graph schema once.
+///
+/// Declares every role, label, relation type, typed property key, equality
+/// index, and graph projection the store needs, derived from the model's typed
+/// catalog so the write and read paths cannot drift. Applying it twice registers
+/// nothing new (the apply is idempotent).
+fn code_schema() -> Schema {
+    let mut schema = Schema::new().role(SOURCE_ROLE).role(TARGET_ROLE);
+
+    for kind in NodeKind::ALL {
+        schema = schema.label(kind.as_str());
+    }
+    schema = schema.label(NodeKind::Unresolved.as_str());
+    for kind in EdgeKind::ALL {
+        schema = schema.relation_type(kind.as_str());
+    }
+
+    for property in ElementProperty::ALL {
+        schema = declare_key(
+            schema,
+            property.key(),
+            property.kind(),
+            PropertyFamily::Element,
+        );
+    }
+    for property in RelationProperty::ALL {
+        schema = declare_key(
+            schema,
+            property.key(),
+            property.kind(),
+            PropertyFamily::Relation,
+        );
+    }
+
+    // Equality indexes for selector lookups, the two identity indexes the
+    // reconcile verbs probe (resolve-or-mint elements and relations), and the
+    // edge-kind index consulted by status counts.
+    for property in ElementProperty::INDEXED {
+        schema = schema.equality_index(&element_index_name(property.key()), property.key());
+    }
+    schema = schema
+        .equality_index(EDGE_KEY_INDEX, RelationProperty::EdgeStableKey.key())
+        .equality_index(&edge_kind_index_name(), RelationProperty::EdgeKind.key());
+
+    // One graph projection per edge kind so navigation can traverse any kind.
+    for kind in EdgeKind::ALL {
+        let name = projection_name(kind);
+        schema = schema.graph_projection(&name, &[kind.as_str()], SOURCE_ROLE, TARGET_ROLE);
+    }
+    schema
+}
+
+/// Declares one typed property key on the schema, mapping the model's value kind
+/// to the engine's typed key constructor.
+fn declare_key(schema: Schema, name: &str, kind: PropertyKind, family: PropertyFamily) -> Schema {
     match kind {
-        PropertyKind::Text => PropertyType::Text,
-        PropertyKind::Integer => PropertyType::Integer,
+        PropertyKind::Text => schema.key::<Text>(name, family),
+        PropertyKind::Integer => schema.key::<Int>(name, family),
     }
 }
 
-/// Index name for counting elements carrying a node-kind label.
-pub(super) fn label_index_name(kind: NodeKind) -> String {
-    format!("label_{}", kind.as_str())
-}
-
-/// Index name for counting relations of an edge kind.
-pub(super) fn type_index_name(kind: EdgeKind) -> String {
-    format!("type_{}", kind.as_str())
-}
-
-/// Rebuilds the native OxGraph database for one resolved index.
-pub(crate) fn rebuild_database(root: &Path, index: &ResolvedIndex) -> Result<PathBuf> {
+/// Reconciles the native OxGraph database to one resolved index.
+///
+/// The database is crash-safe natively (atomic superblock publish + log
+/// recovery), so this writes straight into the database directory. The schema is
+/// applied idempotently, then the body reconciles by identity: every current
+/// symbol and edge is upserted (reusing the id of anything unchanged) and the
+/// vanished complement is pruned. A cold store therefore mints everything and
+/// prunes nothing; a warm store mutates only what changed (`O(change)`).
+pub(crate) fn reconcile_database(root: &Path, index: &ResolvedIndex) -> Result<PathBuf> {
     let index_directory = index_dir(root);
     let database_directory = database_dir(root);
-    let temp_directory = index_directory.join("index.oxgdb.tmp");
-    let backup_directory = index_directory.join("index.oxgdb.old");
     std::fs::create_dir_all(&index_directory)
         .map_err(|source| Error::fs(&index_directory, source))?;
     write_index_gitignore(&index_directory)?;
 
-    // Recover from a crash between the two swap renames: the live database is
-    // gone but a validated copy survives in the backup. Promote it before any
-    // deletion so the backup machinery cannot destroy the only copy.
-    if !database_directory.exists()
-        && backup_directory.exists()
-        && Database::validate_path(&backup_directory).is_ok()
-    {
-        std::fs::rename(&backup_directory, &database_directory)
-            .map_err(|source| Error::fs(&backup_directory, source))?;
-    }
-
-    for stale in [&temp_directory, &backup_directory] {
-        if stale.exists() {
-            std::fs::remove_dir_all(stale).map_err(|source| Error::fs(stale, source))?;
+    // Open the existing store in place, or create one on the first index (and on
+    // a store that fails to open — a missing, corrupt, or stale-format database is
+    // wiped and regenerated, since the index is derived and cheap to rebuild). A
+    // single `open` attempt is used rather than `validate_path` + `open`, which
+    // would open (and fully decode the base) twice. Both arms reconcile below.
+    let mut database = match Db::open(&database_directory) {
+        Ok(database) => database,
+        Err(_) => {
+            if database_directory.exists() {
+                std::fs::remove_dir_all(&database_directory)
+                    .map_err(|source| Error::fs(&database_directory, source))?;
+            }
+            Db::create(&database_directory)?
         }
-    }
+    };
 
-    let mut database = Database::create(&temp_directory)?;
-    let mut writer = database.begin_write()?;
+    let schema = code_schema();
+    let node_keys: Vec<&str> = index
+        .nodes
+        .iter()
+        .map(|node| node.stable_key.as_str())
+        .collect();
+    let edge_keys: Vec<String> = index.edges.iter().map(edge_stable_key).collect();
 
-    let source_role = writer.register_role(SOURCE_ROLE)?;
-    let target_role = writer.register_role(TARGET_ROLE)?;
-    let labels = register_labels(&mut writer)?;
-    let unresolved_label = writer.register_label(NodeKind::Unresolved.as_str())?;
-    let relation_types = register_relation_types(&mut writer)?;
-    let element_properties = register_element_properties(&mut writer)?;
-    let relation_properties = register_relation_properties(&mut writer)?;
-    define_property_indexes(&mut writer, &element_properties)?;
-    define_count_indexes(&mut writer, &labels, unresolved_label, &relation_types)?;
-    writer.define_projection(ProjectionDefinition::Graph(GraphProjectionDefinition {
-        name: CALLS_PROJECTION.to_owned(),
-        relation_types: BTreeSet::from([relation_types[&EdgeKind::Calls]]),
-        source_role,
-        target_role,
-    }))?;
+    database.write(|writer| {
+        let bound = writer.apply_schema(&schema)?;
+        let stable_key_eq = bound.equality_index::<Text>(STABLE_KEY_INDEX)?;
+        let edge_key_eq = bound.equality_index::<Text>(EDGE_KEY_INDEX)?;
 
-    let mut elements = BTreeMap::new();
-    for node in &index.nodes {
-        let element = writer.create_element()?;
-        writer.add_element_label(element, labels[&node.kind])?;
-        set_symbol_properties(&mut writer, element, &element_properties, node)?;
-        elements.insert(node.stable_key.clone(), element);
-    }
+        // 1. Upsert every symbol by its stable key (an unchanged symbol keeps its element id),
+        //    tracking the resolved id for edge endpoints.
+        let mut id_by_key = BTreeMap::new();
+        for node in &index.nodes {
+            let element = writer.upsert_element(stable_key_eq, node.stable_key.as_str())?;
+            writer.add_label(element, bound.label(node.kind.as_str())?)?;
+            set_symbol_properties(writer, &bound, element, node)?;
+            id_by_key.insert(node.stable_key.clone(), element);
+        }
 
-    for unresolved in &index.unresolved {
-        let element = writer.create_element()?;
-        writer.add_element_label(element, unresolved_label)?;
-        set_unresolved_properties(&mut writer, element, &element_properties, unresolved)?;
-    }
+        // Unresolved diagnostics carry their own stable key (which encodes the
+        // reference site), so they reconcile identically — unchanged diagnostics
+        // keep their ids and stale ones are pruned by `retain` below.
+        let mut diagnostic_keys = Vec::new();
+        for unresolved in &index.unresolved {
+            let key = unresolved_stable_key(unresolved);
+            let element = writer.upsert_element(stable_key_eq, key.as_str())?;
+            writer.add_label(element, bound.label(NodeKind::Unresolved.as_str())?)?;
+            set_unresolved_properties(writer, &bound, element, unresolved, &key)?;
+            diagnostic_keys.push(key);
+        }
 
-    for edge in &index.edges {
-        let Some(&source) = elements.get(&edge.source_key) else {
-            continue;
-        };
-        let Some(&target) = elements.get(&edge.target_key) else {
-            continue;
-        };
-        let relation = writer.create_relation()?;
-        writer.set_relation_type(relation, relation_types[&edge.kind])?;
-        set_relation_properties(&mut writer, relation, &relation_properties, edge)?;
-        writer.create_incidence(relation, source, source_role)?;
-        writer.create_incidence(relation, target, target_role)?;
-    }
+        // 2. Prune vanished symbols and diagnostics: keep every current stable key.
+        let mut keep_element_keys: Vec<&str> = node_keys.clone();
+        keep_element_keys.extend(diagnostic_keys.iter().map(String::as_str));
+        writer.retain(stable_key_eq, &keep_element_keys)?;
 
-    writer.commit()?;
-    database.validate()?;
-    drop(database);
+        // 3. Upsert edges by a deterministic per-edge key (an unchanged edge keeps its relation id
+        //    and endpoints).
+        for (edge, key) in index.edges.iter().zip(&edge_keys) {
+            let (Some(&source), Some(&target)) = (
+                id_by_key.get(&edge.source_key),
+                id_by_key.get(&edge.target_key),
+            ) else {
+                continue;
+            };
+            let relation = writer.upsert_relation(
+                edge_key_eq,
+                key.as_str(),
+                bound.relation_type(edge.kind.as_str())?,
+                &[
+                    (source, bound.role(SOURCE_ROLE)?),
+                    (target, bound.role(TARGET_ROLE)?),
+                ],
+            )?;
+            set_relation_properties(writer, &bound, relation, edge)?;
+        }
 
-    if database_directory.exists() {
-        std::fs::rename(&database_directory, &backup_directory)
-            .map_err(|source| Error::fs(&database_directory, source))?;
-    }
-    std::fs::rename(&temp_directory, &database_directory)
-        .map_err(|source| Error::fs(&temp_directory, source))?;
-    if backup_directory.exists() {
-        std::fs::remove_dir_all(&backup_directory)
-            .map_err(|source| Error::fs(&backup_directory, source))?;
-    }
+        // 4. Prune vanished edges: keep every current edge key. An edge dropped because an endpoint
+        //    went missing is absent from `keep` and pruned.
+        let kept_edge_keys: Vec<&str> = index
+            .edges
+            .iter()
+            .zip(&edge_keys)
+            .filter(|(edge, _)| {
+                id_by_key.contains_key(&edge.source_key) && id_by_key.contains_key(&edge.target_key)
+            })
+            .map(|(_, key)| key.as_str())
+            .collect();
+        writer.retain(edge_key_eq, &kept_edge_keys)?;
+
+        Ok(())
+    })?;
+    // The engine auto-checkpoints (folds the delta-log into a fresh base) when the
+    // log outgrows the base under its size-ratio policy, so a small incremental
+    // reindex stays `O(change)` and never pays a full `O(base)` fold. The first
+    // index's large commit over a near-empty base trips that policy and folds on
+    // its own — so no explicit `compact()` is needed (forcing one every reindex
+    // would defeat the amortization and pay `O(base)` each time).
     Ok(database_directory)
+}
+
+/// Builds the deterministic per-edge identity key.
+///
+/// The key must be distinct for multi-edges between the same `(source, target,
+/// kind)` triple, so it folds in the reference site (file path plus byte span)
+/// when present. An edge with no reference site (a purely structural edge such as
+/// `contains`/`defines`) is unique per triple already, so the `-` placeholder is
+/// stable and collision-free for those.
+pub(super) fn edge_stable_key(edge: &ResolvedEdge) -> String {
+    let site = match &edge.reference {
+        Some(reference) => format!(
+            "{}@{}..{}",
+            reference.file_path, reference.span.start_byte, reference.span.end_byte
+        ),
+        None => "-".to_owned(),
+    };
+    format!(
+        "{}|{}|{}|{}",
+        edge.source_key,
+        edge.kind.as_str(),
+        edge.target_key,
+        site
+    )
+}
+
+/// Builds the deterministic stable key for one unresolved-reference diagnostic.
+fn unresolved_stable_key(unresolved: &UnresolvedReference) -> String {
+    format!(
+        "unresolved:{}:{}:{}:{}",
+        unresolved.source_key,
+        unresolved.kind.as_str(),
+        unresolved.target.joined(),
+        unresolved.span.start_byte
+    )
 }
 
 /// Writes a `.gitignore` that ignores the whole index directory, so users do
@@ -142,409 +271,372 @@ fn write_index_gitignore(index_directory: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Registers code symbol and diagnostic labels.
-fn register_labels(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-) -> Result<BTreeMap<NodeKind, LabelId>> {
-    let mut labels = BTreeMap::new();
-    for kind in NodeKind::ALL {
-        labels.insert(kind, writer.register_label(kind.as_str())?);
-    }
-    Ok(labels)
-}
-
-/// Registers code edge relation types.
-fn register_relation_types(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-) -> Result<BTreeMap<EdgeKind, RelationTypeId>> {
-    let mut relation_types = BTreeMap::new();
-    for kind in EdgeKind::ALL {
-        relation_types.insert(kind, writer.register_relation_type(kind.as_str())?);
-    }
-    Ok(relation_types)
-}
-
-/// Registers element property keys, derived from the model catalog.
-fn register_element_properties(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-) -> Result<BTreeMap<&'static str, PropertyKeyId>> {
-    let mut properties = BTreeMap::new();
-    for property in ElementProperty::ALL {
-        let key = writer.register_property_key(
-            property.key(),
-            PropertyFamily::Element,
-            property_type(property.kind()),
-        )?;
-        properties.insert(property.key(), key);
-    }
-    Ok(properties)
-}
-
-/// Registers relation property keys, derived from the model catalog.
-fn register_relation_properties(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-) -> Result<BTreeMap<&'static str, PropertyKeyId>> {
-    let mut properties = BTreeMap::new();
-    for property in RelationProperty::ALL {
-        let key = writer.register_property_key(
-            property.key(),
-            PropertyFamily::Relation,
-            property_type(property.kind()),
-        )?;
-        properties.insert(property.key(), key);
-    }
-    Ok(properties)
-}
-
-/// Defines equality indexes for the catalog's indexed element keys.
-fn define_property_indexes(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
-) -> Result<()> {
-    for property in ElementProperty::INDEXED {
-        let name = property.key();
-        writer.define_index(
-            format!("element_{name}_eq"),
-            IndexDefinition::PropertyEquality {
-                key: properties[name],
-            },
-        )?;
-    }
+/// Sets a text property keyed by an [`ElementProperty`] on an element.
+fn set_element_text(
+    writer: &mut Writer<'_>,
+    bound: &Bound,
+    element: ElementId,
+    property: ElementProperty,
+    value: &str,
+) -> std::result::Result<(), DbError> {
+    writer.set(element, bound.key::<Text>(property.key())?, value)?;
     Ok(())
 }
 
-/// Defines membership indexes used by status counts (consulted via `lookup_index`).
-fn define_count_indexes(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    labels: &BTreeMap<NodeKind, LabelId>,
-    unresolved_label: LabelId,
-    relation_types: &BTreeMap<EdgeKind, RelationTypeId>,
-) -> Result<()> {
-    writer.define_index(
-        label_index_name(NodeKind::File),
-        IndexDefinition::Label {
-            label: labels[&NodeKind::File],
-        },
-    )?;
-    writer.define_index(
-        label_index_name(NodeKind::Unresolved),
-        IndexDefinition::Label {
-            label: unresolved_label,
-        },
-    )?;
-    writer.define_index(
-        type_index_name(EdgeKind::Calls),
-        IndexDefinition::RelationType {
-            relation_type: relation_types[&EdgeKind::Calls],
-        },
-    )?;
+/// Sets a `usize` property keyed by an [`ElementProperty`] on an element.
+///
+/// The span/offset is passed directly: the engine's `Assignable<Int>` for
+/// `usize` performs a checked conversion, surfacing `DbError::ValueOutOfRange`.
+fn set_element_int(
+    writer: &mut Writer<'_>,
+    bound: &Bound,
+    element: ElementId,
+    property: ElementProperty,
+    value: usize,
+) -> std::result::Result<(), DbError> {
+    writer.set(element, bound.key::<Int>(property.key())?, value)?;
     Ok(())
 }
 
 /// Writes symbol properties to one element.
 fn set_symbol_properties(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
+    writer: &mut Writer<'_>,
+    bound: &Bound,
     element: ElementId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
     node: &SymbolNode,
-) -> Result<()> {
-    set_text(writer, element, properties, "stable_key", &node.stable_key)?;
-    set_text(writer, element, properties, "name", &node.name)?;
-    set_text(
+) -> std::result::Result<(), DbError> {
+    set_element_text(
         writer,
+        bound,
         element,
-        properties,
-        "qualified_name",
+        ElementProperty::StableKey,
+        &node.stable_key,
+    )?;
+    set_element_text(writer, bound, element, ElementProperty::Name, &node.name)?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::QualifiedName,
         &node.qualified_name,
     )?;
-    set_text(writer, element, properties, "kind", node.kind.as_str())?;
-    if let Some(raw_kind) = &node.raw_kind {
-        set_text(writer, element, properties, "raw_kind", raw_kind)?;
-    }
-    set_text(
+    set_element_text(
         writer,
+        bound,
         element,
-        properties,
-        "language",
+        ElementProperty::Kind,
+        node.kind.as_str(),
+    )?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::Language,
         node.language.as_str(),
     )?;
-    set_text(writer, element, properties, "file_path", &node.file_path)?;
-    if let Some(signature) = &node.signature {
-        set_text(writer, element, properties, "signature", signature)?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::FilePath,
+        &node.file_path,
+    )?;
+    set_element_span(writer, bound, element, node.span)?;
+
+    // Optional properties: set when present, otherwise unset so a reused element
+    // never retains a stale value (for example a docstring removed by an edit).
+    set_or_unset_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::RawKind,
+        node.raw_kind.as_deref(),
+    )?;
+    set_or_unset_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::Signature,
+        node.signature.as_deref(),
+    )?;
+    set_or_unset_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::Docstring,
+        node.docstring.as_deref(),
+    )?;
+    set_or_unset_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::SourcePreview,
+        node.source_preview.as_deref(),
+    )
+}
+
+/// Sets an optional text property, or removes it when absent so a reused element
+/// never retains a stale value.
+fn set_or_unset_text(
+    writer: &mut Writer<'_>,
+    bound: &Bound,
+    element: ElementId,
+    property: ElementProperty,
+    value: Option<&str>,
+) -> std::result::Result<(), DbError> {
+    let key = bound.key::<Text>(property.key())?;
+    match value {
+        Some(value) => writer.set(element, key, value)?,
+        None => writer.unset(element, key)?,
     }
-    if let Some(docstring) = &node.docstring {
-        set_text(writer, element, properties, "docstring", docstring)?;
-    }
-    if let Some(source_preview) = &node.source_preview {
-        set_text(
-            writer,
-            element,
-            properties,
-            "source_preview",
-            source_preview,
-        )?;
-    }
-    set_span_properties(writer, element, properties, node.span)?;
     Ok(())
 }
 
 /// Writes unresolved-reference diagnostic properties.
 fn set_unresolved_properties(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
+    writer: &mut Writer<'_>,
+    bound: &Bound,
     element: ElementId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
     unresolved: &UnresolvedReference,
-) -> Result<()> {
+    stable_key: &str,
+) -> std::result::Result<(), DbError> {
     let joined = unresolved.target.joined();
-    let stable_key = format!(
-        "unresolved:{}:{}:{}:{}",
-        unresolved.source_key,
-        unresolved.kind.as_str(),
-        joined,
-        unresolved.span.start_byte
-    );
-    set_text(writer, element, properties, "stable_key", &stable_key)?;
-    set_text(writer, element, properties, "name", &unresolved.target.raw)?;
-    set_text(writer, element, properties, "qualified_name", &joined)?;
-    set_text(writer, element, properties, "kind", "unresolved_reference")?;
-    set_text(
+    set_element_text(
         writer,
+        bound,
         element,
-        properties,
-        "file_path",
-        &unresolved.file_path,
+        ElementProperty::StableKey,
+        stable_key,
     )?;
-    set_text(
+    set_element_text(
         writer,
+        bound,
         element,
-        properties,
-        "unresolved_source_key",
-        &unresolved.source_key,
-    )?;
-    set_text(
-        writer,
-        element,
-        properties,
-        "target_raw",
+        ElementProperty::Name,
         &unresolved.target.raw,
     )?;
-    set_text(writer, element, properties, "target_path", &joined)?;
-    if let Some(qualifier) = &unresolved.target.qualifier {
-        set_text(writer, element, properties, "target_qualifier", qualifier)?;
-    }
-    set_text(
+    set_element_text(
         writer,
+        bound,
         element,
-        properties,
-        "target_kind_hint",
+        ElementProperty::QualifiedName,
+        &joined,
+    )?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::Kind,
+        NodeKind::Unresolved.as_str(),
+    )?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::FilePath,
+        &unresolved.file_path,
+    )?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::UnresolvedSourceKey,
+        &unresolved.source_key,
+    )?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::TargetRaw,
+        &unresolved.target.raw,
+    )?;
+    set_element_text(writer, bound, element, ElementProperty::TargetPath, &joined)?;
+    set_element_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::TargetKindHint,
         unresolved.target.kind_hint.as_str(),
     )?;
-    set_text(
+    set_element_text(
         writer,
+        bound,
         element,
-        properties,
-        "unresolved_edge_kind",
+        ElementProperty::UnresolvedEdgeKind,
         unresolved.kind.as_str(),
     )?;
-    if let Some(reason) = &unresolved.reason {
-        set_text(writer, element, properties, "reason", reason)?;
-    }
-    set_span_properties(writer, element, properties, unresolved.span)
+    set_element_span(writer, bound, element, unresolved.span)?;
+
+    set_or_unset_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::TargetQualifier,
+        unresolved.target.qualifier.as_deref(),
+    )?;
+    set_or_unset_text(
+        writer,
+        bound,
+        element,
+        ElementProperty::Reason,
+        unresolved.reason.as_deref(),
+    )
 }
 
 /// Writes relation properties to one code edge.
 fn set_relation_properties(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
+    writer: &mut Writer<'_>,
+    bound: &Bound,
     relation: RelationId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
     edge: &ResolvedEdge,
-) -> Result<()> {
+) -> std::result::Result<(), DbError> {
     set_relation_text(
         writer,
+        bound,
         relation,
-        properties,
-        "edge_kind",
+        RelationProperty::EdgeKind,
         edge.kind.as_str(),
     )?;
-    set_relation_text(writer, relation, properties, "source_key", &edge.source_key)?;
-    set_relation_text(writer, relation, properties, "target_key", &edge.target_key)?;
     set_relation_text(
         writer,
+        bound,
         relation,
-        properties,
-        "resolution",
+        RelationProperty::Resolution,
         edge.resolution.as_str(),
     )?;
 
     if let Some(reference) = &edge.reference {
         set_relation_text(
             writer,
+            bound,
             relation,
-            properties,
-            "site_file_path",
+            RelationProperty::SiteFilePath,
             &reference.file_path,
         )?;
-        set_relation_usize(
+        set_relation_int(
             writer,
+            bound,
             relation,
-            properties,
-            "site_start_line",
+            RelationProperty::SiteStartLine,
             reference.span.start_line,
         )?;
-        set_relation_usize(
+        set_relation_int(
             writer,
+            bound,
             relation,
-            properties,
-            "site_start_column",
+            RelationProperty::SiteStartColumn,
             reference.span.start_column,
         )?;
-        set_relation_usize(
+        set_relation_int(
             writer,
+            bound,
             relation,
-            properties,
-            "site_end_line",
+            RelationProperty::SiteEndLine,
             reference.span.end_line,
         )?;
-        set_relation_usize(
+        set_relation_int(
             writer,
+            bound,
             relation,
-            properties,
-            "site_end_column",
+            RelationProperty::SiteEndColumn,
             reference.span.end_column,
         )?;
-        set_relation_usize(
+        set_relation_int(
             writer,
+            bound,
             relation,
-            properties,
-            "site_start_byte",
+            RelationProperty::SiteStartByte,
             reference.span.start_byte,
         )?;
-        set_relation_usize(
+        set_relation_int(
             writer,
+            bound,
             relation,
-            properties,
-            "site_end_byte",
+            RelationProperty::SiteEndByte,
             reference.span.end_byte,
         )?;
-        set_relation_text(writer, relation, properties, "site_text", &reference.text)?;
+        set_relation_text(
+            writer,
+            bound,
+            relation,
+            RelationProperty::SiteText,
+            &reference.text,
+        )?;
     }
     Ok(())
 }
 
-/// Writes source span properties.
-fn set_span_properties(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
+/// Sets a text property keyed by a [`RelationProperty`] on a relation.
+fn set_relation_text(
+    writer: &mut Writer<'_>,
+    bound: &Bound,
+    relation: RelationId,
+    property: RelationProperty,
+    value: &str,
+) -> std::result::Result<(), DbError> {
+    writer.set(relation, bound.key::<Text>(property.key())?, value)?;
+    Ok(())
+}
+
+/// Sets a `usize` property keyed by a [`RelationProperty`] on a relation.
+fn set_relation_int(
+    writer: &mut Writer<'_>,
+    bound: &Bound,
+    relation: RelationId,
+    property: RelationProperty,
+    value: usize,
+) -> std::result::Result<(), DbError> {
+    writer.set(relation, bound.key::<Int>(property.key())?, value)?;
+    Ok(())
+}
+
+/// Writes the six span properties to one element.
+fn set_element_span(
+    writer: &mut Writer<'_>,
+    bound: &Bound,
     element: ElementId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
     span: SourceSpan,
-) -> Result<()> {
-    set_usize(writer, element, properties, "start_byte", span.start_byte)?;
-    set_usize(writer, element, properties, "end_byte", span.end_byte)?;
-    set_usize(writer, element, properties, "start_line", span.start_line)?;
-    set_usize(
+) -> std::result::Result<(), DbError> {
+    set_element_int(
         writer,
+        bound,
         element,
-        properties,
-        "start_column",
+        ElementProperty::StartByte,
+        span.start_byte,
+    )?;
+    set_element_int(
+        writer,
+        bound,
+        element,
+        ElementProperty::EndByte,
+        span.end_byte,
+    )?;
+    set_element_int(
+        writer,
+        bound,
+        element,
+        ElementProperty::StartLine,
+        span.start_line,
+    )?;
+    set_element_int(
+        writer,
+        bound,
+        element,
+        ElementProperty::StartColumn,
         span.start_column,
     )?;
-    set_usize(writer, element, properties, "end_line", span.end_line)?;
-    set_usize(writer, element, properties, "end_column", span.end_column)
-}
-
-/// Sets a text property on any subject (the one place that logic lives).
-fn set_property_text(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    subject: PropertySubject,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
-    key: &'static str,
-    value: &str,
-) -> Result<()> {
-    writer.set_property(
-        subject,
-        properties[key],
-        PropertyValue::Text(value.to_string()),
+    set_element_int(
+        writer,
+        bound,
+        element,
+        ElementProperty::EndLine,
+        span.end_line,
     )?;
-    Ok(())
-}
-
-/// Sets a usize property (as an OxGraph integer) on any subject.
-fn set_property_int(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    subject: PropertySubject,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
-    key: &'static str,
-    value: usize,
-) -> Result<()> {
-    let value = i64::try_from(value).map_err(|_| Error::IntegerOverflow { key, value })?;
-    writer.set_property(subject, properties[key], PropertyValue::Integer(value))?;
-    Ok(())
-}
-
-/// Sets a text property on a relation.
-fn set_relation_text(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    relation: RelationId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
-    key: &'static str,
-    value: &str,
-) -> Result<()> {
-    set_property_text(
+    set_element_int(
         writer,
-        PropertySubject::Relation(relation),
-        properties,
-        key,
-        value,
-    )
-}
-
-/// Sets a usize property on a relation as an OxGraph integer.
-fn set_relation_usize(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    relation: RelationId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
-    key: &'static str,
-    value: usize,
-) -> Result<()> {
-    set_property_int(
-        writer,
-        PropertySubject::Relation(relation),
-        properties,
-        key,
-        value,
-    )
-}
-
-/// Sets a text property on an element.
-fn set_text(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    element: ElementId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
-    key: &'static str,
-    value: &str,
-) -> Result<()> {
-    set_property_text(
-        writer,
-        PropertySubject::Element(element),
-        properties,
-        key,
-        value,
-    )
-}
-
-/// Sets a usize property on an element as an OxGraph integer.
-fn set_usize(
-    writer: &mut oxgraph::db::WriteTransaction<'_>,
-    element: ElementId,
-    properties: &BTreeMap<&'static str, PropertyKeyId>,
-    key: &'static str,
-    value: usize,
-) -> Result<()> {
-    set_property_int(
-        writer,
-        PropertySubject::Element(element),
-        properties,
-        key,
-        value,
+        bound,
+        element,
+        ElementProperty::EndColumn,
+        span.end_column,
     )
 }

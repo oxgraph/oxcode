@@ -5,7 +5,9 @@ use std::{collections::HashMap, path::Path, sync::OnceLock};
 use oxcode_model::{Extraction, FileDiagnostic, FileParseStatus, LanguageSupport};
 
 use crate::{
+    cache::{CacheEntry, ExtractionCache},
     error::{Error, Result},
+    manifest::content_hash,
     paths::normalize_relative_path,
     scan,
 };
@@ -15,8 +17,8 @@ mod cst;
 mod rust;
 
 /// Source-language file extensions oxcode recognizes, whether or not an
-/// extractor exists yet. The subset that has an extractor is derived from the
-/// [`Registry`]; a recognized extension with no extractor is reported as a
+/// extractor exists for them. The subset that has an extractor is derived from
+/// the [`Registry`]; a recognized extension with no extractor is reported as a
 /// skipped unsupported file rather than silently ignored.
 pub(crate) const RECOGNIZED_SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "h", "cpp", "cc", "hpp",
@@ -36,9 +38,8 @@ pub(crate) struct ExtractionInput<'a> {
 ///
 /// Extractors are registered once in a process-global [`Registry`] keyed by
 /// file extension (see [`registry`]); dispatch is therefore an extension-map
-/// lookup, not a linear scan. Implementors are zero-cost stateless markers
-/// today, but the `Send + Sync` bound keeps the door open for extractors that
-/// cache parser/query state in the shared registry.
+/// lookup, not a linear scan. The `Send + Sync` bound lets the shared registry
+/// hold extractors that cache parser/query state.
 pub(crate) trait LanguageExtractor: Send + Sync {
     /// Stable language ID.
     fn language_id(&self) -> oxcode_model::LanguageId;
@@ -104,7 +105,7 @@ pub(crate) fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Registry::build)
 }
 
-/// Returns whether `path` is a recognized source file with no extractor yet.
+/// Returns whether `path` is a recognized source file with no extractor.
 pub(crate) fn is_recognized_unsupported(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -129,11 +130,15 @@ pub(crate) struct IndexInput {
 /// A file that fails to read or whose extractor errors is recorded as a
 /// [`FileDiagnostic`] and skipped; the rest of the project still indexes. Only
 /// catastrophic failures (not per-file ones) propagate as `Err`.
-pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
+pub(crate) fn extract_project(
+    root: &Path,
+    cache: &ExtractionCache,
+) -> Result<(IndexInput, ExtractionCache)> {
     let registry = registry();
     let mut extractions = Vec::new();
     let mut skipped_unsupported_files = 0_usize;
     let mut diagnostics = Vec::new();
+    let mut next_cache = ExtractionCache::empty(cache.scope_token);
 
     for file in scan::discover_source_files(root) {
         let Some(extractor) = registry.extractor_for(&file.path) else {
@@ -155,6 +160,29 @@ pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
                 continue;
             }
         };
+        let hash = content_hash(&source);
+
+        // Reuse the cached extraction when this file's content is unchanged,
+        // skipping the (expensive) parse; otherwise extract and cache the result.
+        if let Some(entry) = cache.lookup(&relative_path, hash) {
+            if entry.partial {
+                diagnostics.push(FileDiagnostic {
+                    path: relative_path.clone(),
+                    status: FileParseStatus::Partial,
+                    message: Some("recoverable parse errors; symbols are partial".to_string()),
+                });
+            }
+            extractions.push(entry.extraction.clone());
+            next_cache.files.insert(
+                relative_path,
+                CacheEntry {
+                    hash,
+                    partial: entry.partial,
+                    extraction: entry.extraction.clone(),
+                },
+            );
+            continue;
+        }
 
         match extractor.extract(ExtractionInput {
             path: &file.path,
@@ -162,13 +190,22 @@ pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
             source,
         }) {
             Ok(extraction) => {
-                if extraction.parse_status == FileParseStatus::Partial {
+                let partial = extraction.parse_status == FileParseStatus::Partial;
+                if partial {
                     diagnostics.push(FileDiagnostic {
-                        path: relative_path,
+                        path: relative_path.clone(),
                         status: FileParseStatus::Partial,
                         message: Some("recoverable parse errors; symbols are partial".to_string()),
                     });
                 }
+                next_cache.files.insert(
+                    relative_path,
+                    CacheEntry {
+                        hash,
+                        partial,
+                        extraction: extraction.clone(),
+                    },
+                );
                 extractions.push(extraction);
             }
             Err(error) => diagnostics.push(FileDiagnostic {
@@ -180,11 +217,14 @@ pub(crate) fn extract_project(root: &Path) -> Result<IndexInput> {
     }
 
     extractions.sort_by(|left, right| left.file.path.cmp(&right.file.path));
-    Ok(IndexInput {
-        extractions,
-        skipped_unsupported_files,
-        diagnostics,
-    })
+    Ok((
+        IndexInput {
+            extractions,
+            skipped_unsupported_files,
+            diagnostics,
+        },
+        next_cache,
+    ))
 }
 
 /// Returns explicit extractor support.
@@ -217,8 +257,36 @@ mod tests {
     }
 
     #[test]
+    fn extraction_cache_reuses_unchanged_and_reextracts_changed_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("cargo");
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        let lib = root.join("src/lib.rs");
+        std::fs::write(&lib, "pub fn alpha() {}\n").expect("lib");
+
+        let scope = crate::manifest::scope_token(root).expect("scope");
+        let (first, cache) =
+            extract_project(root, &ExtractionCache::empty(scope)).expect("first extract");
+        assert!(cache.files.contains_key("src/lib.rs"));
+
+        // Unchanged content: the cached extraction is reused and identical.
+        let (second, _) = extract_project(root, &cache).expect("cached extract");
+        assert_eq!(first.extractions, second.extractions);
+
+        // Changed content: the cache misses and the new extraction reflects it.
+        std::fs::write(&lib, "pub fn beta() {}\n").expect("edit");
+        let (third, _) = extract_project(root, &cache).expect("changed extract");
+        assert_ne!(first.extractions, third.extractions);
+    }
+
+    #[test]
     fn recognized_unsupported_excludes_supported_languages() {
-        // Recognized source, no extractor yet -> unsupported.
+        // Recognized source, no extractor -> unsupported.
         assert!(is_recognized_unsupported(Path::new("app.py")));
         // Recognized source with an extractor -> not unsupported.
         assert!(!is_recognized_unsupported(Path::new("lib.rs")));

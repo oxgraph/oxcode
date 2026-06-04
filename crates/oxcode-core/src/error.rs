@@ -30,16 +30,7 @@ pub enum Error {
 
     /// OxGraph database operation failed.
     #[error("oxgraph database error: {0}")]
-    Database(#[from] DbError),
-
-    /// Integer conversion overflowed.
-    #[error("property {key} value {value} cannot be represented in the target type")]
-    IntegerOverflow {
-        /// Property whose value overflowed.
-        key: &'static str,
-        /// Overflowing value.
-        value: usize,
-    },
+    Db(#[from] DbError),
 
     /// The project database is missing catalog metadata expected by oxcode.
     #[error("database catalog is missing {item} {name}")]
@@ -81,6 +72,10 @@ pub enum Error {
         /// Candidate matches.
         matches: Vec<SymbolSummary>,
     },
+
+    /// A text navigation query could not be parsed.
+    #[error("{0}")]
+    InvalidQuery(String),
 }
 
 impl Error {
@@ -90,20 +85,5 @@ impl Error {
             path: path.into(),
             source,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn integer_overflow_names_the_offending_property() {
-        let message = Error::IntegerOverflow {
-            key: "start_byte",
-            value: usize::MAX,
-        }
-        .to_string();
-        assert!(message.contains("start_byte"), "{message}");
     }
 }

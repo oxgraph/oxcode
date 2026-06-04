@@ -11,7 +11,7 @@ use crate::paths::should_skip_path;
 pub(crate) struct SourceFile {
     /// Absolute path on disk.
     pub(crate) path: PathBuf,
-    /// Whether the extension is a known source language with no extractor yet.
+    /// Whether the extension is a known source language with no extractor.
     pub(crate) recognized_unsupported: bool,
 }
 

@@ -2,8 +2,8 @@
 //!
 //! The convention is: read a child by field name, descend into known node kinds
 //! to find the base identifier, and walk children with a [`TreeCursor`] — never
-//! re-parse a node's source text. Future language extractors reuse these
-//! helpers so the field-based discipline stays uniform.
+//! re-parse a node's source text. Language extractors reuse these helpers so the
+//! field-based discipline stays uniform.
 
 use std::str;
 
@@ -26,10 +26,7 @@ pub(crate) fn field(node: &Node, field: &str) -> Option<Node> {
     node.child_by_field_name(field)
 }
 
-/// Collects a node's named children using a cursor walk.
-///
-/// Replaces index arithmetic (`0..named_child_count()` with fallible `u32`
-/// conversions) with a single linear pass.
+/// Collects a node's named children in a single linear cursor walk.
 #[must_use]
 pub(crate) fn named_children(node: &Node) -> Vec<Node> {
     let mut cursor = node.walk();
