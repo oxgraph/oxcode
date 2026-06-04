@@ -41,7 +41,7 @@ echo "### indexing smoke fixture with oxcode"
 OXCODE_REPO="$OUT/corpus/oxcode-cli/smoke-rust"
 mkdir -p "$(dirname "$OXCODE_REPO")"
 cp -R "$SOURCE_REPO" "$OXCODE_REPO"
-"$OUT/bin/oxcode/oxcode" index "$OXCODE_REPO" > "$OUT/oxcode-index.out" 2> "$OUT/oxcode-index.err"
+"$OUT/bin/oxcode/oxcode" index --path "$OXCODE_REPO" > "$OUT/oxcode-index.out" 2> "$OUT/oxcode-index.err"
 
 ARMS=("empty" "oxcode-cli")
 if [ -n "${CODEGRAPH_BIN:-}" ]; then

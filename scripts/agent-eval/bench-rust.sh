@@ -2,8 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUNS=4
+# Agent runs are high-variance; 6 runs/arm give the Student-t 95% CI that
+# export-metrics reports enough degrees of freedom to be meaningful.
+RUNS=6
 MODEL="${CODEX_MODEL:-gpt-5.5}"
+# Model for the blind LLM-as-judge grader. Defaults to the agent model (the only
+# auth available); the judge is blind to the arm, so any same-model bias applies
+# uniformly across arms and does not skew the cross-arm deltas we care about.
+JUDGE_MODEL="${JUDGE_MODEL:-$MODEL}"
 OUT="$ROOT/target/agent-eval/rust-$(date +%Y%m%d-%H%M%S)"
 AUTH_FILE="$ROOT/codex-auth.json"
 SKIP_SMOKE=0
@@ -115,7 +121,7 @@ for task_json in "${TASK_JSON_LINES[@]}"; do
   echo "### indexing $repo_name with oxcode"
   oxcode_repo="$CORPUS/$repo_name/oxcode-cli"
   prepare_arm_repo "$source_repo" "$oxcode_repo"
-  "$OUT/bin/oxcode/oxcode" index "$oxcode_repo" > "$OUT/$repo_name-oxcode-index.out" 2> "$OUT/$repo_name-oxcode-index.err"
+  "$OUT/bin/oxcode/oxcode" index --path "$oxcode_repo" > "$OUT/$repo_name-oxcode-index.out" 2> "$OUT/$repo_name-oxcode-index.err"
 
   if [ -n "${CODEGRAPH_BIN:-}" ]; then
     echo "### indexing $repo_name with codegraph"
@@ -156,6 +162,18 @@ for task_json in "${TASK_JSON_LINES[@]}"; do
     done
   done
 done
+
+# Blind LLM-as-judge grading: scores each run's final answer against the task
+# rubric without seeing the arm, writing a cached grade.json per run. Slow but
+# cached, so re-running export-metrics is free. Failures here leave runs ungraded
+# (quality_score null) rather than aborting the suite.
+echo "### grading answers (blind LLM judge, model=$JUDGE_MODEL)"
+node "$ROOT/scripts/agent-eval/grade-answer.mjs" \
+  --suite-dir "$OUT" \
+  --task-file "$TASK_FILE" \
+  --auth-file "$AUTH_FILE" \
+  --judge-model "$JUDGE_MODEL" \
+  --concurrency 4 || echo "### grading had failures; ungraded runs will show null quality"
 
 node "$ROOT/scripts/agent-eval/export-metrics.mjs" \
   --workshop-url "$WORKSHOP_URL" \

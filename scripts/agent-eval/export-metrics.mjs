@@ -11,8 +11,34 @@ import {
   readJson,
   readText,
   requireArg,
+  spread,
   writeJson,
 } from "./lib.mjs";
+
+// Headline metrics get a Student-t 95% CI alongside the median, so a
+// cross-arm delta can be read against its spread instead of as point truth.
+const HEADLINE_KEYS = [
+  "quality_score",
+  "keyword_hit_rate",
+  "shell_commands",
+  "indexed_cli_commands",
+  "search_commands",
+  "read_commands",
+  "wall_clock_ms",
+  "first_indexed_cli_ms",
+  "indexed_cli_duration_ms_p50",
+];
+
+// Metrics where a larger median is the better outcome (everything else is
+// "fewer/faster is better").
+const HIGHER_IS_BETTER = new Set([
+  "quality_score",
+  "keyword_hit_rate",
+  "judge_correct",
+  "judge_complete",
+  "judge_grounded",
+  "judge_refusal_ok",
+]);
 
 const args = parseArgs();
 const workshopUrl = String(args["workshop-url"] ?? "").replace(/\/$/, "");
@@ -49,7 +75,9 @@ const runs = applyExpectedRuns(groupRuns(spans), expectedRuns)
   .filter((run) => runIndexFilter === null || run.run_index === runIndexFilter);
 validateCommonPromptHashes(runs);
 
-const runMetrics = runs.map((run) => computeRunMetrics(run, tasks.get(run.task_id)));
+const expectedById = new Map(expectedRuns.map((run) => [run.run_id, run]));
+const runMetrics = runs.map((run) =>
+  computeRunMetrics(run, tasks.get(run.task_id), expectedById.get(run.run_id)));
 const aggregate = aggregateMetrics(runMetrics);
 const output = {
   suite_id: suiteId,
@@ -149,6 +177,7 @@ function localExpectedRuns({ suiteDir: localSuiteDir, runDir: localRunDir }) {
         stderr_timeline_path: meta.stderr_timeline_path,
         timing_path: meta.timing_path,
         final_answer_path: meta.final_answer_path,
+        grade_path: path.join(dir, "grade.json"),
       };
     }
     const relative = localSuiteDir ? path.relative(path.join(localSuiteDir, "runs"), dir) : "";
@@ -165,6 +194,7 @@ function localExpectedRuns({ suiteDir: localSuiteDir, runDir: localRunDir }) {
       stderr_timeline_path: path.join(dir, "run.stderr-timeline.jsonl"),
       timing_path: path.join(dir, "run.timing.json"),
       final_answer_path: path.join(dir, "final-answer.txt"),
+      grade_path: path.join(dir, "grade.json"),
     };
   }).filter((run) => run.task_id && run.arm && Number.isFinite(run.run_index));
 }
@@ -316,7 +346,7 @@ function spanDedupeKey(span, attrs) {
   ].join("\u001f");
 }
 
-function computeRunMetrics(run, task) {
+function computeRunMetrics(run, task, expected) {
   if (run.missing_trace || run.spans.length === 0) {
     return missingRunMetrics(run);
   }
@@ -341,7 +371,9 @@ function computeRunMetrics(run, task) {
     ? firstIndexed.start_time_ms - Number(root?.start_time_ms ?? firstIndexed.start_time_ms)
     : null;
   const answer = final?.output_payload ?? root?.output_payload ?? "";
-  const quality = task ? qualityScore(answer, task) : { score: null, components: [] };
+  const keyword = task ? qualityScore(answer, task) : { score: null, components: [] };
+  const grade = readGrade(expected?.grade_path);
+  const judge = grade?.verdict ?? null;
   const success = isOkStatus(root?.status) && answer.length > 0 && Number(root?.attrs?.codex_exit_code ?? 1) === 0;
   const wallClockMs = Number(root?.duration_ms ?? 0);
   const allTools = durationMetrics(commands, wallClockMs);
@@ -374,8 +406,16 @@ function computeRunMetrics(run, task) {
         ).length
       : null,
     answer_chars: answer.length,
-    quality_score: quality.score,
-    quality_components: quality.components,
+    quality_score: judge ? judge.score : null,
+    judge_correct: judge ? judge.correct : null,
+    judge_complete: judge ? judge.complete : null,
+    judge_grounded: judge ? judge.grounded : null,
+    judge_refusal_ok: judge ? judge.refusal_ok : null,
+    judge_reason: judge ? judge.reason : null,
+    refusal_task: isRefusalTaskDef(task),
+    grade_error: grade ? grade.error ?? null : "missing grade.json (run grade-answer.mjs)",
+    keyword_hit_rate: keyword.score,
+    keyword_components: keyword.components,
     tool_execution_ms_sum: allTools.execution_ms_sum,
     tool_wall_union_ms: allTools.wall_union_ms,
     tool_execution_share_pct: allTools.wall_share_pct,
@@ -428,7 +468,15 @@ function missingRunMetrics(run) {
     pre_index_search_count: null,
     answer_chars: 0,
     quality_score: null,
-    quality_components: [],
+    judge_correct: null,
+    judge_complete: null,
+    judge_grounded: null,
+    judge_refusal_ok: null,
+    judge_reason: null,
+    refusal_task: false,
+    grade_error: "missing run trace",
+    keyword_hit_rate: null,
+    keyword_components: [],
     tool_execution_ms_sum: null,
     tool_wall_union_ms: null,
     tool_execution_share_pct: null,
@@ -549,6 +597,20 @@ function optionalNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function readGrade(gradePath) {
+  if (!gradePath || !fs.existsSync(gradePath)) return null;
+  try {
+    return readJson(gradePath);
+  } catch {
+    return { verdict: null, error: "unreadable grade.json" };
+  }
+}
+
+function isRefusalTaskDef(task) {
+  const flag = task?.refusal_expected;
+  return flag === true || flag === "true" || flag === 1;
+}
+
 function validateCommonPromptHashes(runs) {
   const byTask = new Map();
   for (const run of runs) {
@@ -592,6 +654,11 @@ function aggregateMetrics(metrics) {
         "pre_index_search_count",
         "answer_chars",
         "quality_score",
+        "keyword_hit_rate",
+        "judge_correct",
+        "judge_complete",
+        "judge_grounded",
+        "judge_refusal_ok",
         "tool_execution_ms_sum",
         "tool_wall_union_ms",
         "tool_execution_share_pct",
@@ -615,6 +682,9 @@ function aggregateMetrics(metrics) {
         "read_duration_ms_p50",
         "read_duration_ms_p95",
       ].map((key) => [key, median(successful.map((metric) => metric[key]))])),
+      spread: Object.fromEntries(
+        HEADLINE_KEYS.map((key) => [key, spread(successful.map((metric) => metric[key]))]),
+      ),
     };
   }
   aggregate.comparisons = compareArms(aggregate);
@@ -635,7 +705,7 @@ function compareArms(aggregate) {
         comparisons[`empty_vs_${arm}`][key] = { baseline: base, treatment: value, delta: null, pct: null };
         continue;
       }
-      const higherIsBetter = key === "quality_score";
+      const higherIsBetter = HIGHER_IS_BETTER.has(key);
       const pct = higherIsBetter ? (value / base - 1) * 100 : (1 - value / base) * 100;
       comparisons[`empty_vs_${arm}`][key] = {
         baseline: base,
@@ -663,12 +733,45 @@ function isOkStatus(status) {
 }
 
 function renderSummary(output) {
+  const arms = Object.keys(output.aggregate).filter((arm) => arm !== "comparisons");
   const lines = [`# Benchmark Summary`, "", `Suite: \`${output.suite_id}\``, ""];
-  lines.push("| arm | runs | success | quality | shell cmds | indexed cli cmds | search cmds | read cmds | failed cmds | indexed cli p50 ms | indexed cli p95 ms | indexed cli total ms | tool share |");
-  lines.push("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
-  for (const [arm, data] of Object.entries(output.aggregate)) {
-    if (arm === "comparisons") continue;
-    lines.push(`| ${arm} | ${data.runs} | ${(data.success_rate * 100).toFixed(0)}% | ${fmt(data.medians.quality_score)} | ${fmt(data.medians.shell_commands)} | ${fmt(data.medians.indexed_cli_commands)} | ${fmt(data.medians.search_commands)} | ${fmt(data.medians.read_commands)} | ${fmt(data.medians.failed_commands)} | ${fmt(data.medians.indexed_cli_duration_ms_p50)} | ${fmt(data.medians.indexed_cli_duration_ms_p95)} | ${fmt(data.medians.indexed_cli_execution_ms_sum)} | ${fmtPct(data.medians.tool_execution_share_pct)} |`);
+
+  lines.push("## Answer Quality (blind LLM judge)");
+  lines.push("");
+  lines.push("Quality is the judge's overall score (0-1), graded blind to the arm. CI is a Student-t 95% interval over successful runs. Rubric columns: correct / complete / grounded for comprehension tasks; refusal-ok for the anti-hallucination tasks. Keyword% is the legacy substring grader, kept only as a diagnostic.");
+  lines.push("");
+  lines.push("| arm | runs | success | quality | 95% CI | correct | complete | grounded | refusal ok | keyword% |");
+  lines.push("|---|---:|---:|---:|:--:|---:|---:|---:|---:|---:|");
+  for (const arm of arms) {
+    const data = output.aggregate[arm];
+    const m = data.medians;
+    lines.push(`| ${arm} | ${data.runs} | ${(data.success_rate * 100).toFixed(0)}% | ${fmt(m.quality_score)} | ${fmtCI(data.spread?.quality_score)} | ${fmt(m.judge_correct)} | ${fmt(m.judge_complete)} | ${fmt(m.judge_grounded)} | ${fmt(m.judge_refusal_ok)} | ${fmtPct(rateToPct(m.keyword_hit_rate))} |`);
+  }
+  lines.push("");
+  lines.push("### Quality by task × arm (medians)");
+  lines.push("");
+  lines.push(`| task | refusal | ${arms.join(" | ")} |`);
+  lines.push(`|---|:--:|${arms.map(() => "---:").join("|")}|`);
+  for (const taskId of [...new Set(output.runs.map((run) => run.task_id))].sort()) {
+    const refusal = output.runs.some((run) => run.task_id === taskId && run.refusal_task) ? "yes" : "";
+    const cells = arms.map((arm) => {
+      const values = output.runs
+        .filter((run) => run.task_id === taskId && run.arm === arm && run.success)
+        .map((run) => run.quality_score);
+      return fmt(median(values));
+    });
+    lines.push(`| ${taskId} | ${refusal} | ${cells.join(" | ")} |`);
+  }
+  lines.push("");
+
+  lines.push("## Cost & Tooling");
+  lines.push("");
+  lines.push("| arm | shell cmds | 95% CI | indexed cli cmds | search cmds | read cmds | failed cmds | indexed cli p50 ms | indexed cli p95 ms | indexed cli total ms | tool share |");
+  lines.push("|---|---:|:--:|---:|---:|---:|---:|---:|---:|---:|---:|");
+  for (const arm of arms) {
+    const data = output.aggregate[arm];
+    const m = data.medians;
+    lines.push(`| ${arm} | ${fmt(m.shell_commands)} | ${fmtCI(data.spread?.shell_commands)} | ${fmt(m.indexed_cli_commands)} | ${fmt(m.search_commands)} | ${fmt(m.read_commands)} | ${fmt(m.failed_commands)} | ${fmt(m.indexed_cli_duration_ms_p50)} | ${fmt(m.indexed_cli_duration_ms_p95)} | ${fmt(m.indexed_cli_execution_ms_sum)} | ${fmtPct(m.tool_execution_share_pct)} |`);
   }
   lines.push("");
   lines.push("## Diagnostic Wall Clock");
@@ -734,4 +837,15 @@ function fmt(value) {
 
 function fmtPct(value) {
   return value === null || value === undefined ? "" : `${Number(value).toFixed(2).replace(/\.00$/, "")}%`;
+}
+
+function rateToPct(value) {
+  return value === null || value === undefined ? null : Number(value) * 100;
+}
+
+function fmtCI(spreadObj) {
+  if (!spreadObj || spreadObj.ci95_half === null || spreadObj.ci95_half === undefined) {
+    return spreadObj && spreadObj.n === 1 ? "n=1" : "";
+  }
+  return `±${Number(spreadObj.ci95_half).toFixed(2).replace(/\.00$/, "")}`;
 }
