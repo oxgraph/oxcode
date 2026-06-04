@@ -14,16 +14,9 @@ use oxcode_model::{
     SymbolKey, SymbolReport, SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE,
     TraversedSymbol, projection_name,
 };
-use oxgraph::{
-    db::{
-        Database, ElementId, PropertyKeyId, PropertySubject, PropertyValue, QueryLanguage,
-        QueryResult, QueryValue, RelationId, TraversalDirection, TraversalOptions,
-    },
-    graph::{EdgeSourceGraph, EdgeTargetGraph, OutgoingGraph},
-    topology::{
-        CanonicalElementIdentity, CanonicalRelationIdentity, LocalElementIdentity,
-        LocalRelationIdentity,
-    },
+use oxgraph::db::{
+    Db, Direction, ElementId, PropertyKeyId, PropertySubject, PropertyValue, QueryResult,
+    QueryValue, RelationId, RelationTypeId, Walk,
 };
 
 use crate::{
@@ -35,8 +28,8 @@ use crate::{
 
 mod write;
 
-pub(crate) use write::{apply_delta, rebuild_database};
-use write::{label_index_name, type_index_name};
+pub(crate) use write::reconcile_database;
+use write::{edge_kind_index_name, element_index_name};
 
 /// Returns project database status.
 pub(crate) fn project_status(root: impl AsRef<Path>) -> Result<ProjectStatus> {
@@ -44,7 +37,7 @@ pub(crate) fn project_status(root: impl AsRef<Path>) -> Result<ProjectStatus> {
     let database_path = database_dir(&root);
     // Ask the storage crate whether a valid store exists rather than probing its
     // private on-disk filename.
-    if Database::validate_path(&database_path).is_err() {
+    if Db::validate_path(&database_path).is_err() {
         return Ok(ProjectStatus {
             root,
             database: database_path,
@@ -61,12 +54,20 @@ pub(crate) fn project_status(root: impl AsRef<Path>) -> Result<ProjectStatus> {
         });
     }
 
-    let database = Database::open(&database_path)?;
-    let status = database.status();
-    let read = database.begin_read();
-    let files = count_index(&read, &label_index_name(NodeKind::File))?;
-    let calls = count_index(&read, &type_index_name(EdgeKind::Calls))?;
-    let unresolved_references = count_index(&read, &label_index_name(NodeKind::Unresolved))?;
+    let database = Db::open(&database_path)?;
+    let status = database.stats();
+    let read = database.reader();
+    let files = count_equal(
+        &read,
+        &element_index_name(ElementProperty::Kind.key()),
+        NodeKind::File.as_str(),
+    )?;
+    let calls = count_equal(&read, &edge_kind_index_name(), EdgeKind::Calls.as_str())?;
+    let unresolved_references = count_equal(
+        &read,
+        &element_index_name(ElementProperty::Kind.key()),
+        NodeKind::Unresolved.as_str(),
+    )?;
     Ok(ProjectStatus {
         root,
         database: database_path,
@@ -92,7 +93,7 @@ pub(crate) fn project_status(root: impl AsRef<Path>) -> Result<ProjectStatus> {
 
 /// An opened project database with its property-key schema resolved once.
 pub(crate) struct OxGraphStore {
-    database: Database,
+    database: Db,
     element_keys: ElementPropertyKeys,
     relation_keys: RelationPropertyKeys,
 }
@@ -100,8 +101,8 @@ pub(crate) struct OxGraphStore {
 impl OxGraphStore {
     pub(crate) fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = canonical_root(root.as_ref())?;
-        let database = Database::open(database_dir(&root))?;
-        let read = database.begin_read();
+        let database = Db::open(database_dir(&root))?;
+        let read = database.reader();
         let element_keys = ElementPropertyKeys::load(&read)?;
         let relation_keys = RelationPropertyKeys::load(&read)?;
         drop(read);
@@ -112,20 +113,20 @@ impl OxGraphStore {
         })
     }
 
-    pub(crate) fn query(&self, language: QueryLanguage, query: &str) -> Result<QueryResult> {
-        let prepared = self.database.prepare(language, query)?;
-        Ok(self.database.begin_read().execute(&prepared)?)
+    pub(crate) fn query(&self, query: &str) -> Result<QueryResult> {
+        let prepared = self.database.prepare(query)?;
+        Ok(self.database.reader().run(&prepared)?)
     }
 
-    pub(crate) fn explain(&self, language: QueryLanguage, query: &str) -> Result<String> {
-        let prepared = self.database.prepare(language, query)?;
-        Ok(self.database.begin_read().explain(&prepared))
+    pub(crate) fn explain(&self, query: &str) -> Result<String> {
+        let prepared = self.database.prepare(query)?;
+        Ok(self.database.reader().explain(&prepared))
     }
 
     pub(crate) fn with_read<T>(&self, f: impl FnOnce(&ReadSession<'_>) -> Result<T>) -> Result<T> {
         let session = ReadSession {
             database: &self.database,
-            read: self.database.begin_read(),
+            read: self.database.reader(),
             element_keys: &self.element_keys,
             relation_keys: &self.relation_keys,
         };
@@ -135,20 +136,16 @@ impl OxGraphStore {
 
 /// One read snapshot over an opened store, sharing the store's resolved schema.
 pub(crate) struct ReadSession<'store> {
-    database: &'store Database,
-    read: oxgraph::db::ReadTransaction,
+    database: &'store Db,
+    read: oxgraph::db::Reader,
     element_keys: &'store ElementPropertyKeys,
     relation_keys: &'store RelationPropertyKeys,
 }
 
 impl ReadSession<'_> {
-    pub(crate) fn execute_query(
-        &self,
-        language: QueryLanguage,
-        query: &str,
-    ) -> Result<QueryResult> {
-        let prepared = self.database.prepare(language, query)?;
-        Ok(self.read.execute(&prepared)?)
+    pub(crate) fn execute_query(&self, query: &str) -> Result<QueryResult> {
+        let prepared = self.database.prepare(query)?;
+        Ok(self.read.run(&prepared)?)
     }
 
     pub(crate) fn resolve_selector(&self, selector: &str) -> Result<Vec<SymbolSummary>> {
@@ -322,7 +319,7 @@ impl ReadSession<'_> {
 
     /// Reads every symbol-like element from one read snapshot.
     fn all_symbol_summaries(&self) -> Result<Vec<SymbolSummary>> {
-        let result = self.execute_query(QueryLanguage::Oxql, "MATCH ELEMENTS")?;
+        let result = self.execute_query("MATCH ELEMENTS")?;
         result
             .rows()
             .iter()
@@ -358,12 +355,8 @@ impl ReadSession<'_> {
     }
 
     /// Executes a query and expands its result on this same snapshot.
-    pub(crate) fn query_expanded(
-        &self,
-        language: QueryLanguage,
-        query: &str,
-    ) -> Result<ExpandedQueryReport> {
-        let result = self.execute_query(language, query)?;
+    pub(crate) fn query_expanded(&self, query: &str) -> Result<ExpandedQueryReport> {
+        let result = self.execute_query(query)?;
         self.expand_query_result(&result)
     }
 
@@ -419,20 +412,22 @@ impl ReadSession<'_> {
         }];
         let mut edges = Vec::new();
 
-        // Resolve the calls projection (id for the engine traversal, materialized
-        // graph for edge hydration) and confirm the seed participates in it.
-        let projection = self
+        // Discover the node set + shortest depths AND the traversed edges with the
+        // engine's deterministic BFS (clean stop at the node limit), then hydrate.
+        // A seed absent from the projection yields an empty report (the walk errs
+        // with `UnknownElement`, matching the previous participation guard).
+        let walk = Walk {
+            max_depth: depth,
+            direction: walk_direction(direction),
+            limit,
+            include_start: false,
+        };
+        let subgraph = self
             .read
             .catalog()
             .projection_id(projection)
-            .and_then(|id| {
-                self.read
-                    .graph_projection_by_name(projection)
-                    .ok()
-                    .map(|graph| (id, graph))
-            })
-            .filter(|(_, graph)| graph.local_element_id(seed_id).is_some());
-        let Some((projection_id, graph)) = projection else {
+            .and_then(|id| self.read.walk(id, &[seed_id], walk).ok());
+        let Some(subgraph) = subgraph else {
             return Ok(CallGraphReport {
                 selector: selector.to_string(),
                 seed,
@@ -443,69 +438,42 @@ impl ReadSession<'_> {
                 edges,
             });
         };
-
-        // Discover the node set + shortest depths with the engine's deterministic
-        // BFS (clean stop at the row limit), then hydrate.
-        let options = TraversalOptions {
-            max_depth: depth,
-            direction: traversal_direction(direction),
-            limit,
-            include_start: false,
-        };
-        let traversal = self
-            .read
-            .traverse_graph(projection_id, &[seed_id], options)?;
         let mut depth_of = BTreeMap::from([(seed_id, 0_usize)]);
-        for row in traversal.rows() {
+        for node in subgraph.nodes() {
             if let Some(symbol) =
-                symbol_summary_from_element(&self.read, element_keys, row.element)?
+                symbol_summary_from_element(&self.read, element_keys, node.element)?
             {
-                depth_of.insert(row.element, row.depth);
+                depth_of.insert(node.element, node.depth);
                 symbols.push(TraversedSymbol {
-                    depth: row.depth,
+                    depth: node.depth,
                     symbol,
                 });
             }
         }
 
-        // Emit every calls edge whose endpoints are both in the discovered set,
-        // so the report never references a symbol it omitted. Ordering is
-        // deterministic (sorted element/relation ids).
-        let mut emitted = BTreeSet::new();
-        let discovered_ids = depth_of.keys().copied().collect::<Vec<_>>();
-        let mut local_edges = Vec::new();
-        for element in discovered_ids {
-            if let Some(local) = graph.local_element_id(element) {
-                local_edges.extend(graph.outgoing_edges(local).collect::<Vec<_>>());
-            }
-        }
-        for local_edge in local_edges {
-            let source = graph.canonical_element_id(graph.source(local_edge));
-            let target = graph.canonical_element_id(graph.target(local_edge));
-            if !depth_of.contains_key(&target) {
-                continue;
-            }
-            let relation = graph.canonical_relation_id(local_edge);
-            if !emitted.insert(relation) {
+        // Hydrate the engine-traversed edges, whose endpoints are both in the
+        // discovered set, so the report never references a symbol it omitted.
+        for edge in subgraph.edges() {
+            if !depth_of.contains_key(&edge.target) {
                 continue;
             }
             let edge_depth = depth_of
-                .get(&source)
+                .get(&edge.source)
                 .copied()
                 .unwrap_or(0)
-                .max(depth_of.get(&target).copied().unwrap_or(0));
-            if let Some(edge) = call_edge_summary(
+                .max(depth_of.get(&edge.target).copied().unwrap_or(0));
+            if let Some(summary) = call_edge_summary(
                 &self.read,
                 element_keys,
                 relation_keys,
                 CallEdgeRef {
-                    relation,
-                    source,
-                    target,
+                    relation: edge.relation,
+                    source: edge.source,
+                    target: edge.target,
                     depth: Some(edge_depth),
                 },
             )? {
-                edges.push(edge);
+                edges.push(summary);
             }
         }
 
@@ -521,7 +489,12 @@ impl ReadSession<'_> {
     }
 
     pub(crate) fn expand_query_result(&self, result: &QueryResult) -> Result<ExpandedQueryReport> {
-        let graph = self.read.graph_projection_by_name(CALLS_PROJECTION).ok();
+        // A relation query value is hydrated into a call edge only when it is a
+        // `Calls` relation (the previous calls-projection membership filter).
+        let calls_type = self
+            .read
+            .catalog()
+            .relation_type_id(EdgeKind::Calls.as_str());
         let rows = result
             .rows()
             .iter()
@@ -534,7 +507,7 @@ impl ReadSession<'_> {
                             &self.read,
                             self.element_keys,
                             self.relation_keys,
-                            graph.as_ref(),
+                            calls_type,
                             value,
                         )
                     })
@@ -582,7 +555,7 @@ struct ElementPropertyKeys {
 
 impl ElementPropertyKeys {
     /// Loads required element property keys from the catalog.
-    fn load(read: &oxgraph::db::ReadTransaction) -> Result<Self> {
+    fn load(read: &oxgraph::db::Reader) -> Result<Self> {
         Ok(Self {
             stable_key: require_element_key(read, ElementProperty::StableKey)?,
             name: require_element_key(read, ElementProperty::Name)?,
@@ -604,11 +577,11 @@ impl ElementPropertyKeys {
 }
 
 /// Property keys needed for relation expansion.
+///
+/// Endpoint resolution no longer reads the stored `source_key`/`target_key` text
+/// props — [`Reader::endpoints`](oxgraph::db::Reader::endpoints) reads endpoints
+/// straight from incidence storage — so only the call-site keys are loaded here.
 struct RelationPropertyKeys {
-    /// Source symbol stable key property.
-    source_key: PropertyKeyId,
-    /// Target symbol stable key property.
-    target_key: PropertyKeyId,
     /// Reference-site file path property.
     site_file_path: PropertyKeyId,
     /// Reference-site start line property.
@@ -629,10 +602,8 @@ struct RelationPropertyKeys {
 
 impl RelationPropertyKeys {
     /// Loads required relation property keys from the catalog.
-    fn load(read: &oxgraph::db::ReadTransaction) -> Result<Self> {
+    fn load(read: &oxgraph::db::Reader) -> Result<Self> {
         Ok(Self {
-            source_key: require_relation_key(read, RelationProperty::SourceKey)?,
-            target_key: require_relation_key(read, RelationProperty::TargetKey)?,
             site_file_path: require_relation_key(read, RelationProperty::SiteFilePath)?,
             site_start_line: require_relation_key(read, RelationProperty::SiteStartLine)?,
             site_start_column: require_relation_key(read, RelationProperty::SiteStartColumn)?,
@@ -645,18 +616,18 @@ impl RelationPropertyKeys {
     }
 }
 
-/// Maps an agent traversal direction to the engine's traversal direction.
-const fn traversal_direction(direction: GraphDirection) -> TraversalDirection {
+/// Maps an agent graph direction to the engine's walk [`Direction`].
+const fn walk_direction(direction: GraphDirection) -> Direction {
     match direction {
-        GraphDirection::Outgoing => TraversalDirection::Outgoing,
-        GraphDirection::Incoming => TraversalDirection::Incoming,
-        GraphDirection::Both => TraversalDirection::Both,
+        GraphDirection::Outgoing => Direction::Outgoing,
+        GraphDirection::Incoming => Direction::Incoming,
+        GraphDirection::Both => Direction::Both,
     }
 }
 
 /// Resolves exactly one symbol or returns a selector error.
 fn resolve_one_symbol_in_read(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     keys: &ElementPropertyKeys,
     selector: &str,
 ) -> Result<SymbolSummary> {
@@ -679,7 +650,7 @@ fn resolve_one_symbol_in_read(
 /// the parsed variants to lookups. Malformed selectors resolve to no matches
 /// (callers needing exactly one symbol then report `SelectorNotFound`).
 fn resolve_selector_in_read(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     keys: &ElementPropertyKeys,
     selector: &str,
 ) -> Result<Vec<SymbolSummary>> {
@@ -711,7 +682,7 @@ fn resolve_selector_in_read(
 /// path always defines its `element_<key>_eq` index. A missing index therefore
 /// means catalog drift and fails loudly rather than silently scanning.
 fn lookup_symbols_by_property(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     keys: &ElementPropertyKeys,
     property: ElementProperty,
     value: &str,
@@ -725,7 +696,7 @@ fn lookup_symbols_by_property(
             item: "index",
             name: index_name,
         })?;
-    let subjects = read.lookup_index(index_id, oxgraph::db::IndexLookup::Equal(&value_property))?;
+    let subjects = read.lookup(index_id, oxgraph::db::Match::Equal(&value_property))?;
     let mut symbols = subjects
         .into_iter()
         .filter_map(|subject| match subject {
@@ -984,7 +955,7 @@ fn preferred_context_kinds() -> Vec<NodeKind> {
     reason = "keeps context graph traversal state explicit"
 )]
 fn collect_context_relationships(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     element_keys: &ElementPropertyKeys,
     relation_keys: &RelationPropertyKeys,
     seed_id: u64,
@@ -1053,7 +1024,7 @@ fn collect_context_relationships(
     reason = "keeps context graph traversal state explicit"
 )]
 fn collect_context_edges(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     element_keys: &ElementPropertyKeys,
     relation_keys: &RelationPropertyKeys,
     kind: EdgeKind,
@@ -1071,15 +1042,7 @@ fn collect_context_edges(
     const MAX_CONTEXT_EDGES_PER_NODE: usize = 64;
 
     let next_depth = current_depth + 1;
-    for edge in direct_relation_edges(
-        read,
-        element_keys,
-        relation_keys,
-        kind,
-        current,
-        direction,
-        MAX_CONTEXT_EDGES_PER_NODE,
-    ) {
+    for edge in direct_relation_edges(read, kind, current, direction, MAX_CONTEXT_EDGES_PER_NODE) {
         if relationships.len() >= max_relationships {
             break;
         }
@@ -1136,14 +1099,8 @@ struct DirectRelationEdge {
     neighbor: ElementId,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps direct relation filtering inputs explicit"
-)]
 fn direct_relation_edges(
-    read: &oxgraph::db::ReadTransaction,
-    element_keys: &ElementPropertyKeys,
-    relation_keys: &RelationPropertyKeys,
+    read: &oxgraph::db::Reader,
     kind: EdgeKind,
     current: ElementId,
     direction: EdgeVisitDirection,
@@ -1179,9 +1136,9 @@ fn direct_relation_edges(
         if relation.relation_type != Some(relation_type) {
             continue;
         }
-        let Some((source, target)) =
-            relation_endpoints(read, element_keys, relation_keys, relation.id)
-        else {
+        // Endpoints come straight from incidence storage; the source endpoint is
+        // the lower incidence id, the target the higher.
+        let Some((source, target)) = relation_endpoints(read, relation.id) else {
             continue;
         };
         let neighbor = match direction {
@@ -1198,36 +1155,13 @@ fn direct_relation_edges(
     edges
 }
 
+/// Returns a relation's `(source, target)` endpoint elements straight from the
+/// engine's incidence storage, with no `source_key`/`target_key` text round-trip.
 fn relation_endpoints(
-    read: &oxgraph::db::ReadTransaction,
-    element_keys: &ElementPropertyKeys,
-    relation_keys: &RelationPropertyKeys,
+    read: &oxgraph::db::Reader,
     relation: RelationId,
 ) -> Option<(ElementId, ElementId)> {
-    let subject = PropertySubject::Relation(relation);
-    let source_key = optional_text_property(read, subject, relation_keys.source_key)?;
-    let target_key = optional_text_property(read, subject, relation_keys.target_key)?;
-    let source = element_by_stable_key(read, element_keys, &source_key)?;
-    let target = element_by_stable_key(read, element_keys, &target_key)?;
-    Some((source, target))
-}
-
-fn element_by_stable_key(
-    read: &oxgraph::db::ReadTransaction,
-    _keys: &ElementPropertyKeys,
-    stable_key: &str,
-) -> Option<ElementId> {
-    let index_id = read.catalog().index_id("element_stable_key_eq")?;
-    read.lookup_index(
-        index_id,
-        oxgraph::db::IndexLookup::Equal(&PropertyValue::Text(stable_key.to_owned())),
-    )
-    .ok()?
-    .into_iter()
-    .find_map(|subject| match subject {
-        PropertySubject::Element(id) => Some(id),
-        PropertySubject::Relation(_) | PropertySubject::Incidence(_) => None,
-    })
+    read.endpoints(relation)
 }
 
 /// Builds one generic relationship summary from canonical endpoint IDs.
@@ -1236,7 +1170,7 @@ fn element_by_stable_key(
     reason = "keeps relationship endpoint hydration explicit"
 )]
 fn relationship_summary_from_ids(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     element_keys: &ElementPropertyKeys,
     relation_keys: &RelationPropertyKeys,
     kind: EdgeKind,
@@ -1296,7 +1230,7 @@ fn context_files(
 
 /// Resolves a `file:path:line` selector to the innermost matching symbol.
 fn resolve_file_line_selector(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     keys: &ElementPropertyKeys,
     file_path: &str,
     line: usize,
@@ -1331,10 +1265,10 @@ fn resolve_file_line_selector(
 
 /// Expands one query value.
 fn expand_query_value(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     element_keys: &ElementPropertyKeys,
     relation_keys: &RelationPropertyKeys,
-    graph: Option<&oxgraph::db::GraphProjection>,
+    calls_type: Option<RelationTypeId>,
     value: &QueryValue,
 ) -> Result<ExpandedQueryValue> {
     let raw = format_query_value(value);
@@ -1348,23 +1282,25 @@ fn expand_query_value(
             expanded.symbol = symbol_summary_from_element(read, element_keys, *id)?;
         }
         QueryValue::Relation(id) => {
-            expanded.call_edge = graph
-                .and_then(|graph| graph.local_relation_id(*id).map(|local| (graph, local)))
-                .map(|(graph, local)| {
-                    call_edge_summary(
-                        read,
-                        element_keys,
-                        relation_keys,
-                        CallEdgeRef {
-                            relation: *id,
-                            source: graph.canonical_element_id(graph.source(local)),
-                            target: graph.canonical_element_id(graph.target(local)),
-                            depth: None,
-                        },
-                    )
-                })
-                .transpose()?
-                .flatten();
+            // Hydrate a call edge only for `Calls` relations, reading endpoints
+            // straight from incidence storage.
+            let is_calls = read
+                .relation(*id)
+                .is_some_and(|relation| relation.relation_type == calls_type)
+                && calls_type.is_some();
+            if is_calls && let Some((source, target)) = read.endpoints(*id) {
+                expanded.call_edge = call_edge_summary(
+                    read,
+                    element_keys,
+                    relation_keys,
+                    CallEdgeRef {
+                        relation: *id,
+                        source,
+                        target,
+                        depth: None,
+                    },
+                )?;
+            }
         }
         QueryValue::Incidence(record) => {
             expanded.symbol = symbol_summary_from_element(read, element_keys, record.element)?;
@@ -1390,7 +1326,7 @@ struct CallEdgeRef {
 
 /// Builds one call edge summary from canonical endpoint IDs.
 fn call_edge_summary(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     element_keys: &ElementPropertyKeys,
     relation_keys: &RelationPropertyKeys,
     edge: CallEdgeRef,
@@ -1412,7 +1348,7 @@ fn call_edge_summary(
 
 /// Reads call-site metadata from one relation.
 fn call_site_summary(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     keys: &RelationPropertyKeys,
     relation: RelationId,
 ) -> Option<CallSiteSummary> {
@@ -1435,7 +1371,7 @@ fn call_site_summary(
 /// Reads symbol properties for one element, returning `None` when the element
 /// or a required property is absent.
 fn symbol_summary_from_element(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     keys: &ElementPropertyKeys,
     id: ElementId,
 ) -> Result<Option<SymbolSummary>> {
@@ -1497,7 +1433,7 @@ fn symbol_summary_from_element(
 
 /// Reads a required text property, erroring if a present element lacks it.
 fn require_text(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     subject: PropertySubject,
     key: PropertyKeyId,
     property: ElementProperty,
@@ -1509,7 +1445,7 @@ fn require_text(
 
 /// Reads a required unsigned-integer property, erroring if it is absent.
 fn require_int(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     subject: PropertySubject,
     key: PropertyKeyId,
     property: ElementProperty,
@@ -1525,10 +1461,7 @@ fn is_agent_symbol(symbol: &SymbolSummary) -> bool {
 }
 
 /// Requires a property key by catalog name.
-fn require_property_key(
-    read: &oxgraph::db::ReadTransaction,
-    name: &'static str,
-) -> Result<PropertyKeyId> {
+fn require_property_key(read: &oxgraph::db::Reader, name: &'static str) -> Result<PropertyKeyId> {
     read.catalog()
         .property_key_id(name)
         .ok_or_else(|| Error::MissingCatalog {
@@ -1539,7 +1472,7 @@ fn require_property_key(
 
 /// Requires a catalog element property key.
 fn require_element_key(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     property: ElementProperty,
 ) -> Result<PropertyKeyId> {
     require_property_key(read, property.key())
@@ -1547,7 +1480,7 @@ fn require_element_key(
 
 /// Reads an optional catalog element property key.
 fn optional_element_key(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     property: ElementProperty,
 ) -> Option<PropertyKeyId> {
     read.catalog().property_key_id(property.key())
@@ -1555,7 +1488,7 @@ fn optional_element_key(
 
 /// Requires a catalog relation property key.
 fn require_relation_key(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     property: RelationProperty,
 ) -> Result<PropertyKeyId> {
     require_property_key(read, property.key())
@@ -1563,14 +1496,14 @@ fn require_relation_key(
 
 /// Reads one optional text property.
 ///
-/// The native read returns `Option<Cow<PropertyValue>>` (base records borrow,
-/// overlay records own); matching the borrowed `PropertyValue` covers both.
+/// The native read returns an owned `Option<PropertyValue>`; matching by
+/// reference avoids cloning when the value is not the expected variant.
 fn optional_text_property(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     subject: PropertySubject,
     key: PropertyKeyId,
 ) -> Option<String> {
-    match read.property(subject, key).as_deref() {
+    match read.property(subject, key).as_ref() {
         Some(PropertyValue::Text(value)) => Some(value.clone()),
         Some(PropertyValue::Boolean(_) | PropertyValue::Integer(_)) | None => None,
     }
@@ -1578,27 +1511,31 @@ fn optional_text_property(
 
 /// Reads one optional unsigned integer property.
 ///
-/// The native read returns `Option<Cow<PropertyValue>>` (base records borrow,
-/// overlay records own); matching the borrowed `PropertyValue` covers both.
+/// The native read returns an owned `Option<PropertyValue>`; matching by
+/// reference avoids cloning when the value is not the expected variant.
 fn optional_usize_property(
-    read: &oxgraph::db::ReadTransaction,
+    read: &oxgraph::db::Reader,
     subject: PropertySubject,
     key: PropertyKeyId,
 ) -> Option<usize> {
-    match read.property(subject, key).as_deref() {
+    match read.property(subject, key).as_ref() {
         Some(PropertyValue::Integer(value)) => usize::try_from(*value).ok(),
         Some(PropertyValue::Boolean(_) | PropertyValue::Text(_)) | None => None,
     }
 }
 
-/// Counts index members by name, returning `0` when the index is absent.
+/// Counts the subjects whose indexed value equals `value` via the named equality
+/// index, returning `0` when the index is absent.
 ///
-/// Uses the membership index rather than materializing query result rows.
-fn count_index(read: &oxgraph::db::ReadTransaction, name: &str) -> Result<usize> {
+/// Probes the equality index directly rather than materializing query rows.
+fn count_equal(read: &oxgraph::db::Reader, name: &str, value: &str) -> Result<usize> {
     match read.catalog().index_id(name) {
-        Some(index_id) => Ok(read
-            .lookup_index(index_id, oxgraph::db::IndexLookup::All)?
-            .len()),
+        Some(index_id) => {
+            let value = PropertyValue::Text(value.to_owned());
+            Ok(read
+                .lookup(index_id, oxgraph::db::Match::Equal(&value))?
+                .len())
+        }
         None => Ok(0),
     }
 }

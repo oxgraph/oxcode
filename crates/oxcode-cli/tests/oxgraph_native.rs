@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use oxcode_core::{
-    ExpandedQueryValue, GraphDirection, IndexStats, OxElementId, OxQueryLanguage, OxQueryResult,
-    OxQueryValue, ProjectIndex,
+    ExpandedQueryValue, GraphDirection, IndexStats, OxElementId, OxQueryResult, OxQueryValue,
+    ProjectIndex,
 };
 use tempfile::TempDir;
 
@@ -32,9 +32,7 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
 
     let index = ProjectIndex::open(temp.path()).expect("open index");
 
-    let all = index
-        .query(OxQueryLanguage::Oxql, "MATCH ELEMENTS")
-        .expect("all");
+    let all = index.query("MATCH ELEMENTS").expect("all");
     assert!(all.rows().len() >= 3);
 
     let entry = single_element_query(
@@ -47,29 +45,20 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
     );
 
     let functions = index
-        .query(
-            OxQueryLanguage::Oxql,
-            "MATCH ELEMENTS WHERE kind = 'function'",
-        )
+        .query("MATCH ELEMENTS WHERE kind = 'function'")
         .expect("functions");
     assert!(functions.rows().len() >= 2);
 
     let outgoing = index
-        .query(
-            OxQueryLanguage::Oxql,
-            &format!("GRAPH calls WALK FROM {} DEPTH 1", entry.get()),
-        )
+        .query(&format!("GRAPH calls WALK FROM {} DEPTH 1", entry.get()))
         .expect("outgoing");
     assert_eq!(element_rows(&outgoing), vec![helper]);
 
     let incoming = index
-        .query(
-            OxQueryLanguage::Oxql,
-            &format!(
-                "GRAPH calls WALK FROM {} DEPTH 1 DIRECTION incoming",
-                helper.get()
-            ),
-        )
+        .query(&format!(
+            "GRAPH calls WALK FROM {} DEPTH 1 DIRECTION incoming",
+            helper.get()
+        ))
         .expect("incoming");
     assert_eq!(element_rows(&incoming), vec![entry]);
 
@@ -111,7 +100,7 @@ fn indexes_queries_and_traverses_with_native_oxgraph_database() {
     // Query and expansion run on one shared read snapshot.
     index
         .with_session(|session| {
-            let relations = session.query(OxQueryLanguage::Oxql, "MATCH RELATIONS TYPE calls")?;
+            let relations = session.query("MATCH RELATIONS TYPE calls")?;
             let expanded = session.expand(&relations)?;
             assert!(
                 expanded
@@ -182,7 +171,7 @@ fn assert_index_stats(stats: &IndexStats) {
 }
 
 fn single_element_query(index: &ProjectIndex, query: &str) -> OxElementId {
-    let result = index.query(OxQueryLanguage::Oxql, query).expect("query");
+    let result = index.query(query).expect("query");
     let rows = element_rows(&result);
     assert_eq!(rows.len(), 1, "{query} returned {rows:?}");
     rows[0]

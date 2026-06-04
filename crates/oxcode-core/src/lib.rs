@@ -3,11 +3,10 @@
 use std::path::Path;
 
 pub use oxcode_model::*;
+use oxgraph::db::QueryResult;
 pub use oxgraph::db::{
-    ElementId as OxElementId, QueryLanguage as OxQueryLanguage, QueryResult as OxQueryResult,
-    QueryValue as OxQueryValue,
+    ElementId as OxElementId, QueryResult as OxQueryResult, QueryValue as OxQueryValue,
 };
-use oxgraph::db::{QueryLanguage, QueryResult};
 
 mod cache;
 mod error;
@@ -76,13 +75,10 @@ pub fn index_project(root: impl AsRef<Path>) -> Result<IndexStats> {
         .filter(|diagnostic| diagnostic.status == FileParseStatus::Partial)
         .count();
     let resolved = resolve::resolve_extractions(input.extractions)?;
-    // Update an existing database in place (preserving element ids of unchanged
-    // symbols); build from scratch on the first index.
-    let database = if database_path.exists() {
-        store::oxgraph::apply_delta(&root, &resolved)?
-    } else {
-        store::oxgraph::rebuild_database(&root, &resolved)?
-    };
+    // Reconcile the database against the resolved index in place: unchanged
+    // symbols and edges keep their ids (only the changed delta mutates) and the
+    // first index simply mints everything against a fresh store.
+    let database = store::oxgraph::reconcile_database(&root, &resolved)?;
     let stats = IndexStats {
         root,
         database,
@@ -202,23 +198,18 @@ impl ProjectIndex {
     }
 
     /// Executes one raw OxGraph database query.
-    pub fn query(&self, language: QueryLanguage, query: &str) -> Result<QueryResult> {
-        self.store.query(language, query)
+    pub fn query(&self, query: &str) -> Result<QueryResult> {
+        self.store.query(query)
     }
 
     /// Returns OxGraph's plan explanation for one query.
-    pub fn explain(&self, language: QueryLanguage, query: &str) -> Result<String> {
-        self.store.explain(language, query)
+    pub fn explain(&self, query: &str) -> Result<String> {
+        self.store.explain(query)
     }
 
     /// Executes and expands one query in a single read snapshot.
-    pub fn query_expanded(
-        &self,
-        language: QueryLanguage,
-        query: &str,
-    ) -> Result<ExpandedQueryReport> {
-        self.store
-            .with_read(|read| read.query_expanded(language, query))
+    pub fn query_expanded(&self, query: &str) -> Result<ExpandedQueryReport> {
+        self.store.with_read(|read| read.query_expanded(query))
     }
 
     /// Runs several read operations against one shared read snapshot.
@@ -302,17 +293,13 @@ impl Session<'_> {
     }
 
     /// Executes one raw query against this snapshot.
-    pub fn query(&self, language: QueryLanguage, query: &str) -> Result<QueryResult> {
-        self.read.execute_query(language, query)
+    pub fn query(&self, query: &str) -> Result<QueryResult> {
+        self.read.execute_query(query)
     }
 
     /// Executes and expands one query against this snapshot.
-    pub fn query_expanded(
-        &self,
-        language: QueryLanguage,
-        query: &str,
-    ) -> Result<ExpandedQueryReport> {
-        self.read.query_expanded(language, query)
+    pub fn query_expanded(&self, query: &str) -> Result<ExpandedQueryReport> {
+        self.read.query_expanded(query)
     }
 
     /// Expands a previously executed raw result against this snapshot.
@@ -393,7 +380,10 @@ mod tests {
         {
             let index = ProjectIndex::open(root).expect("open");
             assert_eq!(
-                index.resolve_selector("name:drop_me").expect("resolve").len(),
+                index
+                    .resolve_selector("name:drop_me")
+                    .expect("resolve")
+                    .len(),
                 1,
                 "removed symbol is present before the edit"
             );
@@ -407,7 +397,10 @@ mod tests {
 
         let index = ProjectIndex::open(root).expect("reopen");
         assert_eq!(
-            index.resolve_selector("name:drop_me").expect("resolve").len(),
+            index
+                .resolve_selector("name:drop_me")
+                .expect("resolve")
+                .len(),
             0,
             "removed symbol resolves to zero matches after an incremental reindex"
         );

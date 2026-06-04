@@ -167,12 +167,11 @@ impl ElementProperty {
 /// A property attached to graph relations (edges).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationProperty {
+    /// Deterministic, per-edge identity key used to resolve-or-mint the relation
+    /// across reindexes (the relation analogue of [`ElementProperty::StableKey`]).
+    EdgeStableKey,
     /// Edge kind spelling.
     EdgeKind,
-    /// Source symbol key.
-    SourceKey,
-    /// Target symbol key.
-    TargetKey,
     /// How the edge target was resolved.
     Resolution,
     /// Reference-site file path.
@@ -196,9 +195,8 @@ pub enum RelationProperty {
 impl RelationProperty {
     /// Every relation property, in registration order.
     pub const ALL: &'static [Self] = &[
+        Self::EdgeStableKey,
         Self::EdgeKind,
-        Self::SourceKey,
-        Self::TargetKey,
         Self::Resolution,
         Self::SiteFilePath,
         Self::SiteStartByte,
@@ -214,9 +212,8 @@ impl RelationProperty {
     #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
+            Self::EdgeStableKey => "edge_stable_key",
             Self::EdgeKind => "edge_kind",
-            Self::SourceKey => "source_key",
-            Self::TargetKey => "target_key",
             Self::Resolution => "resolution",
             Self::SiteFilePath => "site_file_path",
             Self::SiteStartByte => "site_start_byte",
