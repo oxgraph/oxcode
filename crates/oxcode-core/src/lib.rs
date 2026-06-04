@@ -146,10 +146,17 @@ impl ProjectIndex {
         self.store.with_read(|read| read.search_files(query, limit))
     }
 
-    /// Builds deterministic task-oriented context.
-    pub fn context(&self, query: &str, limit: usize, depth: usize) -> Result<ContextReport> {
+    /// Builds a bounded, PageRank-curated task-oriented context, capping the
+    /// rendered source at `max_bytes` characters.
+    pub fn context(
+        &self,
+        query: &str,
+        limit: usize,
+        depth: usize,
+        max_bytes: usize,
+    ) -> Result<ContextReport> {
         self.store
-            .with_read(|read| read.context(query, limit, depth))
+            .with_read(|read| read.context(query, limit, depth, max_bytes))
     }
 
     /// Describes one selected symbol.
@@ -244,9 +251,16 @@ impl Session<'_> {
         self.read.search_files(query, limit)
     }
 
-    /// Builds deterministic task-oriented context.
-    pub fn context(&self, query: &str, limit: usize, depth: usize) -> Result<ContextReport> {
-        self.read.context(query, limit, depth)
+    /// Builds a bounded, PageRank-curated task-oriented context, capping the
+    /// rendered source at `max_bytes` characters.
+    pub fn context(
+        &self,
+        query: &str,
+        limit: usize,
+        depth: usize,
+        max_bytes: usize,
+    ) -> Result<ContextReport> {
+        self.read.context(query, limit, depth, max_bytes)
     }
 
     /// Describes one selected symbol.

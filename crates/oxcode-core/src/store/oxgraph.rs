@@ -2,21 +2,21 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use oxcode_model::{
-    CALLS_PROJECTION, CallEdgeSummary, CallGraphReport, CallSiteSummary, CatalogStatus,
-    CodeLocation, ContextFileSummary, ContextReport, EdgeKind, ElementProperty,
-    ExpandedQueryReport, ExpandedQueryRow, ExpandedQueryValue, FileSearchReport, FileSummary,
-    GraphDirection, LanguageId, NodeKind, ProjectStatus, QualifiedName, RelatedSymbol,
-    RelationProperty, RelationshipSummary, SOURCE_ROLE, Selector, SourcePath, SourceSpan, SymbolId,
-    SymbolKey, SymbolReport, SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE,
-    TraversedSymbol, projection_name,
+    BlastRadius, CALLS_PROJECTION, CallEdgeSummary, CallFlowHop, CallGraphReport, CallSiteSummary,
+    CatalogStatus, CodeLocation, ContextBudget, ContextFile, ContextRelation, ContextReport,
+    EXPLORE_PROJECTION, EdgeKind, ElementProperty, ExpandedQueryReport, ExpandedQueryRow,
+    ExpandedQueryValue, FileSearchReport, FileSummary, GraphDirection, LanguageId, NodeKind,
+    ProjectStatus, QualifiedName, RelationProperty, RenderedSymbol, SOURCE_ROLE, Selector,
+    SourcePath, SourceSpan, SymbolId, SymbolKey, SymbolReport, SymbolSearchMatch,
+    SymbolSearchReport, SymbolSummary, TARGET_ROLE, TraversedSymbol, projection_name,
 };
 use oxgraph::db::{
-    Db, Direction, ElementId, PropertyKeyId, PropertySubject, PropertyValue, QueryResult,
-    QueryValue, RelationId, RelationTypeId, Walk,
+    Db, Direction, ElementId, PageRankConfig, PropertyKeyId, PropertySubject, PropertyValue,
+    QueryResult, QueryValue, RelationId, RelationTypeId, Walk,
 };
 
 use crate::{
@@ -96,6 +96,7 @@ pub(crate) struct OxGraphStore {
     database: Db,
     element_keys: ElementPropertyKeys,
     relation_keys: RelationPropertyKeys,
+    root: PathBuf,
 }
 
 impl OxGraphStore {
@@ -110,6 +111,7 @@ impl OxGraphStore {
             database,
             element_keys,
             relation_keys,
+            root,
         })
     }
 
@@ -129,6 +131,7 @@ impl OxGraphStore {
             read: self.database.reader(),
             element_keys: &self.element_keys,
             relation_keys: &self.relation_keys,
+            root: &self.root,
         };
         f(&session)
     }
@@ -140,6 +143,7 @@ pub(crate) struct ReadSession<'store> {
     read: oxgraph::db::Reader,
     element_keys: &'store ElementPropertyKeys,
     relation_keys: &'store RelationPropertyKeys,
+    root: &'store Path,
 }
 
 impl ReadSession<'_> {
@@ -264,57 +268,305 @@ impl ReadSession<'_> {
     }
 
     /// Builds deterministic context for a task or question.
-    pub(crate) fn context(&self, query: &str, limit: usize, depth: usize) -> Result<ContextReport> {
+    pub(crate) fn context(
+        &self,
+        query: &str,
+        limit: usize,
+        depth: usize,
+        max_bytes: usize,
+    ) -> Result<ContextReport> {
+        // Seeds: top search matches in the preferred kinds.
         let entry_report = self.search_symbols_filtered(
             query,
             limit.saturating_mul(3).max(limit),
             &preferred_context_kinds(),
         )?;
-        let entry_points = entry_report
+        let seeds = entry_report
             .matches
             .into_iter()
-            .filter(|entry| entry.symbol.kind != NodeKind::File)
+            .map(|entry| entry.symbol)
+            .filter(|symbol| symbol.kind != NodeKind::File)
             .take(limit)
             .collect::<Vec<_>>();
-
-        let mut related = BTreeMap::<u64, RelatedSymbol>::new();
-        let mut relationships = BTreeMap::<u64, RelationshipSummary>::new();
-        let entry_ids = entry_points
+        let seed_ids = seeds
             .iter()
-            .map(|entry| entry.symbol.id.get())
+            .map(|symbol| ElementId::new(symbol.id.get()))
+            .collect::<Vec<_>>();
+
+        // Rank the seed neighbourhood with personalized PageRank, then select the
+        // top renderable symbols and fill a hard byte budget with their source.
+        let ranks = self.rank_neighborhood(&seed_ids);
+        let candidates = self.select_candidates(&seeds, &ranks, depth)?;
+        let per_file_cap = max_bytes.div_ceil(4).max(2_000);
+        let (symbols, files, total_chars, truncated) =
+            self.fill_budget(&candidates, max_bytes, per_file_cap);
+
+        let selected = symbols
+            .iter()
+            .map(|symbol| symbol.id.get())
             .collect::<BTreeSet<_>>();
+        let relationships = self.context_relationships(&symbols, &selected);
+        let blast_radius = self.context_blast_radius(&seed_ids);
+        let call_flow = self.context_call_flow(&symbols);
 
-        for entry in &entry_points {
-            collect_context_relationships(
-                &self.read,
-                self.element_keys,
-                self.relation_keys,
-                entry.symbol.id.get(),
-                depth,
-                &entry_ids,
-                &mut related,
-                &mut relationships,
-            )?;
-        }
-
-        let related_symbols = related.into_values().collect::<Vec<_>>();
-        let relationships = relationships.into_values().collect::<Vec<_>>();
-        let files = context_files(&entry_points, &related_symbols);
         let summary = format!(
-            "found {} entry points, {} related symbols, and {} relationships for {:?}",
-            entry_points.len(),
-            related_symbols.len(),
-            relationships.len(),
-            query
+            "{} symbols across {} files for {query:?} ({total_chars} of {max_bytes} chars{})",
+            symbols.len(),
+            files.len(),
+            if truncated { ", truncated" } else { "" },
         );
         Ok(ContextReport {
             query: query.to_string(),
             summary,
-            entry_points,
-            related_symbols,
+            budget: ContextBudget {
+                total_chars,
+                max_total_chars: max_bytes,
+                per_file_cap,
+                truncated,
+            },
+            symbols,
             relationships,
+            blast_radius,
+            call_flow,
             files,
         })
+    }
+
+    /// Ranks the seed neighbourhood by personalized PageRank over the combined
+    /// `explore` projection (falling back to `calls`, then to no ranking).
+    fn rank_neighborhood(&self, seeds: &[ElementId]) -> Vec<(ElementId, f64)> {
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+        let Some(projection) = self
+            .read
+            .catalog()
+            .projection_id(EXPLORE_PROJECTION)
+            .or_else(|| self.read.catalog().projection_id(CALLS_PROJECTION))
+        else {
+            return Vec::new();
+        };
+        let config = PageRankConfig::new(0.85_f64, 1e-6_f64, 100);
+        self.read
+            .personalized_pagerank(projection, seeds, config)
+            .unwrap_or_default()
+    }
+
+    /// Selects up to `MAX_CONTEXT_SYMBOLS` renderable symbols from the top of the
+    /// ranking, pairing each with its PageRank score. With no ranking it falls
+    /// back to the seeds in search order.
+    fn select_candidates(
+        &self,
+        seeds: &[SymbolSummary],
+        ranks: &[(ElementId, f64)],
+        _depth: usize,
+    ) -> Result<Vec<(SymbolSummary, f64)>> {
+        const MAX_CONTEXT_SYMBOLS: usize = 40;
+        const SCAN_CAP: usize = 800;
+        if ranks.is_empty() {
+            return Ok(seeds.iter().cloned().map(|symbol| (symbol, 0.0)).collect());
+        }
+        let mut candidates = Vec::new();
+        for (element, score) in ranks.iter().take(SCAN_CAP) {
+            if candidates.len() >= MAX_CONTEXT_SYMBOLS {
+                break;
+            }
+            if let Some(symbol) =
+                symbol_summary_from_element(&self.read, self.element_keys, *element)?
+                && is_agent_symbol(&symbol)
+                && symbol.kind != NodeKind::File
+            {
+                candidates.push((symbol, *score));
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Groups candidates by file in rank order, renders each file's source
+    /// skeleton under `per_file_cap`, and stops once `max_bytes` is reached.
+    fn fill_budget(
+        &self,
+        candidates: &[(SymbolSummary, f64)],
+        max_bytes: usize,
+        per_file_cap: usize,
+    ) -> (Vec<RenderedSymbol>, Vec<ContextFile>, usize, bool) {
+        let mut order: Vec<String> = Vec::new();
+        let mut by_file: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, (symbol, _score)) in candidates.iter().enumerate() {
+            let file = symbol.definition.file_path.as_str().to_owned();
+            if !by_file.contains_key(&file) {
+                order.push(file.clone());
+            }
+            by_file.entry(file).or_default().push(index);
+        }
+
+        let mut files = Vec::new();
+        let mut included: Vec<usize> = Vec::new();
+        let mut total_chars = 0usize;
+        let mut truncated = false;
+        for file in &order {
+            let Some(indices) = by_file.get(file) else {
+                continue;
+            };
+            let spans = indices
+                .iter()
+                .map(|&index| {
+                    let span = &candidates[index].0.definition.span;
+                    (span.start_line, span.end_line)
+                })
+                .collect::<Vec<_>>();
+            let skeleton = render_file_skeleton(self.root, file, &spans, per_file_cap);
+            let skeleton_len = skeleton.as_ref().map_or(0, String::len);
+            if !files.is_empty() && total_chars + skeleton_len > max_bytes {
+                truncated = true;
+                break;
+            }
+            total_chars += skeleton_len;
+            files.push(ContextFile {
+                path: candidates[indices[0]].0.definition.file_path.clone(),
+                symbol_ids: indices
+                    .iter()
+                    .map(|&index| candidates[index].0.id)
+                    .collect(),
+                skeleton,
+            });
+            included.extend(indices.iter().copied());
+        }
+
+        let mut symbols = included
+            .iter()
+            .map(|&index| {
+                let (symbol, score) = &candidates[index];
+                RenderedSymbol {
+                    id: symbol.id,
+                    name: symbol.name.clone(),
+                    qualified_name: symbol.qualified_name.clone(),
+                    kind: symbol.kind,
+                    definition: symbol.definition.clone(),
+                    pagerank: *score,
+                    signature: symbol.signature.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        symbols.sort_by(|a, b| b.pagerank.total_cmp(&a.pagerank));
+        (symbols, files, total_chars, truncated)
+    }
+
+    /// Edges among the selected symbols, referenced by id and deduplicated.
+    fn context_relationships(
+        &self,
+        symbols: &[RenderedSymbol],
+        selected: &BTreeSet<u64>,
+    ) -> Vec<ContextRelation> {
+        let mut seen = BTreeSet::new();
+        let mut relations = Vec::new();
+        for symbol in symbols {
+            self.collect_outgoing_relations(symbol, selected, &mut seen, &mut relations);
+        }
+        relations
+    }
+
+    /// Appends one symbol's selected-to-selected outgoing edges, capped and
+    /// deduplicated by relation id.
+    fn collect_outgoing_relations(
+        &self,
+        source: &RenderedSymbol,
+        selected: &BTreeSet<u64>,
+        seen: &mut BTreeSet<u64>,
+        relations: &mut Vec<ContextRelation>,
+    ) {
+        const MAX_RELATIONS: usize = 160;
+        let element = ElementId::new(source.id.get());
+        let edges: Vec<_> = EdgeKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                direct_relation_edges(&self.read, kind, element, EdgeVisitDirection::Outgoing, 64)
+                    .into_iter()
+                    .map(move |edge| (kind, edge))
+            })
+            .collect();
+        for (kind, edge) in edges {
+            if relations.len() >= MAX_RELATIONS {
+                return;
+            }
+            if selected.contains(&edge.neighbor.get()) && seen.insert(edge.relation.get()) {
+                relations.push(ContextRelation {
+                    relation_id: edge.relation.get(),
+                    kind,
+                    source_id: source.id,
+                    target_id: SymbolId::new(edge.neighbor.get()),
+                    site: None,
+                });
+            }
+        }
+    }
+
+    /// Callers of the entry points, split into ordinary and test-tree callers.
+    fn context_blast_radius(&self, seeds: &[ElementId]) -> BlastRadius {
+        let mut radius = BlastRadius::default();
+        let mut seen = BTreeSet::new();
+        for &seed in seeds {
+            self.collect_callers(seed, &mut radius, &mut seen);
+        }
+        radius
+    }
+
+    /// Appends one seed's incoming callers to the blast radius, capped.
+    fn collect_callers(&self, seed: ElementId, radius: &mut BlastRadius, seen: &mut BTreeSet<u64>) {
+        const MAX_CALLERS: usize = 30;
+        for edge in direct_relation_edges(
+            &self.read,
+            EdgeKind::Calls,
+            seed,
+            EdgeVisitDirection::Incoming,
+            32,
+        ) {
+            if radius.callers.len() + radius.tests.len() >= MAX_CALLERS {
+                return;
+            }
+            if !seen.insert(edge.neighbor.get()) {
+                continue;
+            }
+            let id = SymbolId::new(edge.neighbor.get());
+            if self.is_test_caller(edge.neighbor) {
+                radius.tests.push(id);
+            } else {
+                radius.callers.push(id);
+            }
+        }
+    }
+
+    /// Whether an element is defined in a test-like tree.
+    fn is_test_caller(&self, element: ElementId) -> bool {
+        matches!(
+            symbol_summary_from_element(&self.read, self.element_keys, element),
+            Ok(Some(symbol)) if is_test_like_path(symbol.definition.file_path.as_str())
+        )
+    }
+
+    /// The longest call chain among the selected callable symbols.
+    fn context_call_flow(&self, symbols: &[RenderedSymbol]) -> Vec<CallFlowHop> {
+        let Some(calls) = self.read.catalog().projection_id(CALLS_PROJECTION) else {
+            return Vec::new();
+        };
+        let callable = symbols
+            .iter()
+            .filter(|symbol| matches!(symbol.kind, NodeKind::Function | NodeKind::Method))
+            .map(|symbol| ElementId::new(symbol.id.get()))
+            .collect::<Vec<_>>();
+        if callable.len() < 2 {
+            return Vec::new();
+        }
+        self.read
+            .longest_path(calls, &callable)
+            .unwrap_or_default()
+            .windows(2)
+            .map(|hop| CallFlowHop {
+                from_id: SymbolId::new(hop[0].get()),
+                to_id: SymbolId::new(hop[1].get()),
+                dynamic_dispatch: None,
+            })
+            .collect()
     }
 
     /// Reads every symbol-like element from one read snapshot.
@@ -893,6 +1145,78 @@ fn wants_test_like(terms: &[String]) -> bool {
     })
 }
 
+/// Renders a line-numbered source skeleton for the selected symbols in one file.
+///
+/// Reads the file from disk; small files render whole, larger files render the
+/// merged line ranges around each selected symbol with `...` gap markers, all
+/// clipped to `per_file_cap` characters. Returns `None` when the file cannot be
+/// read (for example it changed since indexing) or no span is in range.
+fn render_file_skeleton(
+    root: &Path,
+    file_path: &str,
+    spans: &[(usize, usize)],
+    per_file_cap: usize,
+) -> Option<String> {
+    const WHOLE_FILE_MAX_LINES: usize = 220;
+    const CONTEXT_LINES: usize = 3;
+
+    let source = std::fs::read_to_string(root.join(file_path)).ok()?;
+    let lines = source.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let line_count = lines.len();
+
+    let ranges = if line_count <= WHOLE_FILE_MAX_LINES {
+        vec![(1usize, line_count)]
+    } else {
+        let mut windows = spans
+            .iter()
+            .filter_map(|&(start, end)| {
+                if start == 0 || start > line_count {
+                    return None;
+                }
+                Some((
+                    start.saturating_sub(CONTEXT_LINES).max(1),
+                    end.saturating_add(CONTEXT_LINES).min(line_count),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if windows.is_empty() {
+            return None;
+        }
+        windows.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (low, high) in windows {
+            match merged.last_mut() {
+                Some(last) if low <= last.1 + 1 => last.1 = last.1.max(high),
+                _ => merged.push((low, high)),
+            }
+        }
+        merged
+    };
+
+    let mut output = format!("// {file_path}\n");
+    let mut previous_end = 0usize;
+    for (low, high) in ranges {
+        if previous_end > 0 && low > previous_end + 1 {
+            output.push_str("       ...\n");
+        }
+        for line_number in low..=high {
+            let Some(line) = lines.get(line_number - 1) else {
+                continue;
+            };
+            output.push_str(&format!("{line_number:>6}\t{}\n", line.trim_end()));
+            if output.len() >= per_file_cap {
+                output.push_str("       ... (truncated)\n");
+                return Some(output);
+            }
+        }
+        previous_end = high;
+    }
+    Some(output)
+}
+
 /// Returns whether a path belongs to a test-like tree.
 fn is_test_like_path(file_path: &str) -> bool {
     file_path.contains("/tests/")
@@ -949,142 +1273,6 @@ fn preferred_context_kinds() -> Vec<NodeKind> {
     .collect()
 }
 
-/// Builds related context by walking direct graph relationships from one seed.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps context graph traversal state explicit"
-)]
-fn collect_context_relationships(
-    read: &oxgraph::db::Reader,
-    element_keys: &ElementPropertyKeys,
-    relation_keys: &RelationPropertyKeys,
-    seed_id: u64,
-    max_depth: usize,
-    entry_ids: &BTreeSet<u64>,
-    related: &mut BTreeMap<u64, RelatedSymbol>,
-    relationships: &mut BTreeMap<u64, RelationshipSummary>,
-) -> Result<()> {
-    const MAX_RELATED_SYMBOLS: usize = 80;
-    const MAX_RELATIONSHIPS: usize = 200;
-
-    let mut queue = std::collections::VecDeque::from([(ElementId::new(seed_id), 0_usize)]);
-    let mut visited = BTreeSet::from([seed_id]);
-    while let Some((current, current_depth)) = queue.pop_front() {
-        if current_depth >= max_depth || relationships.len() >= MAX_RELATIONSHIPS {
-            continue;
-        }
-        for kind in [
-            EdgeKind::Calls,
-            EdgeKind::Contains,
-            EdgeKind::References,
-            EdgeKind::Implements,
-        ] {
-            collect_context_edges(
-                read,
-                element_keys,
-                relation_keys,
-                kind,
-                current,
-                current_depth,
-                EdgeVisitDirection::Outgoing,
-                entry_ids,
-                &mut visited,
-                &mut queue,
-                related,
-                relationships,
-                MAX_RELATED_SYMBOLS,
-                MAX_RELATIONSHIPS,
-            )?;
-            if matches!(kind, EdgeKind::Contains | EdgeKind::References) {
-                continue;
-            }
-            collect_context_edges(
-                read,
-                element_keys,
-                relation_keys,
-                kind,
-                current,
-                current_depth,
-                EdgeVisitDirection::Incoming,
-                entry_ids,
-                &mut visited,
-                &mut queue,
-                related,
-                relationships,
-                MAX_RELATED_SYMBOLS,
-                MAX_RELATIONSHIPS,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps context graph traversal state explicit"
-)]
-fn collect_context_edges(
-    read: &oxgraph::db::Reader,
-    element_keys: &ElementPropertyKeys,
-    relation_keys: &RelationPropertyKeys,
-    kind: EdgeKind,
-    current: ElementId,
-    current_depth: usize,
-    direction: EdgeVisitDirection,
-    entry_ids: &BTreeSet<u64>,
-    visited: &mut BTreeSet<u64>,
-    queue: &mut std::collections::VecDeque<(ElementId, usize)>,
-    related: &mut BTreeMap<u64, RelatedSymbol>,
-    relationships: &mut BTreeMap<u64, RelationshipSummary>,
-    max_related: usize,
-    max_relationships: usize,
-) -> Result<()> {
-    const MAX_CONTEXT_EDGES_PER_NODE: usize = 64;
-
-    let next_depth = current_depth + 1;
-    for edge in direct_relation_edges(read, kind, current, direction, MAX_CONTEXT_EDGES_PER_NODE) {
-        if relationships.len() >= max_relationships {
-            break;
-        }
-        if let Some(summary) = relationship_summary_from_ids(
-            read,
-            element_keys,
-            relation_keys,
-            kind,
-            edge.relation,
-            edge.source,
-            edge.target,
-        )? {
-            relationships.entry(summary.relation_id).or_insert(summary);
-        }
-
-        let neighbor_id = edge.neighbor.get();
-        if entry_ids.contains(&neighbor_id) || related.len() >= max_related {
-            continue;
-        }
-        if let Some(symbol) = symbol_summary_from_element(read, element_keys, edge.neighbor)?
-            && is_context_related_symbol(&symbol)
-        {
-            related.entry(neighbor_id).or_insert_with(|| RelatedSymbol {
-                depth: next_depth,
-                reason: format!(
-                    "{} {} relationship",
-                    match direction {
-                        EdgeVisitDirection::Outgoing => "outgoing",
-                        EdgeVisitDirection::Incoming => "incoming",
-                    },
-                    kind
-                ),
-                symbol,
-            });
-        }
-        if visited.insert(neighbor_id) {
-            queue.push_back((edge.neighbor, next_depth));
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 enum EdgeVisitDirection {
     Outgoing,
@@ -1094,8 +1282,6 @@ enum EdgeVisitDirection {
 #[derive(Clone, Copy)]
 struct DirectRelationEdge {
     relation: RelationId,
-    source: ElementId,
-    target: ElementId,
     neighbor: ElementId,
 }
 
@@ -1147,8 +1333,6 @@ fn direct_relation_edges(
         };
         edges.push(DirectRelationEdge {
             relation: relation.id,
-            source,
-            target,
             neighbor,
         });
     }
@@ -1162,70 +1346,6 @@ fn relation_endpoints(
     relation: RelationId,
 ) -> Option<(ElementId, ElementId)> {
     read.endpoints(relation)
-}
-
-/// Builds one generic relationship summary from canonical endpoint IDs.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps relationship endpoint hydration explicit"
-)]
-fn relationship_summary_from_ids(
-    read: &oxgraph::db::Reader,
-    element_keys: &ElementPropertyKeys,
-    relation_keys: &RelationPropertyKeys,
-    kind: EdgeKind,
-    relation: RelationId,
-    source: ElementId,
-    target: ElementId,
-) -> Result<Option<RelationshipSummary>> {
-    let Some(source) = symbol_summary_from_element(read, element_keys, source)? else {
-        return Ok(None);
-    };
-    let Some(target) = symbol_summary_from_element(read, element_keys, target)? else {
-        return Ok(None);
-    };
-    Ok(Some(RelationshipSummary {
-        relation_id: relation.get(),
-        kind,
-        source,
-        target,
-        site: call_site_summary(read, relation_keys, relation),
-    }))
-}
-
-/// Returns whether one adjacent symbol is useful in context output.
-fn is_context_related_symbol(symbol: &SymbolSummary) -> bool {
-    !matches!(symbol.kind, NodeKind::File | NodeKind::Unresolved)
-}
-
-/// Aggregates file counts for context output.
-fn context_files(
-    entry_points: &[SymbolSearchMatch],
-    related_symbols: &[RelatedSymbol],
-) -> Vec<ContextFileSummary> {
-    let mut files = BTreeMap::<SourcePath, (usize, usize)>::new();
-    for entry in entry_points {
-        files
-            .entry(entry.symbol.definition.file_path.clone())
-            .or_default()
-            .0 += 1;
-    }
-    for related in related_symbols {
-        files
-            .entry(related.symbol.definition.file_path.clone())
-            .or_default()
-            .1 += 1;
-    }
-    files
-        .into_iter()
-        .map(
-            |(path, (matched_symbols, related_symbols))| ContextFileSummary {
-                path,
-                matched_symbols,
-                related_symbols,
-            },
-        )
-        .collect()
 }
 
 /// Resolves a `file:path:line` selector to the innermost matching symbol.

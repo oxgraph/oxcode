@@ -102,32 +102,108 @@ pub struct FileSearchReport {
     pub files: Vec<FileSummary>,
 }
 
-/// File contribution inside a task-oriented context report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextFileSummary {
-    /// Repository-relative file path.
-    pub path: SourcePath,
-    /// Number of entry-point symbols in the file.
-    pub matched_symbols: usize,
-    /// Number of related symbols in the file.
-    pub related_symbols: usize,
+/// One symbol selected into a curated context report, with its lightweight
+/// fields rendered exactly once. Its source lives in the owning [`ContextFile`],
+/// never re-embedded per relationship.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderedSymbol {
+    /// OxGraph element ID, referenced by every other section.
+    pub id: SymbolId,
+    /// Simple display name.
+    pub name: String,
+    /// Qualified language-level name.
+    pub qualified_name: QualifiedName,
+    /// Stored symbol kind.
+    pub kind: NodeKind,
+    /// Definition source location.
+    pub definition: CodeLocation,
+    /// Personalized-PageRank relevance score (higher is more central to the task).
+    pub pagerank: f64,
+    /// Compact declaration or header.
+    pub signature: Option<String>,
 }
 
-/// Deterministic task-oriented context report.
+/// One relationship between selected symbols, referencing them by id so a heavy
+/// [`RenderedSymbol`] is never duplicated per edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRelation {
+    /// OxGraph relation ID.
+    pub relation_id: u64,
+    /// Stored edge kind.
+    pub kind: EdgeKind,
+    /// Source symbol id.
+    pub source_id: SymbolId,
+    /// Target symbol id.
+    pub target_id: SymbolId,
+    /// Optional source-reference site.
+    pub site: Option<CallSiteSummary>,
+}
+
+/// What depends on the entry-point symbols.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlastRadius {
+    /// Symbols that call an entry point.
+    pub callers: Vec<SymbolId>,
+    /// The subset of callers that live in test-like trees.
+    pub tests: Vec<SymbolId>,
+}
+
+/// One hop on the longest call chain among the selected symbols.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallFlowHop {
+    /// Calling symbol id.
+    pub from_id: SymbolId,
+    /// Called symbol id.
+    pub to_id: SymbolId,
+    /// Trait symbol id when this hop crosses an `implements` edge (approximate
+    /// dynamic dispatch).
+    pub dynamic_dispatch: Option<SymbolId>,
+}
+
+/// One file's curated source, rendered once under the per-file byte budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFile {
+    /// Repository-relative file path.
+    pub path: SourcePath,
+    /// Selected symbol ids defined in this file.
+    pub symbol_ids: Vec<SymbolId>,
+    /// Line-numbered source skeleton (whole file if small, else merged slices
+    /// around the selected symbols), or `None` when the source is unavailable.
+    pub skeleton: Option<String>,
+}
+
+/// Output-size accounting for a curated context report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBudget {
+    /// Characters of source skeleton actually emitted.
+    pub total_chars: usize,
+    /// The configured ceiling.
+    pub max_total_chars: usize,
+    /// Per-file skeleton character cap.
+    pub per_file_cap: usize,
+    /// Whether the budget cut off lower-ranked files.
+    pub truncated: bool,
+}
+
+/// Deterministic, bounded, PageRank-curated task-oriented context report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextReport {
     /// Original task or question text.
     pub query: String,
     /// Compact deterministic summary of what was found.
     pub summary: String,
-    /// Best matching symbols for the task.
-    pub entry_points: Vec<SymbolSearchMatch>,
-    /// Symbols adjacent to entry points.
-    pub related_symbols: Vec<RelatedSymbol>,
-    /// Relationships connecting entry points and adjacent symbols.
-    pub relationships: Vec<RelationshipSummary>,
-    /// Files represented by entry points and adjacent symbols.
-    pub files: Vec<ContextFileSummary>,
+    /// Output-size budget accounting.
+    pub budget: ContextBudget,
+    /// Selected symbols ranked by relevance; heavy fields appear once here.
+    pub symbols: Vec<RenderedSymbol>,
+    /// Relationships among the selected symbols, referencing them by id.
+    pub relationships: Vec<ContextRelation>,
+    /// Callers and covering tests of the entry-point symbols.
+    pub blast_radius: BlastRadius,
+    /// The longest call chain among the selected symbols.
+    pub call_flow: Vec<CallFlowHop>,
+    /// Selected files with their rendered source skeletons.
+    pub files: Vec<ContextFile>,
 }
 
 /// A symbol discovered during a bounded graph walk.

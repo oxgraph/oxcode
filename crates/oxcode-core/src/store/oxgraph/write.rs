@@ -20,9 +20,9 @@ use std::{
 };
 
 use oxcode_model::{
-    EdgeKind, ElementProperty, NodeKind, PropertyKind, RelationProperty, ResolvedEdge,
-    ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE, UnresolvedReference,
-    projection_name,
+    EXPLORE_PROJECTION, EdgeKind, ElementProperty, NodeKind, PropertyKind, RelationProperty,
+    ResolvedEdge, ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE,
+    UnresolvedReference, projection_name,
 };
 use oxgraph::db::{
     Bound, Db, DbError, ElementId, Int, PropertyFamily, RelationId, Schema, Text, Writer,
@@ -98,6 +98,10 @@ fn code_schema() -> Schema {
         let name = projection_name(kind);
         schema = schema.graph_projection(&name, &[kind.as_str()], SOURCE_ROLE, TARGET_ROLE);
     }
+    // One combined projection spanning every edge kind, used by the curated
+    // `context` command to rank the neighbourhood with personalized PageRank.
+    let explore_kinds: Vec<&str> = EdgeKind::ALL.iter().map(|kind| kind.as_str()).collect();
+    schema = schema.graph_projection(EXPLORE_PROJECTION, &explore_kinds, SOURCE_ROLE, TARGET_ROLE);
     schema
 }
 
