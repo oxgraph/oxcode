@@ -116,16 +116,16 @@ pub fn format_context_report(report: &ContextReport) -> String {
 
     if !report.blast_radius.callers.is_empty() || !report.blast_radius.tests.is_empty() {
         output.push_str("blast radius\n");
-        if !report.blast_radius.callers.is_empty() {
+        for caller in &report.blast_radius.callers {
             output.push_str(&format!(
-                "  callers {}\n",
-                join_symbol_ids(&report.blast_radius.callers)
+                "  caller {} ({})\n",
+                caller.qualified_name, caller.path
             ));
         }
-        if !report.blast_radius.tests.is_empty() {
+        for caller in &report.blast_radius.tests {
             output.push_str(&format!(
-                "  tests {}\n",
-                join_symbol_ids(&report.blast_radius.tests)
+                "  test {} ({})\n",
+                caller.qualified_name, caller.path
             ));
         }
     }
@@ -167,14 +167,6 @@ pub fn format_context_report(report: &ContextReport) -> String {
         },
     ));
     output
-}
-
-/// Joins symbol ids into a compact `#id` list for blast-radius output.
-fn join_symbol_ids(ids: &[oxcode_model::SymbolId]) -> String {
-    ids.iter()
-        .map(|id| format!("#{}", id.get()))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Formats one call graph report for agent-facing CLI output.

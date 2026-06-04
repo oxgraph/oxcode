@@ -6,13 +6,14 @@ use std::{
 };
 
 use oxcode_model::{
-    BlastRadius, CALLS_PROJECTION, CallEdgeSummary, CallFlowHop, CallGraphReport, CallSiteSummary,
-    CatalogStatus, CodeLocation, ContextBudget, ContextFile, ContextRelation, ContextReport,
-    EXPLORE_PROJECTION, EdgeKind, ElementProperty, ExpandedQueryReport, ExpandedQueryRow,
-    ExpandedQueryValue, FileSearchReport, FileSummary, GraphDirection, LanguageId, NodeKind,
-    ProjectStatus, QualifiedName, RelationProperty, RenderedSymbol, SOURCE_ROLE, Selector,
-    SourcePath, SourceSpan, SymbolId, SymbolKey, SymbolReport, SymbolSearchMatch,
-    SymbolSearchReport, SymbolSummary, TARGET_ROLE, TraversedSymbol, projection_name,
+    BlastCaller, BlastRadius, CALLS_PROJECTION, CallEdgeSummary, CallFlowHop, CallGraphReport,
+    CallSiteSummary, CatalogStatus, CodeLocation, ContextBudget, ContextFile, ContextRelation,
+    ContextReport, EXPLORE_PROJECTION, EdgeKind, ElementProperty, ExpandedQueryReport,
+    ExpandedQueryRow, ExpandedQueryValue, FileSearchReport, FileSummary, GraphDirection,
+    LanguageId, NodeKind, ProjectStatus, QualifiedName, RelationProperty, RenderedSymbol,
+    SOURCE_ROLE, Selector, SourcePath, SourceSpan, SymbolId, SymbolKey, SymbolReport,
+    SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE, TraversedSymbol,
+    projection_name,
 };
 use oxgraph::db::{
     Db, Direction, ElementId, PageRankConfig, PropertyKeyId, PropertySubject, PropertyValue,
@@ -297,7 +298,10 @@ impl ReadSession<'_> {
         // top renderable symbols and fill a hard byte budget with their source.
         let ranks = self.rank_neighborhood(&seed_ids);
         let candidates = self.select_candidates(&seeds, &ranks, depth)?;
-        let per_file_cap = max_bytes.div_ceil(4).max(2_000);
+        // Keep the per-file cap at or below the total so a single file can never
+        // overshoot the hard `max_bytes` budget (the first file is always
+        // admitted, bounded only by this cap).
+        let per_file_cap = (max_bytes / 4).max(1);
         let (symbols, files, total_chars, truncated) =
             self.fill_budget(&candidates, max_bytes, per_file_cap);
 
@@ -511,7 +515,9 @@ impl ReadSession<'_> {
         radius
     }
 
-    /// Appends one seed's incoming callers to the blast radius, capped.
+    /// Appends one seed's incoming callers to the blast radius, capped. Each
+    /// caller carries its own identity so it is resolvable without appearing in
+    /// the selected `symbols` table.
     fn collect_callers(&self, seed: ElementId, radius: &mut BlastRadius, seen: &mut BTreeSet<u64>) {
         const MAX_CALLERS: usize = 30;
         for edge in direct_relation_edges(
@@ -527,21 +533,23 @@ impl ReadSession<'_> {
             if !seen.insert(edge.neighbor.get()) {
                 continue;
             }
-            let id = SymbolId::new(edge.neighbor.get());
-            if self.is_test_caller(edge.neighbor) {
-                radius.tests.push(id);
+            let Ok(Some(symbol)) =
+                symbol_summary_from_element(&self.read, self.element_keys, edge.neighbor)
+            else {
+                continue;
+            };
+            let is_test = is_test_like_path(symbol.definition.file_path.as_str());
+            let caller = BlastCaller {
+                id: symbol.id,
+                qualified_name: symbol.qualified_name,
+                path: symbol.definition.file_path,
+            };
+            if is_test {
+                radius.tests.push(caller);
             } else {
-                radius.callers.push(id);
+                radius.callers.push(caller);
             }
         }
-    }
-
-    /// Whether an element is defined in a test-like tree.
-    fn is_test_caller(&self, element: ElementId) -> bool {
-        matches!(
-            symbol_summary_from_element(&self.read, self.element_keys, element),
-            Ok(Some(symbol)) if is_test_like_path(symbol.definition.file_path.as_str())
-        )
     }
 
     /// The longest call chain among the selected callable symbols.

@@ -52,32 +52,6 @@ pub struct SymbolSearchReport {
     pub matches: Vec<SymbolSearchMatch>,
 }
 
-/// One relationship expanded into code-aware context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelationshipSummary {
-    /// OxGraph relation ID.
-    pub relation_id: u64,
-    /// Stored edge kind.
-    pub kind: EdgeKind,
-    /// Source symbol.
-    pub source: SymbolSummary,
-    /// Target symbol.
-    pub target: SymbolSummary,
-    /// Optional source-reference site.
-    pub site: Option<CallSiteSummary>,
-}
-
-/// One symbol related to a task-oriented context entry point.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelatedSymbol {
-    /// Shortest discovered hop depth.
-    pub depth: usize,
-    /// Why this symbol is included.
-    pub reason: String,
-    /// Related symbol.
-    pub symbol: SymbolSummary,
-}
-
 /// File-level summary for agent navigation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSummary {
@@ -139,13 +113,26 @@ pub struct ContextRelation {
     pub site: Option<CallSiteSummary>,
 }
 
+/// One caller of an entry-point symbol, carried with enough identity to resolve
+/// it on its own (callers are upstream of the selected neighbourhood, so they do
+/// not appear in `ContextReport::symbols`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlastCaller {
+    /// OxGraph element ID.
+    pub id: SymbolId,
+    /// Qualified language-level name.
+    pub qualified_name: QualifiedName,
+    /// Defining file path.
+    pub path: SourcePath,
+}
+
 /// What depends on the entry-point symbols.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlastRadius {
     /// Symbols that call an entry point.
-    pub callers: Vec<SymbolId>,
+    pub callers: Vec<BlastCaller>,
     /// The subset of callers that live in test-like trees.
-    pub tests: Vec<SymbolId>,
+    pub tests: Vec<BlastCaller>,
 }
 
 /// One hop on the longest call chain among the selected symbols.
