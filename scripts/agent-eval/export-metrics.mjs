@@ -27,6 +27,10 @@ const HEADLINE_KEYS = [
   "wall_clock_ms",
   "first_indexed_cli_ms",
   "indexed_cli_duration_ms_p50",
+  "total_tokens",
+  "input_tokens",
+  "output_tokens",
+  "cost_usd",
 ];
 
 // Metrics where a larger median is the better outcome (everything else is
@@ -39,6 +43,16 @@ const HIGHER_IS_BETTER = new Set([
   "judge_grounded",
   "judge_refusal_ok",
 ]);
+
+// Token pricing for the cost estimate, in USD per million tokens. codegraph
+// reads cost straight from Claude Code's stream-json; codex reports only token
+// counts, so we derive cost here. These are GPT-5-class assumptions — override
+// to match the model under test. Token COUNTS are exact and model-agnostic; the
+// cost figure is an estimate, so prefer tokens (and %-vs-control) for any
+// cross-tool comparison.
+const PRICE_INPUT_PER_MTOK = Number(process.env.OXCODE_PRICE_INPUT_PER_MTOK ?? 1.25);
+const PRICE_CACHED_PER_MTOK = Number(process.env.OXCODE_PRICE_CACHED_PER_MTOK ?? 0.125);
+const PRICE_OUTPUT_PER_MTOK = Number(process.env.OXCODE_PRICE_OUTPUT_PER_MTOK ?? 10);
 
 const args = parseArgs();
 const workshopUrl = String(args["workshop-url"] ?? "").replace(/\/$/, "");
@@ -374,6 +388,7 @@ function computeRunMetrics(run, task, expected) {
   const keyword = task ? qualityScore(answer, task) : { score: null, components: [] };
   const grade = readGrade(expected?.grade_path);
   const judge = grade?.verdict ?? null;
+  const usage = readUsage(expected?.raw_jsonl_path ?? root?.attrs?.raw_jsonl_path);
   const success = isOkStatus(root?.status) && answer.length > 0 && Number(root?.attrs?.codex_exit_code ?? 1) === 0;
   const wallClockMs = Number(root?.duration_ms ?? 0);
   const allTools = durationMetrics(commands, wallClockMs);
@@ -416,6 +431,12 @@ function computeRunMetrics(run, task, expected) {
     grade_error: grade ? grade.error ?? null : "missing grade.json (run grade-answer.mjs)",
     keyword_hit_rate: keyword.score,
     keyword_components: keyword.components,
+    input_tokens: usage ? usage.input_tokens : null,
+    cached_input_tokens: usage ? usage.cached_input_tokens : null,
+    output_tokens: usage ? usage.output_tokens : null,
+    reasoning_output_tokens: usage ? usage.reasoning_output_tokens : null,
+    total_tokens: usage ? usage.total_tokens : null,
+    cost_usd: usage ? usage.cost_usd : null,
     tool_execution_ms_sum: allTools.execution_ms_sum,
     tool_wall_union_ms: allTools.wall_union_ms,
     tool_execution_share_pct: allTools.wall_share_pct,
@@ -477,6 +498,12 @@ function missingRunMetrics(run) {
     grade_error: "missing run trace",
     keyword_hit_rate: null,
     keyword_components: [],
+    input_tokens: null,
+    cached_input_tokens: null,
+    output_tokens: null,
+    reasoning_output_tokens: null,
+    total_tokens: null,
+    cost_usd: null,
     tool_execution_ms_sum: null,
     tool_wall_union_ms: null,
     tool_execution_share_pct: null,
@@ -606,6 +633,49 @@ function readGrade(gradePath) {
   }
 }
 
+// Sum token usage from the codex run.jsonl turn.completed event(s) and derive a
+// cost estimate. Mirrors codegraph's cost/token metrics, which they get free
+// from Claude Code's stream-json; codex reports only counts, so cost is an
+// estimate at the configured prices.
+function readUsage(rawJsonlPath) {
+  if (!rawJsonlPath || !fs.existsSync(rawJsonlPath)) return null;
+  let input = 0;
+  let cached = 0;
+  let output = 0;
+  let reasoning = 0;
+  let found = false;
+  for (const line of readText(rawJsonlPath).split(/\r?\n/)) {
+    if (!line.includes("turn.completed")) continue;
+    try {
+      const event = JSON.parse(line);
+      const usage = event?.usage;
+      if (event?.type === "turn.completed" && usage) {
+        input += Number(usage.input_tokens ?? 0);
+        cached += Number(usage.cached_input_tokens ?? 0);
+        output += Number(usage.output_tokens ?? 0);
+        reasoning += Number(usage.reasoning_output_tokens ?? 0);
+        found = true;
+      }
+    } catch {
+      // skip malformed line
+    }
+  }
+  if (!found) return null;
+  const nonCachedInput = Math.max(0, input - cached);
+  const cost = (nonCachedInput / 1e6) * PRICE_INPUT_PER_MTOK
+    + (cached / 1e6) * PRICE_CACHED_PER_MTOK
+    + (output / 1e6) * PRICE_OUTPUT_PER_MTOK;
+  return {
+    input_tokens: input,
+    cached_input_tokens: cached,
+    non_cached_input_tokens: nonCachedInput,
+    output_tokens: output,
+    reasoning_output_tokens: reasoning,
+    total_tokens: input + output,
+    cost_usd: cost,
+  };
+}
+
 function isRefusalTaskDef(task) {
   const flag = task?.refusal_expected;
   return flag === true || flag === "true" || flag === 1;
@@ -659,6 +729,11 @@ function aggregateMetrics(metrics) {
         "judge_complete",
         "judge_grounded",
         "judge_refusal_ok",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_usd",
         "tool_execution_ms_sum",
         "tool_wall_union_ms",
         "tool_execution_share_pct",
@@ -774,6 +849,20 @@ function renderSummary(output) {
     lines.push(`| ${arm} | ${fmt(m.shell_commands)} | ${fmtCI(data.spread?.shell_commands)} | ${fmt(m.indexed_cli_commands)} | ${fmt(m.search_commands)} | ${fmt(m.read_commands)} | ${fmt(m.failed_commands)} | ${fmt(m.indexed_cli_duration_ms_p50)} | ${fmt(m.indexed_cli_duration_ms_p95)} | ${fmt(m.indexed_cli_execution_ms_sum)} | ${fmtPct(m.tool_execution_share_pct)} |`);
   }
   lines.push("");
+
+  lines.push("## Tokens & Cost");
+  lines.push("");
+  lines.push(`Total tokens are exact (codex \`turn.completed\` usage). Cost is an estimate at $${PRICE_INPUT_PER_MTOK}/$${PRICE_CACHED_PER_MTOK}/$${PRICE_OUTPUT_PER_MTOK} per Mtok (input/cached/output) — compare tokens and %-vs-control, not absolute dollars, across tools/models.`);
+  lines.push("");
+  lines.push("| arm | total tokens | 95% CI | input | cached | output | cost $ | 95% CI |");
+  lines.push("|---|---:|:--:|---:|---:|---:|---:|:--:|");
+  for (const arm of arms) {
+    const data = output.aggregate[arm];
+    const m = data.medians;
+    lines.push(`| ${arm} | ${fmt(m.total_tokens)} | ${fmtCI(data.spread?.total_tokens)} | ${fmt(m.input_tokens)} | ${fmt(m.cached_input_tokens)} | ${fmt(m.output_tokens)} | ${fmtUsd(m.cost_usd)} | ${fmtCI(data.spread?.cost_usd)} |`);
+  }
+  lines.push("");
+
   lines.push("## Diagnostic Wall Clock");
   lines.push("");
   lines.push("| arm | wall ms median | non-tool wall ms median | tool sum share | answer chars median |");
@@ -841,6 +930,10 @@ function fmtPct(value) {
 
 function rateToPct(value) {
   return value === null || value === undefined ? null : Number(value) * 100;
+}
+
+function fmtUsd(value) {
+  return value === null || value === undefined ? "" : `$${Number(value).toFixed(4).replace(/0+$/, "").replace(/\.$/, "")}`;
 }
 
 function fmtCI(spreadObj) {

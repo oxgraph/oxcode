@@ -54,9 +54,9 @@ CORPUS="${CORPUS:-$OUT/corpus}"
 mkdir -p "$OUT/bin/oxcode" "$OUT/bin/codegraph" "$OUT/runs" "$CORPUS/sources"
 
 echo "### benchmark suite $SUITE_ID RUNS=$RUNS"
-echo "### building oxcode"
-cargo build -p oxcode
-ln -sf "$ROOT/target/debug/oxcode" "$OUT/bin/oxcode/oxcode"
+echo "### building oxcode (release — debug is ~21x slower per query and tanks the latency/token metrics)"
+cargo build --release -p oxcode
+ln -sf "$ROOT/target/release/oxcode" "$OUT/bin/oxcode/oxcode"
 
 ARMS=("empty" "oxcode-cli")
 if [ -n "${CODEGRAPH_BIN:-}" ]; then
