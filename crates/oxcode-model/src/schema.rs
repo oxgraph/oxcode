@@ -14,6 +14,17 @@ pub enum PropertyKind {
 
 /// Catalog name of the `calls` graph projection.
 pub const CALLS_PROJECTION: &str = "calls";
+
+/// Returns the catalog name of the graph projection for `edge_kind`. The
+/// `calls` projection keeps its historical name; every other kind is
+/// `edges_<kind>`, so navigation can traverse any code edge kind.
+#[must_use]
+pub fn projection_name(edge_kind: crate::EdgeKind) -> String {
+    match edge_kind {
+        crate::EdgeKind::Calls => CALLS_PROJECTION.to_owned(),
+        other => format!("edges_{}", other.as_str()),
+    }
+}
 /// Role name for the source endpoint of a relation.
 pub const SOURCE_ROLE: &str = "source";
 /// Role name for the target endpoint of a relation.
@@ -156,12 +167,11 @@ impl ElementProperty {
 /// A property attached to graph relations (edges).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationProperty {
+    /// Deterministic, per-edge identity key used to resolve-or-mint the relation
+    /// across reindexes (the relation analogue of [`ElementProperty::StableKey`]).
+    EdgeStableKey,
     /// Edge kind spelling.
     EdgeKind,
-    /// Source symbol key.
-    SourceKey,
-    /// Target symbol key.
-    TargetKey,
     /// How the edge target was resolved.
     Resolution,
     /// Reference-site file path.
@@ -185,9 +195,8 @@ pub enum RelationProperty {
 impl RelationProperty {
     /// Every relation property, in registration order.
     pub const ALL: &'static [Self] = &[
+        Self::EdgeStableKey,
         Self::EdgeKind,
-        Self::SourceKey,
-        Self::TargetKey,
         Self::Resolution,
         Self::SiteFilePath,
         Self::SiteStartByte,
@@ -203,9 +212,8 @@ impl RelationProperty {
     #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
+            Self::EdgeStableKey => "edge_stable_key",
             Self::EdgeKind => "edge_kind",
-            Self::SourceKey => "source_key",
-            Self::TargetKey => "target_key",
             Self::Resolution => "resolution",
             Self::SiteFilePath => "site_file_path",
             Self::SiteStartByte => "site_start_byte",

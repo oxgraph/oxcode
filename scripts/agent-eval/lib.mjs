@@ -159,6 +159,50 @@ export function median(values) {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
+// Two-sided 95% Student-t multipliers by degrees of freedom (n - 1). Agent runs
+// are few and high-variance, so a normal-approx CI understates the interval at
+// small n; fall back to the large-sample 1.96 only past the table.
+const T95_BY_DF = {
+  1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+  8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042,
+};
+
+function tMultiplier95(df) {
+  if (df <= 0) return null;
+  if (T95_BY_DF[df] !== undefined) return T95_BY_DF[df];
+  for (const key of Object.keys(T95_BY_DF).map(Number).sort((a, b) => a - b)) {
+    if (df <= key) return T95_BY_DF[key];
+  }
+  return 1.96;
+}
+
+// Mean, sample stddev, range, and a Student-t 95% CI for a metric across runs.
+// Reported alongside the median so a "12% better" headline can be read against
+// its spread instead of taken as point truth.
+export function spread(values) {
+  const nums = values.filter((value) => Number.isFinite(value));
+  const n = nums.length;
+  if (n === 0) {
+    return { n: 0, mean: null, stddev: null, min: null, max: null, ci95_lo: null, ci95_hi: null, ci95_half: null };
+  }
+  const mean = nums.reduce((sum, value) => sum + value, 0) / n;
+  const stddev = n >= 2
+    ? Math.sqrt(nums.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (n - 1))
+    : null;
+  const t = n >= 2 ? tMultiplier95(n - 1) : null;
+  const half = stddev !== null && t !== null ? (t * stddev) / Math.sqrt(n) : null;
+  return {
+    n,
+    mean,
+    stddev,
+    min: Math.min(...nums),
+    max: Math.max(...nums),
+    ci95_half: half,
+    ci95_lo: half !== null ? mean - half : null,
+    ci95_hi: half !== null ? mean + half : null,
+  };
+}
+
 export function commandExecutable(command) {
   if (!command || typeof command !== "string") return "";
   let value = command.trim();

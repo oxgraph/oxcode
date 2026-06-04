@@ -207,7 +207,7 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
         .assert()
         .failure()
         .stderr(contains(
-            "query expects OxQL/Cypher; use oxcode symbols for keyword discovery",
+            "query expects OxQL; use oxcode symbols for keyword discovery",
         ));
 }
 

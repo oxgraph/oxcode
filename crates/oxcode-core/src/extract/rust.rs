@@ -3,7 +3,7 @@
 //! structure from raw node text — method names, impl types, traits, and import
 //! paths all come from typed field children.
 
-use std::{path::Path, str};
+use std::{collections::BTreeMap, path::Path, str};
 
 use oxcode_model::{
     EdgeKind, Extraction, FileParseStatus, LanguageId, NodeKind, ReferenceKind, ReferenceTarget,
@@ -99,6 +99,7 @@ fn extract_rust(
         nodes: vec![file_node],
         edges: Vec::new(),
         references: Vec::new(),
+        ordinals: BTreeMap::new(),
     };
 
     walker.visit_children(
@@ -134,6 +135,9 @@ struct RustWalker<'source> {
     nodes: Vec<SymbolNode>,
     edges: Vec<SymbolEdge>,
     references: Vec<UnresolvedReference>,
+    /// Per-`(file, kind, qualified_name)` occurrence counter used to assign a
+    /// byte-offset-independent ordinal to each symbol's stable key.
+    ordinals: BTreeMap<String, u32>,
 }
 
 /// Traversal state threaded through the walker: the containing symbol
@@ -382,13 +386,23 @@ impl RustWalker<'_> {
     /// Pushes one symbol and returns a clone for immediate edge wiring.
     fn push_symbol(&mut self, node: &Node, spec: SymbolSpec<'_>) -> SymbolNode {
         let span = span(node);
-        let stable_key = format!(
-            "symbol:{}:{}:{}:{}",
+        // Identity is byte-offset independent: an edit that only shifts a
+        // symbol's position leaves its stable key unchanged. Symbols sharing a
+        // (file, kind, qualified name) triple are disambiguated by a stable
+        // declaration-order ordinal rather than their start byte.
+        let prefix = format!(
+            "symbol:{}:{}:{}",
             self.file_path,
             spec.kind.as_str(),
-            spec.qualified_name,
-            span.start_byte
+            spec.qualified_name
         );
+        let ordinal = {
+            let counter = self.ordinals.entry(prefix.clone()).or_insert(0);
+            let current = *counter;
+            *counter += 1;
+            current
+        };
+        let stable_key = format!("{prefix}#{ordinal}");
         let symbol = SymbolNode {
             stable_key,
             name: spec.name.to_string(),
@@ -867,6 +881,27 @@ mod tests {
             .iter()
             .find(|reference| reference.text.contains(text_contains))
             .unwrap_or_else(|| panic!("no reference containing {text_contains:?}"))
+    }
+
+    #[test]
+    fn stable_keys_survive_byte_shifting_edits() {
+        let key_of = |extraction: &Extraction, name: &str| -> String {
+            extraction
+                .nodes
+                .iter()
+                .find(|node| node.name == name && node.kind == NodeKind::Function)
+                .unwrap_or_else(|| panic!("symbol {name}"))
+                .stable_key
+                .clone()
+        };
+        let original = extract("fn alpha() {}\nfn beta() {}\n");
+        // Prepend a comment so every byte offset shifts while declaration order
+        // is unchanged; a byte-offset-independent key must be unaffected.
+        let edited =
+            extract("// a leading comment that shifts every byte\nfn alpha() {}\nfn beta() {}\n");
+        assert_eq!(key_of(&original, "alpha"), key_of(&edited, "alpha"));
+        assert_eq!(key_of(&original, "beta"), key_of(&edited, "beta"));
+        assert!(key_of(&original, "alpha").ends_with("#0"));
     }
 
     #[test]

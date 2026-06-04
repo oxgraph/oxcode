@@ -4,30 +4,54 @@ tasks:
     repo: tokio
     repo_url: https://github.com/tokio-rs/tokio.git
     question: "How does tokio schedule and run async tasks on its runtime?"
-    required_concepts: [runtime, schedule, task]
-    expected_files: [tokio/src/runtime]
-    expected_symbols: []
+    required_concepts: [runtime, scheduler, task, poll]
+    expected_files: [tokio/src/runtime/scheduler, tokio/src/runtime/task]
+    expected_symbols: [Runtime, spawn, block_on, JoinHandle]
+    reference: "The Runtime owns a scheduler (current_thread, or the multi_thread work-stealing scheduler with per-worker run queues plus a global inject queue). spawn creates a Task with a JoinHandle, block_on drives the root future, workers poll task futures and steal from peers when idle, and a Waker reschedules a task onto a run queue when its resource becomes ready via the I/O driver."
 
   - id: ripgrep-ignore-discovery
     repo: ripgrep
     repo_url: https://github.com/BurntSushi/ripgrep.git
     question: "How does ripgrep discover files and apply ignore rules before searching?"
-    required_concepts: [ignore, files, search]
-    expected_files: [crates]
-    expected_symbols: []
+    required_concepts: [ignore, gitignore, walk, traversal]
+    expected_files: [crates/ignore, crates/ignore/src/walk.rs]
+    expected_symbols: [WalkBuilder, Walk, WalkParallel, Gitignore]
+    reference: "The ignore crate drives file discovery. WalkBuilder configures a recursive directory walk (Walk or the parallel WalkParallel), layering ignore matchers from .gitignore, .ignore, global and parent gitignores, and hidden/file-type filters, so each directory entry is tested against the accumulated ignore rules before it is yielded to the searcher."
 
   - id: hyper-connection-dispatch
     repo: hyper
     repo_url: https://github.com/hyperium/hyper.git
     question: "How does hyper accept a connection and dispatch requests to a service?"
-    required_concepts: [connection, request, service]
-    expected_files: [src]
-    expected_symbols: []
+    required_concepts: [connection, request, service, dispatch]
+    expected_files: [src/proto, src/server, src/service]
+    expected_symbols: [Dispatcher, Service, conn]
+    reference: "A server connection is built over an IO via the server conn module, which wires the protocol state machine (proto, e.g. h1 dispatch or h2) to a Service. The Dispatcher reads requests off the connection, calls the Service to produce a response future, and writes the response back, driving the connection as a future until it closes."
 
   - id: cargo-resolve-build
     repo: cargo
     repo_url: https://github.com/rust-lang/cargo.git
     question: "How does Cargo resolve dependencies and build a package?"
-    required_concepts: [resolve, dependencies, build]
-    expected_files: [src/cargo]
+    required_concepts: [resolve, dependencies, build, compile]
+    expected_files: [src/cargo/core/resolver, src/cargo/core/compiler, src/cargo/ops]
+    expected_symbols: [resolve, Resolve, Workspace, compile]
+    reference: "Cargo reads the manifest and workspace, then the resolver computes a dependency graph (a Resolve) by selecting compatible versions from the registry/lockfile. ops then turns the resolved graph into a build plan and the compiler module drives rustc invocations in dependency order, with a job queue and fingerprinting to skip unchanged units."
+
+  - id: tokio-nonexistent-scheduler
+    repo: tokio
+    repo_url: https://github.com/tokio-rs/tokio.git
+    question: "How does tokio's GreenThreadScheduler decide when to preempt a running task, and which file defines its preemption budget?"
+    refusal_expected: true
+    required_concepts: []
+    expected_files: []
     expected_symbols: []
+    reference: "There is no GreenThreadScheduler in tokio. Its runtime schedulers are current_thread and multi_thread. A correct answer says no such type exists rather than inventing its behavior."
+
+  - id: ripgrep-nonexistent-gpu-flag
+    repo: ripgrep
+    repo_url: https://github.com/BurntSushi/ripgrep.git
+    question: "How does ripgrep's --gpu flag offload regex matching to the GPU, and where is the CUDA kernel defined?"
+    refusal_expected: true
+    required_concepts: []
+    expected_files: []
+    expected_symbols: []
+    reference: "ripgrep has no --gpu flag and no GPU/CUDA code; matching runs on the CPU via the regex engine. A correct answer says the flag does not exist rather than inventing a kernel."

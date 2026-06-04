@@ -60,6 +60,36 @@ Accepted OxQL profile:
 - `MATCH RELATIONS TYPE <type>`
 - `GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]`
 
+## Benchmarks
+
+Agent-task benchmark on the Tokio codebase: an agent answers *"How does tokio
+schedule and run async tasks?"* with and without each tool, measuring efficiency
+and blind-judged answer quality. oxcode and codegraph were measured on different
+agent harnesses, so the comparable unit is each tool's improvement **vs its own
+no-tool baseline**, not absolute numbers.
+
+| arm | answer quality | tokens | cost | tool calls | wall time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline (no tool) | 0.97 | — | — | — | — |
+| **oxcode** — codex/gpt-5.5, CLI, n=6 | 0.97 (tied) | −5% | −19% | −23% | −10% |
+| codegraph — Opus 4.8, MCP, published | not measured | −38% | even | −57% | −18% |
+
+Percentages are reductions vs that tool's own no-tool baseline (lower is better;
+quality is the blind LLM-judge score, higher is better). Absolute medians for our
+two arms: tokens 431k → 410k, cost ~$0.19 → ~$0.16, shell commands 30 → 23, wall
+104s → 93s, oxcode query p50 931 ms.
+
+oxcode improves on every efficiency axis while **holding answer quality** — the
+quality gate guards against "cheaper because the agent gave up sooner," which
+codegraph's benchmark does not measure. codegraph's larger reductions come mostly
+from its one-call MCP `codegraph_explore` tool versus oxcode's multi-command CLI;
+closing that gap is a matter of tool delivery, not index quality. codegraph
+numbers are from its README, re-validated 2026-06-02.
+
+Full methodology, confidence intervals, and reproduction:
+[`docs/agent-eval-results.md`](docs/agent-eval-results.md) and
+[`docs/agent-eval-methodology.md`](docs/agent-eval-methodology.md).
+
 ## Architecture
 
 The workspace uses a hybrid Rust architecture:

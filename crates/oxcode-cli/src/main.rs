@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use oxcode_core::{
-    Error, GraphDirection, NodeKind, OxQueryLanguage, OxQueryResult, ProjectIndex, SymbolReport,
-    SymbolSummary, format_call_graph_report, format_context_report, format_expanded_query_report,
+    Error, GraphDirection, NodeKind, OxQueryResult, ProjectIndex, SymbolReport, SymbolSummary,
+    format_call_graph_report, format_context_report, format_expanded_query_report,
     format_file_search_report, format_query_value, format_selector_matches,
     format_selector_not_found, format_symbol_report, format_symbol_search_report, index_project,
     language_support, project_status,
@@ -52,22 +52,6 @@ struct WalkArgs {
     limit: usize,
     #[command(flatten)]
     common: CommonArgs,
-}
-
-/// Query language accepted by `query`/`explain`.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum QueryLang {
-    Oxql,
-    Cypher,
-}
-
-impl QueryLang {
-    const fn into_language(self) -> OxQueryLanguage {
-        match self {
-            Self::Oxql => OxQueryLanguage::Oxql,
-            Self::Cypher => OxQueryLanguage::Cypher,
-        }
-    }
 }
 
 /// Output format for `query`.
@@ -127,9 +111,6 @@ enum Command {
         query: String,
         #[command(flatten)]
         path: PathArg,
-        /// Query language.
-        #[arg(long, value_enum, default_value_t = QueryLang::Oxql)]
-        language: QueryLang,
         /// Output format.
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
@@ -217,9 +198,6 @@ enum Command {
         query: String,
         #[command(flatten)]
         path: PathArg,
-        /// Query language.
-        #[arg(long, value_enum, default_value_t = QueryLang::Oxql)]
-        language: QueryLang,
     },
 }
 
@@ -310,27 +288,25 @@ fn run() -> Result<()> {
         Command::Query {
             query,
             path,
-            language,
             format,
             json: _json,
         } => {
-            ensure_raw_query(language, &query)?;
+            ensure_raw_query(&query)?;
             let index = ProjectIndex::open(&path.path)?;
-            let language = language.into_language();
             match format {
                 OutputFormat::Expand => {
-                    let report = index.query_expanded(language, &query)?;
+                    let report = index.query_expanded(&query)?;
                     println!("{}", format_expanded_query_report(&report));
                 }
                 OutputFormat::Table => {
                     let rows = index
-                        .query(language, &query)
+                        .query(&query)
                         .with_context(|| format!("executing query {query:?}"))?;
                     print_query_table(&rows);
                 }
                 OutputFormat::Json => {
                     let rows = index
-                        .query(language, &query)
+                        .query(&query)
                         .with_context(|| format!("executing query {query:?}"))?;
                     println!("{}", serde_json::to_string_pretty(&rows)?);
                 }
@@ -389,14 +365,9 @@ fn run() -> Result<()> {
         Command::Walk { args, direction } => {
             print_call_graph_resolution(&args, direction.into_graph())?
         }
-        Command::Explain {
-            query,
-            path,
-            language,
-        } => {
-            ensure_raw_query(language, &query)?;
-            let report =
-                ProjectIndex::open(&path.path)?.explain(language.into_language(), &query)?;
+        Command::Explain { query, path } => {
+            ensure_raw_query(&query)?;
+            let report = ProjectIndex::open(&path.path)?.explain(&query)?;
             println!("{report}");
         }
     }
@@ -514,15 +485,12 @@ fn print_selector_not_found(selector: &str, json: bool) -> Result<()> {
 }
 
 /// Rejects obvious keyword search text passed to raw query commands.
-fn ensure_raw_query(language: QueryLang, query: &str) -> Result<()> {
+fn ensure_raw_query(query: &str) -> Result<()> {
     let first = query.split_whitespace().next().unwrap_or_default();
     let first = first.to_ascii_uppercase();
-    let looks_structured = match language {
-        QueryLang::Oxql => matches!(first.as_str(), "CATALOG" | "MATCH" | "GRAPH"),
-        QueryLang::Cypher => first == "MATCH",
-    };
+    let looks_structured = matches!(first.as_str(), "CATALOG" | "MATCH" | "GRAPH");
     if !looks_structured {
-        bail!("query expects OxQL/Cypher; use oxcode symbols for keyword discovery");
+        bail!("query expects OxQL; use oxcode symbols for keyword discovery");
     }
     Ok(())
 }
