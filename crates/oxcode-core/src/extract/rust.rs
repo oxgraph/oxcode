@@ -9,13 +9,14 @@ use oxcode_model::{
     EdgeKind, Extraction, FileParseStatus, LanguageId, NodeKind, ReferenceKind, ReferenceTarget,
     SymbolNode,
 };
-use tree_sitter_language_pack::{Node, Tree};
+use tree_sitter::{Node, Tree};
 
 use crate::{
     error::{Error, Result},
     extract::{
         ExtractionInput, LanguageExtractor,
         cst::{field, named_children, node_text, span},
+        grammar,
         scope::{RustScope, ScopeStrategy},
         walker::{
             CommentStrategy, ReferenceSpan, SymbolBuilder, SymbolFields, SymbolSpec, bounded_text,
@@ -38,10 +39,6 @@ impl LanguageExtractor for RustExtractor {
         &["rs"]
     }
 
-    fn parser_name(&self) -> &'static str {
-        PARSER_NAME
-    }
-
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction> {
         let scope = RustScope.base_scope(input.path, &input.relative_path);
         let tree = parse_rust(input.path, &input.source)?;
@@ -54,17 +51,12 @@ impl LanguageExtractor for RustExtractor {
     }
 }
 
-/// tree-sitter-language-pack parser name for Rust.
+/// Grammar name for Rust.
 const PARSER_NAME: &str = "rust";
 
 /// Parses Rust source into a syntax tree.
 fn parse_rust(path: &Path, source: &[u8]) -> Result<Tree> {
-    let mut parser =
-        tree_sitter_language_pack::get_parser(PARSER_NAME).map_err(|error| Error::Parse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    parser.parse_bytes(source).ok_or_else(|| Error::Parse {
+    grammar::parse(PARSER_NAME, source).ok_or_else(|| Error::Parse {
         path: path.to_path_buf(),
         message: "tree-sitter returned no parse tree".to_string(),
     })
@@ -161,7 +153,7 @@ impl RustWalker<'_> {
 
     /// Visits one CST node, emitting graph data when it represents code intent.
     fn visit_node(&mut self, node: &Node, ctx: VisitContext<'_>) {
-        match node.kind().as_str() {
+        match node.kind() {
             "mod_item" => self.visit_module(node, ctx),
             "struct_item" => self.visit_named(node, ctx, NodeKind::Struct, "struct_item"),
             "union_item" => self.visit_named(node, ctx, NodeKind::Struct, "union_item"),
@@ -500,7 +492,7 @@ fn callee_target(
     source: &[u8],
     owner_type: Option<&str>,
 ) -> Option<ReferenceTarget> {
-    match function.kind().as_str() {
+    match function.kind() {
         "identifier" => {
             let name = clean_identifier(node_text(function, source));
             (!name.is_empty())
@@ -590,7 +582,7 @@ fn impl_trait_name(node: &Node, source: &[u8]) -> Option<String> {
 
 /// Descends a type node to a stable, deterministic base name.
 fn base_type_name(node: &Node, source: &[u8]) -> Option<String> {
-    match node.kind().as_str() {
+    match node.kind() {
         "type_identifier" | "identifier" | "primitive_type" => {
             let text = clean_identifier(node_text(node, source));
             (!text.is_empty()).then_some(text)
@@ -626,7 +618,7 @@ fn base_type_name(node: &Node, source: &[u8]) -> Option<String> {
 /// Walks a `use` argument subtree into one reference target per imported leaf,
 /// accumulating the path prefix so each leaf carries its full path segments.
 fn use_targets(node: &Node, prefix: &[String], source: &[u8]) -> Vec<ReferenceTarget> {
-    match node.kind().as_str() {
+    match node.kind() {
         "scoped_identifier" => {
             let Some(name) = field(node, "name")
                 .map(|node| clean_identifier(node_text(&node, source)))

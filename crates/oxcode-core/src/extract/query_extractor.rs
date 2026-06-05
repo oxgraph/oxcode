@@ -7,9 +7,8 @@
 //! is lower than a hand-written extractor (references resolve only at the
 //! scoped/simple tiers), but adding a language costs only a query and a profile.
 //!
-//! The pack's `Node` hides the raw `tree_sitter::Node`, so this path parses with
-//! the `tree-sitter` crate directly, using the pack purely as the grammar
-//! provider via [`tree_sitter_language_pack::get_language`].
+//! The grammar comes from the statically-linked [`crate::extract::grammar`]
+//! registry; this path runs a `tree_sitter::Query` against the parse tree.
 
 use std::{path::Path, sync::OnceLock};
 
@@ -23,7 +22,7 @@ use tree_sitter::{Node, Parser, Query, QueryCursor};
 use crate::{
     error::{Error, Result},
     extract::{
-        ExtractionInput, LanguageExtractor,
+        ExtractionInput, LanguageExtractor, grammar,
         profile::{CaptureRole, LanguageProfile},
         scope,
         walker::{
@@ -70,13 +69,10 @@ impl QueryExtractor {
 
     /// Compiles the grammar and query and resolves the capture-role table.
     fn build_compiled(&self, path: &Path) -> Result<Compiled> {
-        let language =
-            tree_sitter_language_pack::get_language(self.profile.parser_name).map_err(|error| {
-                Error::Parse {
-                    path: path.to_path_buf(),
-                    message: format!("grammar {:?}: {error}", self.profile.parser_name),
-                }
-            })?;
+        let language = grammar::language(self.profile.parser_name).ok_or_else(|| Error::Parse {
+            path: path.to_path_buf(),
+            message: format!("no bundled grammar {:?}", self.profile.parser_name),
+        })?;
         let query =
             Query::new(&language, self.profile.query_source).map_err(|error| Error::Parse {
                 path: path.to_path_buf(),
@@ -102,10 +98,6 @@ impl LanguageExtractor for QueryExtractor {
 
     fn extensions(&self) -> &'static [&'static str] {
         self.profile.extensions
-    }
-
-    fn parser_name(&self) -> &'static str {
-        self.profile.parser_name
     }
 
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction> {

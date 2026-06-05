@@ -33,7 +33,7 @@ pub(crate) struct LanguageProfile {
     pub(crate) language_id: &'static str,
     /// File extensions owned by this profile.
     pub(crate) extensions: &'static [&'static str],
-    /// tree-sitter-language-pack grammar name.
+    /// Grammar name (see [`crate::extract::grammar`]).
     pub(crate) parser_name: &'static str,
     /// The symbol-extraction query (`include_str!` of a `.scm` file).
     pub(crate) query_source: &'static str,

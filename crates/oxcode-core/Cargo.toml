@@ -2,17 +2,19 @@
 name = "oxcode-core"
 version = "0.1.0"
 description = "OxGraph-native code indexing and navigation engine."
-publish = false
+categories = ["development-tools"]
 
 authors.workspace = true
 edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 ignore.workspace = true
-oxcode-model = { path = "../oxcode-model" }
+oxcode-model = { path = "../oxcode-model", version = "0.1.0" }
 oxgraph.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,7 +22,25 @@ streaming-iterator.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
-tree-sitter-language-pack.workspace = true
+tree-sitter-c = "0.24.2"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-dart = "0.2.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-lua = "0.5.0"
+tree-sitter-luau = "1.2.0"
+tree-sitter-objc = "3.0.2"
+tree-sitter-pascal = "0.10.2"
+tree-sitter-php = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-scala = "0.26.0"
+tree-sitter-swift = "0.7.3"
+tree-sitter-typescript = "0.23.2"
 
 [dev-dependencies]
 tempfile.workspace = true

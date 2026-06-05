@@ -10,6 +10,59 @@ with `context`, `symbols`, `files`, and the call graph commands because they
 expand graph IDs back into function names, definition ranges, signatures,
 docstrings, source previews, and call-site source context.
 
+## Get Started
+
+### 1. Install
+
+**Prebuilt binary** (recommended — no Rust toolchain, grammars are statically
+linked so it runs offline):
+
+```sh
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/oxgraph/oxcode/releases/latest/download/oxcode-cli-installer.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/oxgraph/oxcode/releases/latest/download/oxcode-cli-installer.ps1 | iex"
+```
+
+Or download an archive from the [Releases](https://github.com/oxgraph/oxcode/releases)
+page. **With Cargo** instead:
+
+```sh
+cargo binstall oxcode-cli   # prebuilt, no compile
+cargo install  oxcode-cli   # build from source
+```
+
+This installs one `oxcode` binary — the CLI plus the MCP server (`oxcode mcp`).
+(The crate is `oxcode-cli` because the bare `oxcode` name is taken on crates.io;
+the command is still `oxcode`.)
+
+### 2. Index a project
+
+```sh
+cd your-project
+oxcode index
+oxcode context "How does authentication work?"
+```
+
+### 3. Wire up an agent (MCP)
+
+Add the server to your agent. For Claude Code (`~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "oxcode": { "type": "stdio", "command": "oxcode", "args": ["mcp"] }
+  }
+}
+```
+
+Optionally auto-allow the read-only tools in `~/.claude/settings.json`:
+`mcp__oxcode__oxcode_explore`, `_search`, `_callers`, `_callees`, `_symbol`,
+`_files`, `_status`.
+
 ## How Indexing Works
 
 1. **Extraction** — tree-sitter parses each source file into a syntax tree. A
@@ -76,18 +129,18 @@ high fidelity is a hand-written extractor that reuses the shared
 ## Quick Start
 
 ```sh
-cargo run -p oxcode -- index --path path/to/rust/project
-cargo run -p oxcode -- status --path path/to/rust/project
-cargo run -p oxcode -- context "How does entry reach helper?" --path path/to/rust/project --limit 8 --json
-cargo run -p oxcode -- symbols "entry helper" --path path/to/rust/project --limit 20 --json
-cargo run -p oxcode -- symbols "entry helper" --path path/to/rust/project --kind function --kind method
-cargo run -p oxcode -- files "runtime scheduler" --path path/to/rust/project --limit 20 --json
-cargo run -p oxcode -- symbol crate::entry --path path/to/rust/project --json
-cargo run -p oxcode -- calls crate::entry --depth 2 --path path/to/rust/project
-cargo run -p oxcode -- callers crate::helper --depth 2 --path path/to/rust/project
-cargo run -p oxcode -- query "MATCH ELEMENTS WHERE qualified_name = 'crate::entry'" --path path/to/rust/project
-cargo run -p oxcode -- query "MATCH RELATIONS TYPE calls" --format expand --path path/to/rust/project
-cargo run -p oxcode -- query "GRAPH calls WALK FROM 12 DEPTH 2 DIRECTION both LIMIT 100" --path path/to/rust/project
+oxcode index --path path/to/rust/project
+oxcode status --path path/to/rust/project
+oxcode context "How does entry reach helper?" --path path/to/rust/project --limit 8 --json
+oxcode symbols "entry helper" --path path/to/rust/project --limit 20 --json
+oxcode symbols "entry helper" --path path/to/rust/project --kind function --kind method
+oxcode files "runtime scheduler" --path path/to/rust/project --limit 20 --json
+oxcode symbol crate::entry --path path/to/rust/project --json
+oxcode calls crate::entry --depth 2 --path path/to/rust/project
+oxcode callers crate::helper --depth 2 --path path/to/rust/project
+oxcode query "MATCH ELEMENTS WHERE qualified_name = 'crate::entry'" --path path/to/rust/project
+oxcode query "MATCH RELATIONS TYPE calls" --format expand --path path/to/rust/project
+oxcode query "GRAPH calls WALK FROM 12 DEPTH 2 DIRECTION both LIMIT 100" --path path/to/rust/project
 ```
 
 The generated `.oxcode/` directory writes its own `.gitignore`, so the index is
@@ -169,10 +222,10 @@ The workspace uses a hybrid Rust architecture:
   grammar, the extraction/resolution IR, and agent-facing report DTOs
 - `oxcode-core`: indexing, extraction, reference resolution, OxGraph storage,
   navigation, formatting, and the public `ProjectIndex` facade
-- `oxcode`: thin CLI package and binary
-- `oxcode-mcp`: MCP server (stdio) exposing oxcode's read-only queries to coding
-  agents — the one-call `oxcode_explore` tool plus `oxcode_search`,
-  `oxcode_callers`/`oxcode_callees`, `oxcode_symbol`, `oxcode_files`, `oxcode_status`
+- `oxcode-cli`: the `oxcode` binary — the CLI commands plus the `oxcode mcp`
+  subcommand, an MCP server (stdio) exposing oxcode's read-only queries to coding
+  agents (the one-call `oxcode_explore` tool plus `oxcode_search`,
+  `oxcode_callers`/`oxcode_callees`, `oxcode_symbol`, `oxcode_files`, `oxcode_status`)
 
 `oxcode-core` is split into focused internal modules: `scan`, `extract` (with
 per-language extractors and shared CST/cargo helpers), `resolve`,
@@ -183,5 +236,7 @@ through `ProjectIndex`, which opens the database once and resolves the
 property-key schema; `ProjectIndex::with_session` runs several reads against one
 shared snapshot so multi-step navigation stays internally consistent.
 
-Rust is the only shipped extractor. There is no fallback extractor for other
-languages.
+The `extract` module hosts the hand-written extractors (Rust, Go,
+TypeScript/JavaScript), the generic query-driven extractor with its per-language
+`.scm` queries and profiles, the Svelte/Vue embedded-script host, and the
+statically-linked `grammar` registry. See the Languages table above.

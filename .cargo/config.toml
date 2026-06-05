@@ -1,8 +1,0 @@
-# Statically compile the tree-sitter grammars oxcode indexes into the binary at
-# build time, instead of relying on tree-sitter-language-pack's runtime download
-# (which is not reproducible and fails offline / in CI for the less-common
-# grammars). Sources are fetched once at build time; the result is offline and
-# deterministic at runtime.
-[env]
-TSLP_LANGUAGES = "rust,go,typescript,tsx,javascript,python,java,c,cpp,csharp,php,ruby,swift,kotlin,scala,dart,lua,luau,objc,pascal,svelte,vue"
-TSLP_LINK_MODE = "static"

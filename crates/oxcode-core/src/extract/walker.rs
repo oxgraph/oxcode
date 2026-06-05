@@ -17,7 +17,7 @@ use oxcode_model::{
     EdgeKind, LanguageId, NodeKind, ReferenceKind, ReferenceTarget, SourceSpan, SourceUnit,
     SymbolEdge, SymbolNode, UnresolvedReference,
 };
-use tree_sitter_language_pack::Node;
+use tree_sitter::Node;
 
 use crate::extract::cst::{named_children, node_text};
 
@@ -164,7 +164,7 @@ pub(crate) fn field_name(node: &Node, source: &[u8], identifier_kinds: &[&str]) 
         }
     }
     for child in named_children(node) {
-        if identifier_kinds.contains(&child.kind().as_str()) {
+        if identifier_kinds.contains(&child.kind()) {
             let text = clean_identifier(node_text(&child, source));
             if !text.is_empty() {
                 return Some(text);

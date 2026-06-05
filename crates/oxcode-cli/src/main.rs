@@ -1,5 +1,7 @@
 //! Command-line interface for `oxcode`.
 
+mod mcp;
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +16,7 @@ use oxcode_core::{
 
 /// Generate and query code graphs stored in a native OxGraph database.
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(name = "oxcode", author, version, about)]
 struct Cli {
     /// Command to run.
     #[command(subcommand)]
@@ -102,6 +104,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run the MCP server over stdio (for coding agents).
+    Mcp,
     /// Execute an OxGraph database query.
     #[command(
         long_about = "Execute a raw OxGraph database query.\n\nAccepted OxQL profile:\n  CATALOG\n  MATCH ELEMENTS\n  MATCH ELEMENTS HAS LABEL <label>\n  MATCH ELEMENTS WHERE <property> = '<value>'\n  MATCH RELATIONS TYPE <type>\n  GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]\n\nUse `oxcode symbols <keywords>` for keyword discovery."
@@ -375,6 +379,7 @@ fn run() -> Result<()> {
             let report = ProjectIndex::open(&path.path)?.explain(&query)?;
             println!("{report}");
         }
+        Command::Mcp => mcp::serve()?,
     }
     Ok(())
 }
