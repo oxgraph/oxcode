@@ -841,8 +841,11 @@ dependencies = [
  "clap",
  "oxcode-core",
  "predicates",
+ "rmcp",
+ "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -878,18 +881,6 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-swift",
  "tree-sitter-typescript",
-]
-
-[[package]]
-name = "oxcode-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "oxcode-core",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

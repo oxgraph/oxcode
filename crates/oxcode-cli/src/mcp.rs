@@ -1,16 +1,32 @@
-//! The oxcode MCP server: tools mapped onto `oxcode_core::ProjectIndex`.
+//! The `oxcode mcp` server: tools mapped onto `oxcode_core::ProjectIndex`.
+//!
+//! Exposes oxcode's read-only queries to coding agents over MCP (stdio). Run it
+//! with `oxcode mcp`; configure your agent to launch that command.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use oxcode_core::{GraphDirection, NodeKind, ProjectIndex};
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
+    transport::stdio,
 };
 use serde::Deserialize;
 use tokio::sync::Mutex;
+
+/// Runs the MCP server over stdio until the client disconnects.
+pub(crate) fn serve() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let service = OxcodeServer::new().serve(stdio()).await?;
+        service.waiting().await?;
+        Ok(())
+    })
+}
 
 /// Server instructions steering agents to the one-call `oxcode_explore` tool.
 const INSTRUCTIONS: &str = "This server answers questions about the indexed code repository in the \
@@ -23,7 +39,7 @@ shelling out to grep or reading files. Do not edit files.";
 
 /// MCP server over oxcode's read-only queries, caching one opened index per root.
 #[derive(Clone)]
-pub struct OxcodeServer {
+pub(crate) struct OxcodeServer {
     #[expect(
         dead_code,
         reason = "stored per rmcp's #[tool_router] convention; the #[tool_handler]-generated request router reads it through macro-expanded code the dead-code pass does not attribute"
@@ -34,7 +50,7 @@ pub struct OxcodeServer {
 
 /// A code question to answer in one curated call.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ExploreParams {
+pub(crate) struct ExploreParams {
     /// The task or question about the codebase, in natural language.
     pub query: String,
     /// Project root; defaults to the server's working directory.
@@ -45,7 +61,7 @@ pub struct ExploreParams {
 
 /// A keyword search over indexed symbols.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SearchParams {
+pub(crate) struct SearchParams {
     /// Keywords matched against symbol names, signatures, and docs.
     pub query: String,
     /// Project root; defaults to the server's working directory.
@@ -58,7 +74,7 @@ pub struct SearchParams {
 
 /// A call-graph query around one symbol selector.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CallParams {
+pub(crate) struct CallParams {
     /// Selector: a qualified name, `name:<n>`, `element:<id>`, or `file:<path>:<line>`.
     pub selector: String,
     /// Project root; defaults to the server's working directory.
@@ -71,7 +87,7 @@ pub struct CallParams {
 
 /// One symbol selector to describe.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SymbolParams {
+pub(crate) struct SymbolParams {
     /// Selector: a qualified name, `name:<n>`, `element:<id>`, or `file:<path>:<line>`.
     pub selector: String,
     /// Project root; defaults to the server's working directory.
@@ -80,7 +96,7 @@ pub struct SymbolParams {
 
 /// A keyword search over indexed files.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FilesParams {
+pub(crate) struct FilesParams {
     /// Keywords matched against file paths and their symbols.
     pub query: String,
     /// Project root; defaults to the server's working directory.
@@ -91,7 +107,7 @@ pub struct FilesParams {
 
 /// A project-root pointer.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct StatusParams {
+pub(crate) struct StatusParams {
     /// Project root; defaults to the server's working directory.
     pub path: Option<String>,
 }
@@ -100,7 +116,7 @@ pub struct StatusParams {
 impl OxcodeServer {
     /// Builds an empty server; the index is opened lazily on the first tool call.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
             indexes: Arc::new(Mutex::new(HashMap::new())),
@@ -213,12 +229,6 @@ impl OxcodeServer {
         let index = Arc::new(blocking(move || ProjectIndex::open(&open_root)).await?);
         self.indexes.lock().await.insert(root, Arc::clone(&index));
         Ok(index)
-    }
-}
-
-impl Default for OxcodeServer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
