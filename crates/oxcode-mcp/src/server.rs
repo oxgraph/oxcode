@@ -121,7 +121,9 @@ impl OxcodeServer {
         json_result(&report)
     }
 
-    #[tool(description = "Search indexed symbols by keyword, optionally restricted to symbol kinds.")]
+    #[tool(
+        description = "Search indexed symbols by keyword, optionally restricted to symbol kinds."
+    )]
     async fn oxcode_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -175,7 +177,9 @@ impl OxcodeServer {
         json_result(&report)
     }
 
-    #[tool(description = "Show the indexed project's database status (element/relation counts, paths).")]
+    #[tool(
+        description = "Show the indexed project's database status (element/relation counts, paths)."
+    )]
     async fn oxcode_status(
         &self,
         Parameters(params): Parameters<StatusParams>,
