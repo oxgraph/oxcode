@@ -97,7 +97,7 @@ pub(crate) static PROFILES: &[LanguageProfile] = &[
     LanguageProfile {
         language_id: "csharp",
         extensions: &["cs"],
-        parser_name: "c_sharp",
+        parser_name: "csharp",
         query_source: include_str!("queries/csharp.scm"),
         captures: &[
             ("definition.class", Definition(NodeKind::Class)),
