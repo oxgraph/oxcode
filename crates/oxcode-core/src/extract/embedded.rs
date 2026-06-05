@@ -1,18 +1,15 @@
 //! Host extractors for component files that embed a `<script>` block.
 //!
-//! Svelte and Vue parse their script bodies as opaque `raw_text`, so symbols
-//! live in the embedded JS/TS. This extractor locates the script ranges with
-//! the host grammar, masks every other byte to whitespace (preserving byte and
-//! line offsets), and runs the TypeScript extractor over the masked file — so
-//! the extracted spans stay accurate to the original component file.
-
-use std::path::Path;
+//! Svelte and Vue keep their logic in a `<script>` block. This extractor locates
+//! those blocks with a byte-scan (no host grammar needed), masks every other byte
+//! to whitespace (preserving byte and line offsets), and runs the TypeScript
+//! extractor over the masked file — so the extracted spans stay accurate to the
+//! original component file.
 
 use oxcode_model::{Extraction, LanguageId};
-use tree_sitter::{Node, Parser};
 
 use crate::{
-    error::{Error, Result},
+    error::Result,
     extract::{
         ExtractionInput, LanguageExtractor,
         scope::{JsTsScope, ScopeStrategy},
@@ -24,7 +21,6 @@ use crate::{
 pub(crate) struct ScriptHostExtractor {
     language_id: &'static str,
     extensions: &'static [&'static str],
-    parser_name: &'static str,
 }
 
 impl ScriptHostExtractor {
@@ -33,7 +29,6 @@ impl ScriptHostExtractor {
         Self {
             language_id: "svelte",
             extensions: &["svelte"],
-            parser_name: "svelte",
         }
     }
 
@@ -42,7 +37,6 @@ impl ScriptHostExtractor {
         Self {
             language_id: "vue",
             extensions: &["vue"],
-            parser_name: "vue",
         }
     }
 }
@@ -56,13 +50,9 @@ impl LanguageExtractor for ScriptHostExtractor {
         self.extensions
     }
 
-    fn parser_name(&self) -> &'static str {
-        self.parser_name
-    }
-
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction> {
         let scope = JsTsScope.base_scope(input.path, &input.relative_path);
-        let ranges = script_ranges(self.parser_name, input.path, &input.source)?;
+        let ranges = script_ranges(&input.source);
         let masked = mask_to_ranges(&input.source, &ranges);
         typescript::extract_script(
             &input.relative_path,
@@ -73,39 +63,37 @@ impl LanguageExtractor for ScriptHostExtractor {
     }
 }
 
-/// Returns the byte ranges of the `<script>` bodies in a component file.
-fn script_ranges(parser_name: &str, path: &Path, source: &[u8]) -> Result<Vec<(usize, usize)>> {
-    let language =
-        tree_sitter_language_pack::get_language(parser_name).map_err(|error| Error::Parse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language)
-        .map_err(|error| Error::Parse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    let tree = parser.parse(source, None).ok_or_else(|| Error::Parse {
-        path: path.to_path_buf(),
-        message: "tree-sitter returned no parse tree".to_string(),
-    })?;
+/// Returns the byte ranges of the `<script>…</script>` bodies in a component
+/// file, found by a case-insensitive tag scan (no host grammar required).
+fn script_ranges(source: &[u8]) -> Vec<(usize, usize)> {
+    let Ok(text) = std::str::from_utf8(source) else {
+        return Vec::new();
+    };
+    // ASCII-lowercasing preserves byte length, so offsets map 1:1 to `source`.
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
     let mut ranges = Vec::new();
-    collect_script_text(tree.root_node(), false, &mut ranges);
-    Ok(ranges)
+    let mut cursor = 0;
+    while let Some(open) = find(&bytes[cursor..], b"<script").map(|rel| cursor + rel) {
+        let Some(tag_end) = find(&bytes[open..], b">").map(|rel| open + rel + 1) else {
+            break;
+        };
+        let Some(close) = find(&bytes[tag_end..], b"</script>").map(|rel| tag_end + rel) else {
+            break;
+        };
+        if close > tag_end {
+            ranges.push((tag_end, close));
+        }
+        cursor = close + "</script>".len();
+    }
+    ranges
 }
 
-/// Collects the byte ranges of `raw_text` nodes inside a `script_element`.
-fn collect_script_text(node: Node, in_script: bool, ranges: &mut Vec<(usize, usize)>) {
-    let in_script = in_script || node.kind() == "script_element";
-    if in_script && node.kind() == "raw_text" {
-        ranges.push((node.start_byte(), node.end_byte()));
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_script_text(child, in_script, ranges);
-    }
+/// Returns the start offset of `needle` in `haystack`, if present.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Returns a copy of `source` with every byte outside `ranges` blanked to a
@@ -131,6 +119,8 @@ fn mask_to_ranges(source: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use oxcode_model::NodeKind;
 
     use super::*;

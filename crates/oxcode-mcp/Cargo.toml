@@ -1,8 +1,12 @@
 [package]
 name = "oxcode-mcp"
 version = "0.1.0"
-publish = false
+description = "MCP server exposing oxcode's code-intelligence queries to coding agents."
+categories = ["development-tools", "command-line-utilities"]
+readme = "README.md"
 edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
 license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -14,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-oxcode-core = { path = "../oxcode-core" }
+oxcode-core = { path = "../oxcode-core", version = "0.1.0" }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true

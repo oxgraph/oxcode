@@ -1,3 +1,3 @@
 ; Dart symbol-extraction query.
-(class_definition name: (identifier) @name) @definition.class
-(function_signature name: (identifier) @name) @definition.function
+(class_declaration (identifier) @name) @definition.class
+(function_signature (identifier) @name) @definition.function

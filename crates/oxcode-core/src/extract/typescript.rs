@@ -11,13 +11,14 @@ use oxcode_model::{
     EdgeKind, Extraction, FileParseStatus, LanguageId, NodeKind, ReferenceKind, ReferenceTarget,
     SymbolNode,
 };
-use tree_sitter_language_pack::{Node, Tree};
+use tree_sitter::{Node, Tree};
 
 use crate::{
     error::{Error, Result},
     extract::{
         ExtractionInput, LanguageExtractor,
         cst::{field, named_children, node_text, span},
+        grammar,
         scope::{JsTsScope, ScopeStrategy},
         walker::{
             CommentStrategy, ReferenceSpan, SymbolBuilder, SymbolFields, SymbolSpec, bounded_text,
@@ -37,10 +38,6 @@ impl LanguageExtractor for TypeScriptExtractor {
 
     fn extensions(&self) -> &'static [&'static str] {
         &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"]
-    }
-
-    fn parser_name(&self) -> &'static str {
-        "typescript"
     }
 
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction> {
@@ -63,7 +60,7 @@ impl LanguageExtractor for TypeScriptExtractor {
     }
 }
 
-/// Returns the tree-sitter-language-pack parser for a source extension.
+/// Returns the grammar name for a source extension.
 fn parser_for_extension(extension: &str) -> &'static str {
     match extension {
         "tsx" => "tsx",
@@ -82,12 +79,7 @@ fn language_for_extension(extension: &str) -> LanguageId {
 
 /// Parses source with a named grammar into a syntax tree.
 fn parse(path: &Path, parser_name: &str, source: &[u8]) -> Result<Tree> {
-    let mut parser =
-        tree_sitter_language_pack::get_parser(parser_name).map_err(|error| Error::Parse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    parser.parse_bytes(source).ok_or_else(|| Error::Parse {
+    grammar::parse(parser_name, source).ok_or_else(|| Error::Parse {
         path: path.to_path_buf(),
         message: "tree-sitter returned no parse tree".to_string(),
     })
@@ -203,7 +195,7 @@ impl TsWalker<'_> {
 
     /// Visits one CST node, emitting graph data when it represents code intent.
     fn visit_node(&mut self, node: &Node, ctx: VisitContext<'_>) {
-        match node.kind().as_str() {
+        match node.kind() {
             "class_declaration" | "abstract_class_declaration" => {
                 self.visit_type(node, ctx, NodeKind::Class, "class_declaration");
             }
@@ -370,7 +362,7 @@ impl TsWalker<'_> {
             };
             let is_callable = field(&declarator, "value").is_some_and(|value| {
                 matches!(
-                    value.kind().as_str(),
+                    value.kind(),
                     "arrow_function" | "function" | "function_expression"
                 )
             });
@@ -526,7 +518,7 @@ struct ImportBinding {
 fn import_bindings(clause: &Node, source: &[u8]) -> Vec<ImportBinding> {
     let mut bindings = Vec::new();
     for child in named_children(clause) {
-        match child.kind().as_str() {
+        match child.kind() {
             // `import Default from '...'`
             "identifier" => bindings.push(ImportBinding {
                 imported: "default".to_string(),
@@ -608,7 +600,7 @@ fn module_anchor_from_relative_import(
 
 /// Builds a reference target from a call/new callee expression.
 fn callee_target(callee: &Node, source: &[u8], ctx: VisitContext<'_>) -> Option<ReferenceTarget> {
-    match callee.kind().as_str() {
+    match callee.kind() {
         "identifier" => {
             let name = clean_identifier(node_text(callee, source));
             (!name.is_empty())
@@ -634,7 +626,7 @@ fn member_target(
     source: &[u8],
     ctx: VisitContext<'_>,
 ) -> ReferenceTarget {
-    match object.kind().as_str() {
+    match object.kind() {
         "identifier" | "this" => {
             let text = clean_identifier(node_text(object, source));
             let base = if text == "this" {

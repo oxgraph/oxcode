@@ -6,7 +6,9 @@ resolver = "3"
 authors = ["oxcode contributors"]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/oxcode/oxcode"
+repository = "https://github.com/oxgraph/oxcode"
+homepage = "https://github.com/oxgraph/oxcode"
+keywords = ["tree-sitter", "code-graph", "mcp", "code-search", "indexing"]
 rust-version = "1.95"
 
 [workspace.dependencies]
@@ -25,7 +27,3 @@ thiserror = "2.0.17"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
 toml = "1.1.2"
 tree-sitter = "0.26"
-# Grammars are statically compiled at build time (see `.cargo/config.toml`), so
-# the runtime download path is disabled: resolution comes only from the
-# statically-linked registry, keeping indexing offline and reproducible.
-tree-sitter-language-pack = { version = "1.8.1", default-features = false }

@@ -9,13 +9,14 @@ use oxcode_model::{
     EdgeKind, Extraction, FileParseStatus, LanguageId, NodeKind, ReferenceKind, ReferenceTarget,
     SymbolNode,
 };
-use tree_sitter_language_pack::{Node, Tree};
+use tree_sitter::{Node, Tree};
 
 use crate::{
     error::{Error, Result},
     extract::{
         ExtractionInput, LanguageExtractor,
         cst::{field, named_children, node_text, span},
+        grammar,
         scope::{GoScope, ScopeStrategy},
         walker::{
             CommentStrategy, ReferenceSpan, SymbolBuilder, SymbolFields, SymbolSpec, bounded_text,
@@ -37,10 +38,6 @@ impl LanguageExtractor for GoExtractor {
         &["go"]
     }
 
-    fn parser_name(&self) -> &'static str {
-        PARSER_NAME
-    }
-
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction> {
         let scope = GoScope.base_scope(input.path, &input.relative_path);
         let tree = parse_go(input.path, &input.source)?;
@@ -53,17 +50,12 @@ impl LanguageExtractor for GoExtractor {
     }
 }
 
-/// tree-sitter-language-pack parser name for Go.
+/// Grammar name for Go.
 const PARSER_NAME: &str = "go";
 
 /// Parses Go source into a syntax tree.
 fn parse_go(path: &Path, source: &[u8]) -> Result<Tree> {
-    let mut parser =
-        tree_sitter_language_pack::get_parser(PARSER_NAME).map_err(|error| Error::Parse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    parser.parse_bytes(source).ok_or_else(|| Error::Parse {
+    grammar::parse(PARSER_NAME, source).ok_or_else(|| Error::Parse {
         path: path.to_path_buf(),
         message: "tree-sitter returned no parse tree".to_string(),
     })
@@ -162,7 +154,7 @@ impl GoWalker<'_> {
 
     /// Visits one CST node, emitting graph data when it represents code intent.
     fn visit_node(&mut self, node: &Node, ctx: VisitContext<'_>) {
-        match node.kind().as_str() {
+        match node.kind() {
             "function_declaration" => self.visit_function(node, ctx),
             "method_declaration" => self.visit_method(node, ctx),
             "type_spec" | "type_alias" => self.visit_type(node, ctx),
@@ -247,8 +239,8 @@ impl GoWalker<'_> {
         };
         let body = field(node, "type");
         let (kind, raw_kind) = match body.as_ref().map(|node| node.kind()) {
-            Some(kind) if kind == "struct_type" => (NodeKind::Struct, "struct_type"),
-            Some(kind) if kind == "interface_type" => (NodeKind::Interface, "interface_type"),
+            Some("struct_type") => (NodeKind::Struct, "struct_type"),
+            Some("interface_type") => (NodeKind::Interface, "interface_type"),
             _ => (NodeKind::TypeAlias, "type_spec"),
         };
         let qualified = qualify(ctx.scope, &name);
@@ -279,7 +271,7 @@ impl GoWalker<'_> {
     /// Emits struct fields and interface method signatures as members of a type.
     fn visit_type_body(&mut self, node: &Node, ctx: VisitContext<'_>) {
         for child in named_children(node) {
-            match child.kind().as_str() {
+            match child.kind() {
                 "field_declaration_list" | "struct_type" => self.visit_type_body(&child, ctx),
                 "field_declaration" => {
                     self.visit_member(&child, ctx, NodeKind::Field, "field_declaration")
@@ -407,7 +399,7 @@ fn receiver_binding(list: &Node, source: &[u8]) -> Option<ReceiverBinding> {
 
 /// Builds a reference target from a `call_expression`'s `function` child.
 fn callee_target(function: &Node, source: &[u8], ctx: VisitContext<'_>) -> Option<ReferenceTarget> {
-    match function.kind().as_str() {
+    match function.kind() {
         "identifier" => {
             let name = clean_identifier(node_text(function, source));
             (!name.is_empty())
@@ -433,7 +425,7 @@ fn selector_target(
     source: &[u8],
     ctx: VisitContext<'_>,
 ) -> Option<ReferenceTarget> {
-    match operand.kind().as_str() {
+    match operand.kind() {
         "identifier" | "type_identifier" | "package_identifier" => {
             let text = clean_identifier(node_text(operand, source));
             let base = if Some(text.as_str()) == ctx.receiver_var {
@@ -463,7 +455,7 @@ fn selector_target(
 
 /// Descends a Go type node to a stable base type name.
 fn base_type_name(node: &Node, source: &[u8]) -> Option<String> {
-    match node.kind().as_str() {
+    match node.kind() {
         "type_identifier" => {
             let text = clean_identifier(node_text(node, source));
             (!text.is_empty()).then_some(text)

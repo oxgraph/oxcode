@@ -5,30 +5,24 @@
 //! re-parse a node's source text. Language extractors reuse these helpers so the
 //! field-based discipline stays uniform.
 
-use std::str;
-
 use oxcode_model::SourceSpan;
-use tree_sitter_language_pack::Node;
+use tree_sitter::Node;
 
 /// Returns borrowed source text for `node` (zero-copy; not trimmed).
 #[must_use]
 pub(crate) fn node_text<'source>(node: &Node, source: &'source [u8]) -> &'source str {
-    let range = node.byte_range();
-    source
-        .get(range.start..range.end)
-        .and_then(|bytes| str::from_utf8(bytes).ok())
-        .unwrap_or_default()
+    node.utf8_text(source).unwrap_or_default()
 }
 
 /// Returns the named child stored under `field`, if present.
 #[must_use]
-pub(crate) fn field(node: &Node, field: &str) -> Option<Node> {
+pub(crate) fn field<'tree>(node: &Node<'tree>, field: &str) -> Option<Node<'tree>> {
     node.child_by_field_name(field)
 }
 
 /// Collects a node's named children in a single linear cursor walk.
 #[must_use]
-pub(crate) fn named_children(node: &Node) -> Vec<Node> {
+pub(crate) fn named_children<'tree>(node: &Node<'tree>) -> Vec<Node<'tree>> {
     let mut cursor = node.walk();
     let mut children = Vec::new();
     if cursor.goto_first_child() {

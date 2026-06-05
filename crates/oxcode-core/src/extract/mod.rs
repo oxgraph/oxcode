@@ -16,6 +16,7 @@ mod cargo;
 mod cst;
 mod embedded;
 mod go;
+mod grammar;
 mod profile;
 mod profiles;
 mod query_extractor;
@@ -78,9 +79,6 @@ pub(crate) trait LanguageExtractor: Send + Sync {
 
     /// File extensions owned by this extractor.
     fn extensions(&self) -> &'static [&'static str];
-
-    /// Tree-sitter language-pack parser name.
-    fn parser_name(&self) -> &'static str;
 
     /// Extracts code facts from one source file.
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction>;
@@ -276,9 +274,10 @@ pub(crate) fn language_support() -> Vec<LanguageSupport> {
         .extractors()
         .iter()
         .map(|extractor| LanguageSupport {
+            // Grammars are statically linked, so every registered extractor's
+            // parser is always available.
             language: extractor.language_id(),
-            parser_available: tree_sitter_language_pack::get_parser(extractor.parser_name())
-                .is_ok(),
+            parser_available: true,
             extractor_available: true,
         })
         .collect()

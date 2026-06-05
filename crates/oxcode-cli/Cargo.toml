@@ -1,19 +1,28 @@
 [package]
-name = "oxcode"
+name = "oxcode-cli"
 version = "0.1.0"
-description = "CLI for generating and querying code graphs."
-publish = false
+description = "Index source code into a graph and serve it to coding agents — `oxcode` CLI."
+categories = ["development-tools", "command-line-utilities"]
+readme = "README.md"
 
 authors.workspace = true
 edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# The crates.io package is `oxcode-cli` (the bare `oxcode` name is taken), but the
+# installed binary is `oxcode`.
+[[bin]]
+name = "oxcode"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-oxcode-core = { path = "../oxcode-core" }
+oxcode-core = { path = "../oxcode-core", version = "0.1.0" }
 serde_json.workspace = true
 
 [dev-dependencies]
