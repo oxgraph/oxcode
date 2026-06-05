@@ -16,6 +16,7 @@ WORKSHOP_URL=""
 AUTH_FILE="$ROOT/codex-auth.json"
 PATH_PREPEND=""
 REPLAY_RUN_ID=""
+MCP_BIN=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -33,6 +34,7 @@ while [ "$#" -gt 0 ]; do
     --auth-file) AUTH_FILE="$2"; shift 2 ;;
     --path-prepend) PATH_PREPEND="$2"; shift 2 ;;
     --replay-run-id) REPLAY_RUN_ID="$2"; shift 2 ;;
+    --mcp-bin) MCP_BIN="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
 done
@@ -134,6 +136,20 @@ CODEGRAPH_VERSION="$([ -n "$CODEGRAPH_BIN_PATH" ] && "$CODEGRAPH_BIN_PATH" --ver
 REPO_COMMIT="$(git -C "$REPO_PATH" rev-parse HEAD 2>/dev/null || echo unknown)"
 START_MS="$(node -e 'console.log(Date.now())')"
 
+# For the oxcode-mcp arm, register the server over codex's `-c` overrides (these
+# survive --ignore-user-config). default_tools_approval_mode=approve is required:
+# without it codex's non-interactive approval gate auto-cancels every MCP call.
+MCP_ARGS=()
+if [ -n "$MCP_BIN" ]; then
+  MCP_ARGS=(
+    -c "mcp_servers.oxcode.command=$MCP_BIN"
+    -c "mcp_servers.oxcode.cwd=$REPO_PATH"
+    -c "mcp_servers.oxcode.startup_timeout_sec=30"
+    -c "mcp_servers.oxcode.tool_timeout_sec=120"
+    -c "mcp_servers.oxcode.default_tools_approval_mode=approve"
+  )
+fi
+
 set +e
 PATH="$PATH_VALUE" HOME="$RUN_HOME" CODEX_HOME="$RUN_HOME" node "$ROOT/scripts/agent-eval/run-timed-command.mjs" \
   --stdout "$OUT/run.jsonl" \
@@ -147,6 +163,7 @@ PATH="$PATH_VALUE" HOME="$RUN_HOME" CODEX_HOME="$RUN_HOME" node "$ROOT/scripts/a
   --sandbox "$SANDBOX" \
   --disable plugins --disable apps \
   --disable skill_mcp_dependency_install --disable tool_suggest \
+  ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} \
   -C "$REPO_PATH" -m "$MODEL" \
   -o "$OUT/final-answer.txt" \
   "$PROMPT" > "$OUT/run.jsonl" 2> "$OUT/run.err"

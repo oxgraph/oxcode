@@ -15,6 +15,10 @@ pub enum PropertyKind {
 /// Catalog name of the `calls` graph projection.
 pub const CALLS_PROJECTION: &str = "calls";
 
+/// Catalog name of the combined graph projection spanning every edge kind,
+/// ranked by personalized PageRank for the curated `context` command.
+pub const EXPLORE_PROJECTION: &str = "explore";
+
 /// Returns the catalog name of the graph projection for `edge_kind`. The
 /// `calls` projection keeps its historical name; every other kind is
 /// `edges_<kind>`, so navigation can traverse any code edge kind.

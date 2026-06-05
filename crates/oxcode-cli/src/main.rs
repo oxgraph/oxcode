@@ -147,6 +147,9 @@ enum Command {
         /// Relationship hop depth.
         #[arg(long, default_value_t = 1)]
         depth: usize,
+        /// Maximum total source characters to render.
+        #[arg(long, default_value_t = 20_000)]
+        max_bytes: usize,
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -334,9 +337,11 @@ fn run() -> Result<()> {
             path,
             limit,
             depth,
+            max_bytes,
             json,
         } => {
-            let report = ProjectIndex::open(&path.path)?.context(&query, limit, depth)?;
+            let report =
+                ProjectIndex::open(&path.path)?.context(&query, limit, depth, max_bytes)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

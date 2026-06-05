@@ -24,7 +24,11 @@ const finalAnswer = fs.existsSync(metadata.final_answer_path)
   : "";
 const prompt = fs.existsSync(metadata.prompt_path) ? readText(metadata.prompt_path) : "";
 const events = attachTimeline(readJsonl(jsonlPath), metadata);
-const commands = extractCommandExecutions(events);
+// Shell commands and MCP tool calls are both "tool calls" for the cross-arm
+// metric; merge them so the oxcode-mcp arm's tool count is comparable to the
+// shell-based arms instead of reading as zero.
+const commands = [...extractCommandExecutions(events), ...extractMcpToolCalls(events)]
+  .sort((a, b) => (a.line_start ?? 0) - (b.line_start ?? 0));
 const otlp = buildOtlp(metadata, { prompt, finalAnswer, commands, events });
 
 writeJson(metadata.otlp_path, otlp);
@@ -102,24 +106,31 @@ function buildOtlp(meta, { prompt, finalAnswer, commands }) {
     const endMs = hasObservedTiming
       ? command.end_ms
       : Math.min(rootEnd, startMs + Math.max(1, command.duration_ms ?? 1));
-    const executable = commandExecutable(command.command);
-    const classifier = classifyCommand(command.command);
+    // MCP tool-call records carry explicit executable/classifier so they count
+    // as indexed-tool usage (parallel to the oxcode CLI arm) rather than being
+    // re-derived from a shell command string they do not have.
+    const executable = command.executable ?? commandExecutable(command.command);
+    const classifier = command.classifier ?? classifyCommand(command.command);
+    const displayName = command.tool_name ?? executable;
     spans.push(span({
       traceId: rootTraceId,
       spanId: stableHex(`${rootTraceId}:command:${index}:${command.command}`, 8),
       parentSpanId: rootSpanId,
-      name: executable || "shell-command",
+      name: displayName || "shell-command",
       kind: "tool_call",
       startMs,
       endMs: Math.max(endMs, startMs + 1),
       statusCode: command.exit_code && command.exit_code !== 0 ? 2 : 1,
       attrs: {
         ...rootAttrs,
-        "tool.name": executable || "shell",
-        "ai.toolCall.name": executable || "shell",
+        "tool.name": displayName || "shell",
+        "ai.toolCall.name": displayName || "shell",
         "benchmark.command.command": command.command,
         "benchmark.command.executable": executable,
         "benchmark.command.classifier": classifier,
+        "benchmark.command.is_mcp": command.mcp === true ? true : undefined,
+        "benchmark.command.mcp_server": command.mcp_server,
+        "benchmark.command.mcp_tool": command.tool_name,
         "benchmark.command.exit_code": Number.isFinite(command.exit_code) ? command.exit_code : 0,
         "benchmark.command.stdout_bytes": command.stdout_bytes ?? byteLength(command.stdout ?? ""),
         "benchmark.command.stderr_bytes": command.stderr_bytes ?? byteLength(command.stderr ?? ""),
@@ -318,6 +329,65 @@ function extractCommandExecutions(events) {
     }
   }
   return [...records.values()].sort((a, b) => a.line_start - b.line_start);
+}
+
+// Build one tool-call record per MCP tool call by merging its item.started and
+// item.completed events (keyed by item id). executable/classifier are forced to
+// the indexed-CLI bucket so the oxcode-mcp arm is comparable to the oxcode-cli arm.
+function extractMcpToolCalls(events) {
+  const records = new Map();
+  for (const event of events) {
+    const value = event.value;
+    const item = value?.item;
+    if (!item || item.type !== "mcp_tool_call") continue;
+    const id = String(item.id ?? `${event.index}:${item.tool}`);
+    const record = records.get(id) ?? {
+      id,
+      line_start: event.index,
+      mcp: true,
+      executable: "oxcode",
+      classifier: "indexed_cli",
+    };
+    record.line_end = event.index;
+    record.tool_name = item.tool ?? record.tool_name;
+    record.mcp_server = item.server ?? record.mcp_server;
+    record.command = item.tool ?? record.command ?? "mcp_tool_call";
+    const resultText = mcpResultText(item.result);
+    if (resultText !== undefined) record.output = resultText;
+    const status = String(item.status ?? value?.type ?? "");
+    if (item.error != null || /failed|cancelled|canceled|error/i.test(status)) {
+      record.exit_code = 1;
+    } else if (/completed/i.test(status)) {
+      record.exit_code = record.exit_code ?? 0;
+    }
+    const observedAtMs = observedEventTimeMs(event);
+    if (observedAtMs !== null) {
+      const eventType = String(value?.type ?? item.status ?? "");
+      if (/started|in_progress/i.test(eventType)) {
+        record.start_ms ??= observedAtMs;
+      } else if (/completed|failed|cancelled|canceled/i.test(eventType)) {
+        record.end_ms = observedAtMs;
+      } else {
+        record.start_ms ??= observedAtMs;
+        record.end_ms = observedAtMs;
+      }
+    }
+    records.set(id, record);
+  }
+  return [...records.values()].sort((a, b) => a.line_start - b.line_start);
+}
+
+// MCP results are { content: [{ type: "text", text }] }; flatten the text blocks.
+function mcpResultText(result) {
+  if (!result || typeof result !== "object") return undefined;
+  if (Array.isArray(result.content)) {
+    const text = result.content
+      .map((block) => (block && typeof block.text === "string" ? block.text : ""))
+      .filter(Boolean)
+      .join("\n");
+    if (text) return text;
+  }
+  return undefined;
 }
 
 function commandCandidates(value) {

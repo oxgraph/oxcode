@@ -70,21 +70,27 @@ no-tool baseline**, not absolute numbers.
 
 | arm | answer quality | tokens | cost | tool calls | wall time |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| baseline (no tool) | 0.97 | — | — | — | — |
-| **oxcode** — codex/gpt-5.5, CLI, n=6 | 0.97 (tied) | −5% | −19% | −23% | −10% |
+| baseline (no tool) | 0.98 | — | — | — | — |
+| oxcode — codex/gpt-5.5, CLI, n=6 | 0.96 (tied) | +15% | +4% | −4% | +14% |
+| **oxcode — codex/gpt-5.5, MCP, n=6** | **0.93** | **−74%** | **−57%** | **−84%** | **−60%** |
 | codegraph — Opus 4.8, MCP, published | not measured | −38% | even | −57% | −18% |
 
-Percentages are reductions vs that tool's own no-tool baseline (lower is better;
-quality is the blind LLM-judge score, higher is better). Absolute medians for our
-two arms: tokens 431k → 410k, cost ~$0.19 → ~$0.16, shell commands 30 → 23, wall
-104s → 93s, oxcode query p50 931 ms.
+Percentages are change vs that tool's own no-tool baseline (negative = reduction,
+better; quality is the blind LLM-judge score, 0–1). All oxcode rows come from one
+n=6 release suite on Tokio. Absolute medians: tokens 395k (baseline) → 455k (CLI)
+→ 104k (MCP); cost $0.17 → $0.18 → $0.07; tool calls 28 → 27 → 5; wall 97s → 111s
+→ 39s.
 
-oxcode improves on every efficiency axis while **holding answer quality** — the
-quality gate guards against "cheaper because the agent gave up sooner," which
-codegraph's benchmark does not measure. codegraph's larger reductions come mostly
-from its one-call MCP `codegraph_explore` tool versus oxcode's multi-command CLI;
-closing that gap is a matter of tool delivery, not index quality. codegraph
-numbers are from its README, re-validated 2026-06-02.
+**The MCP server is the headline.** Delivering the same bounded, PageRank-curated
+context through a one-call `oxcode_explore` MCP tool — instead of a CLI the agent
+composes — cuts tool calls 84%, tokens 74%, cost 57%, and wall 60% vs the no-tool
+baseline, **exceeding codegraph's published reductions** (−57% tool calls / −38%
+tokens). The CLI arm is statistically tied with the baseline: the agent treats a
+shell binary as a supplement to its own grep/read, not a replacement — so the gap
+was always **tool delivery, not index quality**. The one cost the quality gate
+exposes (and a quality-blind benchmark like codegraph's would hide): MCP answer
+quality dips to 0.93 vs 0.98, a completeness trade-off from the leaner
+exploration. codegraph numbers are from its README, re-validated 2026-06-02.
 
 Full methodology, confidence intervals, and reproduction:
 [`docs/agent-eval-results.md`](docs/agent-eval-results.md) and
@@ -100,6 +106,9 @@ The workspace uses a hybrid Rust architecture:
 - `oxcode-core`: indexing, extraction, reference resolution, OxGraph storage,
   navigation, formatting, and the public `ProjectIndex` facade
 - `oxcode`: thin CLI package and binary
+- `oxcode-mcp`: MCP server (stdio) exposing oxcode's read-only queries to coding
+  agents — the one-call `oxcode_explore` tool plus `oxcode_search`,
+  `oxcode_callers`/`oxcode_callees`, `oxcode_symbol`, `oxcode_files`, `oxcode_status`
 
 `oxcode-core` is split into focused internal modules: `scan`, `extract` (with
 per-language extractors and shared CST/cargo helpers), `resolve`,

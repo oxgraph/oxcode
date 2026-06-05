@@ -164,8 +164,9 @@ fn cli_indexes_statuses_queries_and_explains_a_rust_project() {
         ])
         .assert()
         .success()
-        .stdout(contains("\"entry_points\""))
+        .stdout(contains("\"symbols\""))
         .stdout(contains("\"relationships\""))
+        .stdout(contains("\"budget\""))
         .stdout(contains("\"files\""))
         .stdout(contains("\"entry\""))
         .stdout(contains("\"helper\""))
@@ -308,6 +309,48 @@ fn selector_discovery_outcomes_are_agent_safe() {
         .stdout(contains("\"status\": \"ambiguous\""))
         .stdout(contains("one::entry"))
         .stdout(contains("two::entry"));
+}
+
+#[test]
+fn cli_context_respects_the_byte_budget_and_dedupes_symbols() {
+    let temp = rust_project();
+    let root = temp.path().to_str().expect("utf8 path");
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["index", "--path", root])
+        .assert()
+        .success();
+
+    let report = oxcode_json([
+        "context",
+        "How does entry reach helper?",
+        "--json",
+        "--path",
+        root,
+        "--max-bytes",
+        "200",
+    ]);
+
+    // The rendered source stays within the requested budget.
+    let total = report["budget"]["total_chars"]
+        .as_u64()
+        .expect("total_chars");
+    let max = report["budget"]["max_total_chars"]
+        .as_u64()
+        .expect("max_total_chars");
+    assert_eq!(max, 200);
+    assert!(total <= max, "budget overshoot: {total} > {max}");
+
+    // The report is ID-keyed: each selected symbol appears exactly once.
+    let symbols = report["symbols"].as_array().expect("symbols array");
+    let mut ids = symbols
+        .iter()
+        .map(|symbol| symbol["id"].as_u64().expect("symbol id"))
+        .collect::<Vec<_>>();
+    let total_symbols = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), total_symbols, "duplicate symbol ids in report");
 }
 
 fn rust_project() -> TempDir {
