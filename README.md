@@ -1,6 +1,6 @@
 # oxcode
 
-`oxcode` indexes Rust source into a native OxGraph database. It uses
+`oxcode` indexes source code into a native OxGraph database. It uses
 tree-sitter for extraction, resolves code references into graph relations, and
 stores the result in a native OxGraph database under `.oxcode/index.oxgdb/`.
 
@@ -8,6 +8,26 @@ The CLI keeps raw OxQL available, but agent navigation should usually start
 with `context`, `symbols`, `files`, and the call graph commands because they
 expand graph IDs back into function names, definition ranges, signatures,
 docstrings, source previews, and call-site source context.
+
+## Languages
+
+oxcode supports two tiers of language coverage:
+
+- **High-fidelity** (hand-written extractors): **Rust**, **Go**, and
+  **TypeScript/JavaScript** (`.ts`/`.tsx`/`.js`/`.jsx`/`.mts`/`.cts`). These
+  resolve receiver-typed method calls, qualified names, and imports precisely.
+- **Best-effort** (generic, query-driven extractor): **Python**, **Java**,
+  **C**, and **C++**. These extract symbols, containment, and approximate call
+  edges that resolve only at the scoped/simple tiers (no receiver typing), so
+  some edges are marked ambiguous. Qualified names use `::` internally
+  regardless of the language's own separator.
+
+Run `oxcode languages` to list the registered extractors. A best-effort
+language is promoted to high fidelity by adding a hand-written extractor; a new
+best-effort language is added with a tree-sitter query plus a profile entry
+(see `crates/oxcode-core/src/extract/profiles.rs`). Recognized source files in a
+language with no extractor yet (e.g. Ruby, PHP, C#) are reported as skipped
+rather than silently dropped.
 
 ## Quick Start
 

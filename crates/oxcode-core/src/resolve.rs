@@ -435,6 +435,34 @@ mod tests {
     }
 
     #[test]
+    fn path_based_esm_import_resolves_without_resolver_changes() {
+        // The TS extractor resolves `import { Bar } from './a'` to the target
+        // module's path-anchored scope and emits a normal name-based target, so
+        // the existing import tier resolves a bare `Bar()` with no special case.
+        let bar = symbol("Bar", "src::a::Bar", NodeKind::Function, 0);
+        let caller = symbol("entry", "src::app::entry", NodeKind::Function, 80);
+        let bar_key = bar.stable_key.clone();
+        let caller_key = caller.stable_key.clone();
+        let import = UnresolvedReference {
+            source_key: caller_key.clone(),
+            target: target(&["src", "a", "Bar"], Some("src::a"), ReferenceKind::Import),
+            kind: EdgeKind::Imports,
+            file_path: "src/lib.rs".to_string(),
+            span: SourceSpan::default(),
+            text: "import { Bar } from './a';".to_string(),
+            reason: None,
+        };
+        let bare_call = call(&caller_key, target(&["Bar"], None, ReferenceKind::Function));
+        let resolved = resolve(vec![bar, caller], vec![import, bare_call]);
+        let edge = resolved
+            .edges
+            .iter()
+            .find(|edge| edge.target_key == bar_key && edge.kind == EdgeKind::Calls)
+            .expect("import-resolved call edge");
+        assert_eq!(edge.resolution, ResolutionKind::Import);
+    }
+
+    #[test]
     fn import_first_hop_resolves_to_imported_symbol() {
         let bar = symbol("Bar", "crate::a::Bar", NodeKind::Struct, 0);
         let caller = symbol("entry", "crate::entry", NodeKind::Function, 80);

@@ -14,15 +14,45 @@ use crate::{
 
 mod cargo;
 mod cst;
+mod go;
+mod profile;
+mod profiles;
+mod query_extractor;
 mod rust;
+mod scope;
+mod typescript;
+mod walker;
 
 /// Source-language file extensions oxcode recognizes, whether or not an
 /// extractor exists for them. The subset that has an extractor is derived from
 /// the [`Registry`]; a recognized extension with no extractor is reported as a
 /// skipped unsupported file rather than silently ignored.
+///
+/// The first rows are extensions an extractor (hand-written or generic) owns;
+/// the last row is recognized source we do not index yet, so those files are
+/// reported as skipped rather than silently dropped.
 pub(crate) const RECOGNIZED_SOURCE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "h", "cpp", "cc", "hpp",
+    "rs", "ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs", "py", "pyi", "go", "java", "c",
+    "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", //
+    "rb", "php", "cs", "kt", "swift", "scala", "lua",
 ];
+
+/// Package-manifest filenames whose contents can change crate/module-derived
+/// qualified names without changing any source file. A change to one of these
+/// must invalidate the project digest and extraction cache, so they are folded
+/// into the [`crate::manifest::scope_token`].
+pub(crate) const MANIFEST_FILE_NAMES: &[&str] = &[
+    "Cargo.toml",
+    "go.mod",
+    "package.json",
+    "tsconfig.json",
+    "pyproject.toml",
+];
+
+/// Returns the package-manifest filenames that affect derived scopes.
+pub(crate) fn manifest_filenames() -> &'static [&'static str] {
+    MANIFEST_FILE_NAMES
+}
 
 /// Input provided to one language extractor.
 pub(crate) struct ExtractionInput<'a> {
@@ -63,7 +93,16 @@ pub(crate) struct Registry {
 impl Registry {
     /// Builds the registry from the compiled-in extractor set.
     fn build() -> Self {
-        let extractors: Vec<Box<dyn LanguageExtractor>> = vec![Box::new(rust::RustExtractor)];
+        let mut extractors: Vec<Box<dyn LanguageExtractor>> = vec![
+            Box::new(rust::RustExtractor),
+            Box::new(go::GoExtractor),
+            Box::new(typescript::TypeScriptExtractor),
+        ];
+        // Generic query-driven profiles cover the long tail; they are registered
+        // after the hand-written extractors, which claim their extensions first.
+        extractors.extend(profiles::PROFILES.iter().map(|profile| {
+            Box::new(query_extractor::QueryExtractor::new(profile)) as Box<dyn LanguageExtractor>
+        }));
         let mut by_extension = HashMap::new();
         for (index, extractor) in extractors.iter().enumerate() {
             for extension in extractor.extensions() {
@@ -246,9 +285,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_selects_rust_files() {
+    fn registry_selects_supported_languages_by_extension() {
+        // Hand-written and generic extractors both dispatch by extension.
         assert!(registry().extractor_for(Path::new("lib.rs")).is_some());
-        assert!(registry().extractor_for(Path::new("lib.py")).is_none());
+        assert!(registry().extractor_for(Path::new("main.go")).is_some());
+        assert!(registry().extractor_for(Path::new("app.ts")).is_some());
+        assert!(registry().extractor_for(Path::new("app.py")).is_some());
+        // A recognized-but-unsupported language has no extractor.
+        assert!(registry().extractor_for(Path::new("app.rb")).is_none());
     }
 
     #[test]
@@ -286,10 +330,11 @@ mod tests {
 
     #[test]
     fn recognized_unsupported_excludes_supported_languages() {
-        // Recognized source, no extractor -> unsupported.
-        assert!(is_recognized_unsupported(Path::new("app.py")));
+        // Recognized source, no extractor yet -> unsupported.
+        assert!(is_recognized_unsupported(Path::new("app.rb")));
         // Recognized source with an extractor -> not unsupported.
         assert!(!is_recognized_unsupported(Path::new("lib.rs")));
+        assert!(!is_recognized_unsupported(Path::new("app.py")));
         // Unknown extension -> not a recognized source at all.
         assert!(!is_recognized_unsupported(Path::new("notes.txt")));
     }

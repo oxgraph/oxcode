@@ -1027,9 +1027,11 @@ dependencies = [
  "oxgraph",
  "serde",
  "serde_json",
+ "streaming-iterator",
  "tempfile",
  "thiserror",
  "toml",
+ "tree-sitter",
  "tree-sitter-language-pack",
 ]
 
