@@ -353,6 +353,177 @@ fn cli_context_respects_the_byte_budget_and_dedupes_symbols() {
     assert_eq!(ids.len(), total_symbols, "duplicate symbol ids in report");
 }
 
+#[test]
+fn cli_indexes_and_navigates_a_go_project() {
+    let temp = go_project();
+    let root = temp.path().to_str().expect("utf8 path");
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["index", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("indexed"));
+
+    // The Go extractor is registered and reported.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .arg("languages")
+        .assert()
+        .success()
+        .stdout(contains("go"));
+
+    // Symbols are found with a Go signature.
+    let helper_symbols = oxcode_json(["symbols", "Helper", "--json", "--path", root]);
+    let helper = &helper_symbols["matches"][0]["symbol"];
+    assert_eq!(helper["name"], "Helper");
+    assert!(
+        helper["signature"]
+            .as_str()
+            .is_some_and(|text| text.contains("func Helper"))
+    );
+
+    // A package-import-anchored qualified name resolves to its definition file.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["symbol", "example.com::m::db::Entry", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("Entry"))
+        .stdout(contains("defined at db/entry.go"));
+
+    // The cross-file call edge `Entry -> Helper` is resolved.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args([
+            "calls",
+            "example.com::m::db::Entry",
+            "--json",
+            "--path",
+            root,
+        ])
+        .assert()
+        .success()
+        .stdout(contains("\"status\": \"matched\""))
+        .stdout(contains("\"Helper\""));
+}
+
+#[test]
+fn cli_indexes_and_resolves_a_typescript_project() {
+    let temp = typescript_project();
+    let root = temp.path().to_str().expect("utf8 path");
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["index", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("indexed"));
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .arg("languages")
+        .assert()
+        .success()
+        .stdout(contains("typescript"));
+
+    let helper_symbols = oxcode_json(["symbols", "helper", "--json", "--path", root]);
+    let helper = &helper_symbols["matches"][0]["symbol"];
+    assert_eq!(helper["name"], "helper");
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["symbol", "src::app::entry", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("entry"))
+        .stdout(contains("defined at src/app.ts"));
+
+    // The path-based import `./util` resolves `entry`'s call to `helper`
+    // across files.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["calls", "src::app::entry", "--json", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("\"status\": \"matched\""))
+        .stdout(contains("\"helper\""));
+}
+
+#[test]
+fn cli_indexes_a_python_project_via_the_generic_extractor() {
+    let temp = python_project();
+    let root = temp.path().to_str().expect("utf8 path");
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["index", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("indexed"));
+
+    // The generic query-driven extractor registers Python.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .arg("languages")
+        .assert()
+        .success()
+        .stdout(contains("python"));
+
+    let helper_symbols = oxcode_json(["symbols", "helper", "--json", "--path", root]);
+    assert_eq!(helper_symbols["matches"][0]["symbol"]["name"], "helper");
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["symbol", "pkg::app::entry", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("entry"))
+        .stdout(contains("defined at pkg/app.py"));
+
+    // Same-module call resolves via the scoped tier (no imports needed).
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["calls", "pkg::app::entry", "--json", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("\"status\": \"matched\""))
+        .stdout(contains("\"helper\""));
+}
+
+#[test]
+fn cli_indexes_a_svelte_component_via_embedded_script() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path().to_str().expect("utf8 path");
+    write(
+        temp.path().join("src/App.svelte"),
+        "<h1>hi</h1>\n<script>\nfunction helper() { return 1; }\nfunction entry() { return helper(); }\n</script>\n",
+    );
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["index", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("indexed"));
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .arg("languages")
+        .assert()
+        .success()
+        .stdout(contains("svelte"));
+
+    // The `<script>` function is indexed and its in-script call resolves.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["calls", "src::App::entry", "--json", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("\"status\": \"matched\""))
+        .stdout(contains("\"helper\""));
+}
+
 fn rust_project() -> TempDir {
     let temp = TempDir::new().expect("temp dir");
     write(
@@ -406,6 +577,50 @@ pub mod two {
     pub fn entry() {}
 }
 "#,
+    );
+    temp
+}
+
+fn python_project() -> TempDir {
+    let temp = TempDir::new().expect("temp dir");
+    write(temp.path().join("pkg/__init__.py"), "");
+    write(
+        temp.path().join("pkg/app.py"),
+        "def helper():\n    return \"ready\"\n\n\ndef entry():\n    return helper()\n",
+    );
+    temp
+}
+
+fn typescript_project() -> TempDir {
+    let temp = TempDir::new().expect("temp dir");
+    write(
+        temp.path().join("package.json"),
+        "{\n  \"name\": \"smoke-ts\",\n  \"version\": \"0.0.0\"\n}\n",
+    );
+    write(
+        temp.path().join("src/util.ts"),
+        "export function helper(): string {\n  return \"ready\";\n}\n",
+    );
+    write(
+        temp.path().join("src/app.ts"),
+        "import { helper } from './util';\n\nexport function entry(): string {\n  return helper();\n}\n",
+    );
+    temp
+}
+
+fn go_project() -> TempDir {
+    let temp = TempDir::new().expect("temp dir");
+    write(
+        temp.path().join("go.mod"),
+        "module example.com/m\n\ngo 1.21\n",
+    );
+    write(
+        temp.path().join("db/store.go"),
+        "package db\n\n// Helper does the work.\nfunc Helper() string { return \"ready\" }\n",
+    );
+    write(
+        temp.path().join("db/entry.go"),
+        "package db\n\nfunc Entry() string { return Helper() }\n",
     );
     temp
 }

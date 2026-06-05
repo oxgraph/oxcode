@@ -3,19 +3,26 @@
 //! structure from raw node text — method names, impl types, traits, and import
 //! paths all come from typed field children.
 
-use std::{collections::BTreeMap, path::Path, str};
+use std::{path::Path, str};
 
 use oxcode_model::{
     EdgeKind, Extraction, FileParseStatus, LanguageId, NodeKind, ReferenceKind, ReferenceTarget,
-    SourceUnit, SymbolEdge, SymbolNode, UnresolvedReference,
+    SymbolNode,
 };
 use tree_sitter_language_pack::{Node, Tree};
 
 use crate::{
     error::{Error, Result},
     extract::{
-        ExtractionInput, LanguageExtractor, cargo,
+        ExtractionInput, LanguageExtractor,
         cst::{field, named_children, node_text, span},
+        scope::{RustScope, ScopeStrategy},
+        walker::{
+            CommentStrategy, ReferenceSpan, SymbolBuilder, SymbolFields, SymbolSpec, bounded_text,
+            clean_identifier, clean_path, compact_source_text, field_name, header_signature,
+            import_target, path_segments, qualify, qualify_with_extra, reference_target,
+            source_preview, source_unit,
+        },
     },
 };
 
@@ -36,7 +43,7 @@ impl LanguageExtractor for RustExtractor {
     }
 
     fn extract(&self, input: ExtractionInput<'_>) -> Result<Extraction> {
-        let scope = cargo::crate_module_scope(input.path, &input.relative_path);
+        let scope = RustScope.base_scope(input.path, &input.relative_path);
         let tree = parse_rust(input.path, &input.source)?;
         Ok(extract_rust(
             &input.relative_path,
@@ -92,14 +99,12 @@ fn extract_rust(
         source_preview: None,
     };
 
+    let mut builder = SymbolBuilder::new(relative.clone(), language);
+    builder.push_node(file_node);
     let mut walker = RustWalker {
         source,
-        file_path: relative.clone(),
-        language,
-        nodes: vec![file_node],
-        edges: Vec::new(),
-        references: Vec::new(),
-        ordinals: BTreeMap::new(),
+        builder,
+        comments: RustComments,
     };
 
     walker.visit_children(
@@ -121,23 +126,17 @@ fn extract_rust(
     Extraction {
         file: source_unit(&relative, rust_language()),
         parse_status,
-        nodes: walker.nodes,
-        edges: walker.edges,
-        references: walker.references,
+        nodes: walker.builder.nodes,
+        edges: walker.builder.edges,
+        references: walker.builder.references,
     }
 }
 
 /// Stateful Rust CST walker.
 struct RustWalker<'source> {
     source: &'source [u8],
-    file_path: String,
-    language: LanguageId,
-    nodes: Vec<SymbolNode>,
-    edges: Vec<SymbolEdge>,
-    references: Vec<UnresolvedReference>,
-    /// Per-`(file, kind, qualified_name)` occurrence counter used to assign a
-    /// byte-offset-independent ordinal to each symbol's stable key.
-    ordinals: BTreeMap<String, u32>,
+    builder: SymbolBuilder,
+    comments: RustComments,
 }
 
 /// Traversal state threaded through the walker: the containing symbol
@@ -150,15 +149,6 @@ struct VisitContext<'a> {
     owner_key: &'a str,
     scope: &'a [String],
     owner_type: Option<&'a str>,
-}
-
-/// Describes a symbol to emit: its graph `kind`, the raw CST `raw_kind`, its
-/// `name`, and its fully `qualified_name`.
-struct SymbolSpec<'a> {
-    kind: NodeKind,
-    raw_kind: &'a str,
-    name: &'a str,
-    qualified_name: &'a str,
 }
 
 impl RustWalker<'_> {
@@ -226,7 +216,7 @@ impl RustWalker<'_> {
     fn visit_named(&mut self, node: &Node, ctx: VisitContext<'_>, kind: NodeKind, raw_kind: &str) {
         if let Some(name) = item_name(node, self.source) {
             let qualified = qualify(ctx.scope, &name);
-            let symbol = self.push_symbol(
+            let key = self.push_symbol(
                 node,
                 SymbolSpec {
                     kind,
@@ -235,8 +225,7 @@ impl RustWalker<'_> {
                     qualified_name: &qualified,
                 },
             );
-            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
-            let key = symbol.stable_key;
+            self.push_edge(ctx.parent_key, &key, EdgeKind::Contains);
             self.visit_children(
                 node,
                 VisitContext {
@@ -253,7 +242,7 @@ impl RustWalker<'_> {
     fn visit_module(&mut self, node: &Node, ctx: VisitContext<'_>) {
         if let Some(name) = item_name(node, self.source) {
             let qualified = qualify(ctx.scope, &name);
-            let symbol = self.push_symbol(
+            let key = self.push_symbol(
                 node,
                 SymbolSpec {
                     kind: NodeKind::Module,
@@ -262,10 +251,9 @@ impl RustWalker<'_> {
                     qualified_name: &qualified,
                 },
             );
-            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
+            self.push_edge(ctx.parent_key, &key, EdgeKind::Contains);
             let mut child_scope = ctx.scope.to_vec();
             child_scope.push(name);
-            let key = symbol.stable_key;
             self.visit_children(
                 node,
                 VisitContext {
@@ -284,7 +272,7 @@ impl RustWalker<'_> {
     fn visit_trait(&mut self, node: &Node, ctx: VisitContext<'_>) {
         if let Some(name) = item_name(node, self.source) {
             let qualified = qualify(ctx.scope, &name);
-            let symbol = self.push_symbol(
+            let key = self.push_symbol(
                 node,
                 SymbolSpec {
                     kind: NodeKind::Trait,
@@ -293,8 +281,7 @@ impl RustWalker<'_> {
                     qualified_name: &qualified,
                 },
             );
-            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
-            let key = symbol.stable_key;
+            self.push_edge(ctx.parent_key, &key, EdgeKind::Contains);
             self.visit_children(
                 node,
                 VisitContext {
@@ -313,7 +300,7 @@ impl RustWalker<'_> {
         let target = impl_type_name(node, self.source).unwrap_or_else(|| "<impl>".to_string());
         let name = format!("impl {target}");
         let qualified = qualify(ctx.scope, &name);
-        let symbol = self.push_symbol(
+        let key = self.push_symbol(
             node,
             SymbolSpec {
                 kind: NodeKind::ImplBlock,
@@ -322,7 +309,7 @@ impl RustWalker<'_> {
                 qualified_name: &qualified,
             },
         );
-        self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
+        self.push_edge(ctx.parent_key, &key, EdgeKind::Contains);
 
         if let Some(trait_name) = impl_trait_name(node, self.source) {
             let trait_target = reference_target(
@@ -331,10 +318,9 @@ impl RustWalker<'_> {
                 None,
                 ReferenceKind::Trait,
             );
-            self.push_reference(node, &symbol.stable_key, trait_target, EdgeKind::Implements);
+            self.push_reference(node, &key, trait_target, EdgeKind::Implements);
         }
 
-        let key = symbol.stable_key;
         self.visit_children(
             node,
             VisitContext {
@@ -358,7 +344,7 @@ impl RustWalker<'_> {
                 || qualify(ctx.scope, &name),
                 |target| qualify_with_extra(ctx.scope, &[target, &name]),
             );
-            let symbol = self.push_symbol(
+            let key = self.push_symbol(
                 node,
                 SymbolSpec {
                     kind,
@@ -367,8 +353,7 @@ impl RustWalker<'_> {
                     qualified_name: &qualified,
                 },
             );
-            self.push_edge(ctx.parent_key, &symbol.stable_key, EdgeKind::Contains);
-            let key = symbol.stable_key;
+            self.push_edge(ctx.parent_key, &key, EdgeKind::Contains);
             // Calls in the body keep the enclosing type so `self`/`Self`
             // receivers resolve to it.
             self.visit_children(
@@ -383,50 +368,21 @@ impl RustWalker<'_> {
         }
     }
 
-    /// Pushes one symbol and returns a clone for immediate edge wiring.
-    fn push_symbol(&mut self, node: &Node, spec: SymbolSpec<'_>) -> SymbolNode {
-        let span = span(node);
-        // Identity is byte-offset independent: an edit that only shifts a
-        // symbol's position leaves its stable key unchanged. Symbols sharing a
-        // (file, kind, qualified name) triple are disambiguated by a stable
-        // declaration-order ordinal rather than their start byte.
-        let prefix = format!(
-            "symbol:{}:{}:{}",
-            self.file_path,
-            spec.kind.as_str(),
-            spec.qualified_name
-        );
-        let ordinal = {
-            let counter = self.ordinals.entry(prefix.clone()).or_insert(0);
-            let current = *counter;
-            *counter += 1;
-            current
+    /// Computes a symbol's span/signature/docstring/preview from `node` and
+    /// pushes it, returning its stable key.
+    fn push_symbol(&mut self, node: &Node, spec: SymbolSpec<'_>) -> String {
+        let fields = SymbolFields {
+            span: span(node),
+            signature: self.comments.signature(node, self.source),
+            docstring: self.comments.docstring(node, self.source),
+            source_preview: source_preview(node, self.source),
         };
-        let stable_key = format!("{prefix}#{ordinal}");
-        let symbol = SymbolNode {
-            stable_key,
-            name: spec.name.to_string(),
-            qualified_name: spec.qualified_name.to_string(),
-            kind: spec.kind,
-            raw_kind: Some(spec.raw_kind.to_string()),
-            language: self.language.clone(),
-            file_path: self.file_path.clone(),
-            span,
-            signature: symbol_signature(node, self.source),
-            docstring: symbol_docstring(node, self.source),
-            source_preview: symbol_source_preview(node, self.source),
-        };
-        self.nodes.push(symbol.clone());
-        symbol
+        self.builder.push_symbol(spec, fields)
     }
 
     /// Pushes one already-resolved edge.
     fn push_edge(&mut self, source_key: &str, target_key: &str, kind: EdgeKind) {
-        self.edges.push(SymbolEdge {
-            source_key: source_key.to_string(),
-            target_key: target_key.to_string(),
-            kind,
-        });
+        self.builder.push_edge(source_key, target_key, kind);
     }
 
     /// Pushes one unresolved reference for cross-file resolution.
@@ -437,39 +393,39 @@ impl RustWalker<'_> {
         target: ReferenceTarget,
         kind: EdgeKind,
     ) {
-        if target.path.is_empty() {
-            return;
-        }
-        let text = compact_source_text(node_text(node, self.source));
-        self.references.push(UnresolvedReference {
-            source_key: source_key.to_string(),
-            target,
-            kind,
-            file_path: self.file_path.clone(),
+        let at = ReferenceSpan {
             span: span(node),
-            text,
-            reason: None,
-        });
+            text: compact_source_text(node_text(node, self.source)),
+        };
+        self.builder.push_reference(source_key, target, kind, at);
     }
 }
 
-/// Returns a compact item declaration suitable for search output.
-fn symbol_signature(node: &Node, source: &[u8]) -> Option<String> {
-    let text = strip_leading_metadata(node_text(node, source));
-    let header = text
-        .split('{')
-        .next()
-        .unwrap_or(text.as_str())
-        .split(';')
-        .next()
-        .unwrap_or(text.as_str());
-    bounded_text(&compact_source_text(header), 300)
+/// Rust doc-comment and signature conventions.
+struct RustComments;
+
+impl CommentStrategy for RustComments {
+    /// Returns contiguous Rust doc comments directly attached to an item, read
+    /// from the lines above it or, failing that, from its own leading lines.
+    fn docstring(&self, node: &Node, source: &[u8]) -> Option<String> {
+        let source = str::from_utf8(source).ok()?;
+        let before = source.get(..node.start_byte()).unwrap_or_default();
+        let mut lines = leading_doc_lines(before);
+        if lines.is_empty() {
+            lines = inner_doc_lines(node_text(node, source.as_bytes()));
+        }
+        bounded_text(&lines.join("\n"), 800)
+    }
+
+    /// Returns a compact item declaration suitable for search output.
+    fn signature(&self, node: &Node, source: &[u8]) -> Option<String> {
+        header_signature(&strip_leading_metadata(node_text(node, source)))
+    }
 }
 
-/// Returns contiguous Rust doc comments directly attached to an item.
-fn symbol_docstring(node: &Node, source: &[u8]) -> Option<String> {
-    let source = str::from_utf8(source).ok()?;
-    let before = source.get(..node.start_byte()).unwrap_or_default();
+/// Collects contiguous doc-comment lines immediately preceding an item, skipping
+/// leading attributes.
+fn leading_doc_lines(before: &str) -> Vec<String> {
     let mut lines = Vec::new();
     for line in before.lines().rev() {
         let trimmed = line.trim();
@@ -483,35 +439,24 @@ fn symbol_docstring(node: &Node, source: &[u8]) -> Option<String> {
         break;
     }
     lines.reverse();
-
-    if lines.is_empty() {
-        for line in node_text(node, source.as_bytes()).lines() {
-            let trimmed = line.trim();
-            if let Some(doc) = clean_doc_comment(trimmed) {
-                lines.push(doc);
-                continue;
-            }
-            if trimmed.starts_with("#[") || trimmed.is_empty() {
-                continue;
-            }
-            break;
-        }
-    }
-
-    bounded_text(&lines.join("\n"), 800)
+    lines
 }
 
-/// Returns a bounded source excerpt for an indexed symbol.
-fn symbol_source_preview(node: &Node, source: &[u8]) -> Option<String> {
-    let text = node_text(node, source);
-    let preview = text
-        .lines()
-        .map(str::trim_end)
-        .skip_while(|line| line.trim().is_empty())
-        .take(24)
-        .collect::<Vec<_>>()
-        .join("\n");
-    bounded_text(&preview, 1200)
+/// Collects inner (`//!`) doc-comment lines from the head of an item's own text.
+fn inner_doc_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(doc) = clean_doc_comment(trimmed) {
+            lines.push(doc);
+            continue;
+        }
+        if trimmed.starts_with("#[") || trimmed.is_empty() {
+            continue;
+        }
+        break;
+    }
+    lines
 }
 
 /// Removes leading doc and attribute metadata from a declaration-like string.
@@ -537,39 +482,13 @@ fn clean_doc_comment(line: &str) -> Option<String> {
         .filter(|line| !line.is_empty())
 }
 
-/// Returns bounded non-empty text.
-fn bounded_text(text: &str, max_chars: usize) -> Option<String> {
-    let compact = text.trim();
-    if compact.is_empty() {
-        return None;
-    }
-    let mut output = String::new();
-    for character in compact.chars().take(max_chars) {
-        output.push(character);
-    }
-    Some(output)
-}
-
 /// Returns a node name from its `name` field or first identifier-like child.
 fn item_name(node: &Node, source: &[u8]) -> Option<String> {
-    if let Some(name) = field(node, "name") {
-        let text = clean_identifier(node_text(&name, source));
-        if !text.is_empty() {
-            return Some(text);
-        }
-    }
-    for child in named_children(node) {
-        if matches!(
-            child.kind().as_str(),
-            "identifier" | "type_identifier" | "field_identifier"
-        ) {
-            let text = clean_identifier(node_text(&child, source));
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
+    field_name(
+        node,
+        source,
+        &["identifier", "type_identifier", "field_identifier"],
+    )
 }
 
 /// Builds a reference target from a `call_expression`'s `function` child.
@@ -771,97 +690,15 @@ fn use_targets(node: &Node, prefix: &[String], source: &[u8]) -> Vec<ReferenceTa
     }
 }
 
-/// Builds a reference target with explicit path segments.
-fn reference_target(
-    raw: impl Into<String>,
-    path: Vec<String>,
-    qualifier: Option<String>,
-    kind: ReferenceKind,
-) -> ReferenceTarget {
-    ReferenceTarget {
-        raw: raw.into(),
-        path,
-        qualifier,
-        kind_hint: kind,
-    }
-}
-
-/// Builds an import reference target from full path segments.
-fn import_target(path: Vec<String>, kind: ReferenceKind) -> ReferenceTarget {
-    let raw = path.join("::");
-    let qualifier = (path.len() > 1).then(|| path[..path.len() - 1].join("::"));
-    ReferenceTarget {
-        raw,
-        path,
-        qualifier,
-        kind_hint: kind,
-    }
-}
-
-/// Splits isolated path text into non-empty `::` segments.
-fn path_segments(text: &str) -> Vec<String> {
-    clean_path(text)
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Joins a module scope with one item name.
-fn qualify(scope: &[String], name: &str) -> String {
-    qualify_with_extra(scope, &[name])
-}
-
-/// Joins a module scope with extra path components.
-fn qualify_with_extra(scope: &[String], extra: &[&str]) -> String {
-    scope
-        .iter()
-        .map(String::as_str)
-        .chain(extra.iter().copied())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("::")
-}
-
-/// Cleans an isolated identifier (strips raw markers and a trailing `!`).
-fn clean_identifier(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches("r#")
-        .trim_end_matches('!')
-        .to_string()
-}
-
-/// Cleans isolated path text into a resolver-friendly spelling.
-fn clean_path(value: &str) -> String {
-    let without_whitespace = value.split_whitespace().collect::<String>();
-    without_whitespace
-        .trim_start_matches("r#")
-        .trim_end_matches('!')
-        .trim_matches(';')
-        .to_string()
-}
-
-/// Collapses source text to one readable line for agent-facing context.
-fn compact_source_text(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Returns the Rust language ID.
 fn rust_language() -> LanguageId {
     LanguageId::from(PARSER_NAME)
 }
 
-/// Creates source unit metadata for one extracted file.
-fn source_unit(relative_path: &str, language: LanguageId) -> SourceUnit {
-    SourceUnit {
-        path: relative_path.to_string(),
-        language,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use oxcode_model::UnresolvedReference;
+
     use super::*;
 
     /// Parses a snippet and returns its extraction (crate-root `src/lib.rs`).

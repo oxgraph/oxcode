@@ -125,14 +125,16 @@ pub(crate) fn content_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Digest over every `Cargo.toml` under the root. A manifest change can alter
-/// crate-derived qualified names without changing any source file, so it must
-/// invalidate both the project digest and the extraction cache.
+/// Digest over every per-language package manifest under the root (`Cargo.toml`,
+/// `go.mod`, `package.json`, …). A manifest change can alter crate/module-derived
+/// qualified names without changing any source file, so it must invalidate both
+/// the project digest and the extraction cache.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Fs`] when a manifest cannot be read.
 pub(crate) fn scope_token(root: &Path) -> Result<u64> {
+    let manifest_names = crate::extract::manifest_filenames();
     let mut manifests: Vec<PathBuf> = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
         .standard_filters(true)
@@ -145,7 +147,10 @@ pub(crate) fn scope_token(root: &Path) -> Result<u64> {
             .file_type()
             .is_some_and(|file_type| file_type.is_file())
             && !paths::should_skip_path(root, path)
-            && path.file_name().is_some_and(|name| name == "Cargo.toml")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| manifest_names.contains(&name))
         {
             manifests.push(path.to_path_buf());
         }

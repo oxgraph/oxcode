@@ -1,13 +1,77 @@
 # oxcode
 
-`oxcode` indexes Rust source into a native OxGraph database. It uses
-tree-sitter for extraction, resolves code references into graph relations, and
-stores the result in a native OxGraph database under `.oxcode/index.oxgdb/`.
+`oxcode` indexes source code into a graph and serves it to coding agents. It is
+built on **[oxgraph](https://github.com/oxgraph/oxgraph)** — a storage-agnostic,
+zero-copy-friendly graph/hypergraph topology substrate for Rust — and stores the
+index in a native oxgraph database under `.oxcode/index.oxgdb/`.
 
 The CLI keeps raw OxQL available, but agent navigation should usually start
 with `context`, `symbols`, `files`, and the call graph commands because they
 expand graph IDs back into function names, definition ranges, signatures,
 docstrings, source previews, and call-site source context.
+
+## How Indexing Works
+
+1. **Extraction** — tree-sitter parses each source file into a syntax tree. A
+   per-language extractor walks it (hand-written) or runs a tree-sitter query
+   (generic), emitting symbol **nodes** (file, module, class, struct, trait,
+   interface, function, method, field, …) and **edges** (`contains`, `calls`,
+   `imports`, `references`, `implements`). Qualified names are normalized to a
+   `::`-joined internal form regardless of the language's own separator, so the
+   resolver and graph are language-neutral.
+2. **Resolution** — references resolve to definitions across files through tiers:
+   exact qualified name → enclosing module scope → in-scope imports → receiver
+   type → bare name. Ambiguous matches are kept and marked, not dropped.
+3. **Storage** — the resolved graph is reconciled into the oxgraph database with
+   stable symbol identities, so re-indexing is `O(change)`, not `O(repo)`.
+   Personalized PageRank over the graph powers the `context` command's bounded,
+   relevance-ranked output.
+
+## Languages
+
+Run `oxcode languages` to list the registered extractors. Coverage is tiered:
+
+| Language | Extensions | Tier |
+|----------|-----------|------|
+| Rust | `.rs` | High-fidelity |
+| Go | `.go` | High-fidelity |
+| TypeScript | `.ts` `.tsx` `.mts` `.cts` | High-fidelity |
+| JavaScript | `.js` `.jsx` `.mjs` `.cjs` | High-fidelity |
+| Python | `.py` `.pyi` | Generic |
+| Java | `.java` | Generic |
+| C | `.c` `.h` | Generic |
+| C++ | `.cpp` `.cc` `.cxx` `.hpp` `.hh` `.hxx` | Generic |
+| C# | `.cs` | Generic |
+| PHP | `.php` | Generic |
+| Ruby | `.rb` | Generic |
+| Swift | `.swift` | Generic |
+| Kotlin | `.kt` `.kts` | Generic |
+| Scala | `.scala` `.sc` | Generic |
+| Dart | `.dart` | Generic |
+| Lua | `.lua` | Generic |
+| Luau | `.luau` | Generic |
+| Objective-C | `.m` `.mm` | Generic |
+| Pascal/Delphi | `.pas` `.dpr` `.dpk` `.lpr` | Generic |
+| Svelte | `.svelte` | Embedded script |
+| Vue | `.vue` | Embedded script |
+| Liquid | `.liquid` | Recognized |
+
+- **High-fidelity** — hand-written extractors that resolve receiver-typed method
+  calls (`self`/`this`/Go receivers), precise qualified names, and imports
+  (including TypeScript path-based ESM imports).
+- **Generic** — one query-driven extractor shared by all of these languages.
+  Each is a tree-sitter query plus a profile entry
+  (`crates/oxcode-core/src/extract/profiles.rs`); containment comes from byte-span
+  nesting. It yields symbols and approximate call edges that resolve at the
+  scoped/simple tiers (no receiver typing), so some edges are marked ambiguous.
+- **Embedded script** — Svelte/Vue `<script>` blocks are extracted as TypeScript
+  at offsets accurate to the original component file.
+- **Recognized** — the file type is known but not indexed yet; such files are
+  reported as skipped, not silently dropped.
+
+Adding a language is a tree-sitter query + a profile entry; promoting one to
+high fidelity is a hand-written extractor that reuses the shared
+`extract/walker.rs` scaffolding.
 
 ## Quick Start
 

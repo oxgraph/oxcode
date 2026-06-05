@@ -1225,9 +1225,10 @@ fn render_file_skeleton(
     Some(output)
 }
 
-/// Returns whether a path belongs to a test-like tree.
+/// Returns whether a path belongs to a test-like tree, by directory convention
+/// or by a language's test-file naming convention.
 fn is_test_like_path(file_path: &str) -> bool {
-    file_path.contains("/tests/")
+    if file_path.contains("/tests/")
         || file_path.starts_with("tests/")
         || file_path.contains("/benches/")
         || file_path.starts_with("benches/")
@@ -1235,6 +1236,23 @@ fn is_test_like_path(file_path: &str) -> bool {
         || file_path.starts_with("examples/")
         || file_path.contains("/fixtures/")
         || file_path.starts_with("fixtures/")
+        || file_path.contains("/__tests__/")
+        || file_path.starts_with("__tests__/")
+    {
+        return true;
+    }
+    let basename = file_path.rsplit('/').next().unwrap_or(file_path);
+    // Go: `foo_test.go`. Python: `test_foo.py` / `foo_test.py`. JS/TS:
+    // `foo.test.ts` / `foo.spec.tsx` and the `.js`/`.jsx`/`.mjs` variants.
+    basename.ends_with("_test.go")
+        || basename.ends_with("_test.py")
+        || basename.starts_with("test_") && basename.ends_with(".py")
+        || [".test.", ".spec."]
+            .iter()
+            .any(|marker| basename.contains(marker))
+            && [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]
+                .iter()
+                .any(|ext| basename.ends_with(ext))
 }
 
 /// Scores one indexed file for file discovery.
