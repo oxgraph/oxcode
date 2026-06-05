@@ -67,6 +67,18 @@ if [ -n "$ARMS_ARG" ]; then
   IFS=',' read -r -a ARMS <<< "$ARMS_ARG"
 fi
 
+arm_selected() { local a; for a in "${ARMS[@]}"; do [ "$a" = "$1" ] && return 0; done; return 1; }
+
+# The oxcode-mcp arm delivers the same indexed queries over MCP (one-call
+# oxcode_explore) instead of a shell CLI; build the server but keep it OFF the
+# agent's PATH so the agent must use the MCP tools, not a binary.
+if arm_selected "oxcode-mcp"; then
+  echo "### building oxcode-mcp (release)"
+  cargo build --release -p oxcode-mcp
+  mkdir -p "$OUT/bin/oxcode-mcp"
+  ln -sf "$ROOT/target/release/oxcode-mcp" "$OUT/bin/oxcode-mcp/oxcode-mcp"
+fi
+
 WORKSHOP_URL="$(node "$ROOT/scripts/agent-eval/workshop-url.mjs" --start true)"
 echo "$WORKSHOP_URL" > "$OUT/workshop-url.txt"
 raindrop replay register --cwd="$ROOT" > "$OUT/replay-register.out" 2> "$OUT/replay-register.err"
@@ -123,6 +135,13 @@ for task_json in "${TASK_JSON_LINES[@]}"; do
   prepare_arm_repo "$source_repo" "$oxcode_repo"
   "$OUT/bin/oxcode/oxcode" index --path "$oxcode_repo" > "$OUT/$repo_name-oxcode-index.out" 2> "$OUT/$repo_name-oxcode-index.err"
 
+  if arm_selected "oxcode-mcp"; then
+    echo "### indexing $repo_name for oxcode-mcp arm"
+    oxcode_mcp_repo="$CORPUS/$repo_name/oxcode-mcp"
+    prepare_arm_repo "$source_repo" "$oxcode_mcp_repo"
+    "$OUT/bin/oxcode/oxcode" index --path "$oxcode_mcp_repo" > "$OUT/$repo_name-oxcode-mcp-index.out" 2> "$OUT/$repo_name-oxcode-mcp-index.err"
+  fi
+
   if [ -n "${CODEGRAPH_BIN:-}" ]; then
     echo "### indexing $repo_name with codegraph"
     codegraph_repo="$CORPUS/$repo_name/codegraph-cli"
@@ -145,6 +164,8 @@ for task_json in "${TASK_JSON_LINES[@]}"; do
       path_prepend=""
       if [ "$arm" = "oxcode-cli" ]; then path_prepend="$OUT/bin/oxcode"; fi
       if [ "$arm" = "codegraph-cli" ]; then path_prepend="$OUT/bin/codegraph"; fi
+      mcp_bin_arg=()
+      if [ "$arm" = "oxcode-mcp" ]; then mcp_bin_arg=(--mcp-bin "$OUT/bin/oxcode-mcp/oxcode-mcp"); fi
       echo "### $task_id $arm run $run"
       "$ROOT/scripts/agent-eval/run-codex-arm.sh" \
         --task-file "$TASK_FILE" \
@@ -158,7 +179,8 @@ for task_json in "${TASK_JSON_LINES[@]}"; do
         --model "$MODEL" \
         --workshop-url "$WORKSHOP_URL" \
         --auth-file "$AUTH_FILE" \
-        --path-prepend "$path_prepend" || true
+        --path-prepend "$path_prepend" \
+        ${mcp_bin_arg[@]+"${mcp_bin_arg[@]}"} || true
     done
   done
 done

@@ -79,59 +79,93 @@ pub fn format_file_search_report(report: &FileSearchReport) -> String {
 #[must_use]
 pub fn format_context_report(report: &ContextReport) -> String {
     let mut output = format!("context {:?}\n{}\n", report.query, report.summary);
-    output.push_str("entry points\n");
-    if report.entry_points.is_empty() {
+
+    output.push_str("symbols\n");
+    if report.symbols.is_empty() {
         output.push_str("  none\n");
     }
-    for entry in &report.entry_points {
+    for symbol in &report.symbols {
         output.push_str(&format!(
-            "  {} score={}\n",
-            symbol_inline(&entry.symbol),
-            entry.score
+            "  #{} {} [{}] pagerank={:.4}\n",
+            symbol.id.get(),
+            symbol.qualified_name,
+            symbol.kind,
+            symbol.pagerank,
         ));
-        push_symbol_metadata(&mut output, &entry.symbol, "    ");
+        if let Some(signature) = &symbol.signature {
+            output.push_str(&format!(
+                "    signature {}\n",
+                one_line_preview(signature, 240)
+            ));
+        }
     }
-    output.push_str("related symbols\n");
-    if report.related_symbols.is_empty() {
-        output.push_str("  none\n");
-    }
-    for related in &report.related_symbols {
-        output.push_str(&format!(
-            "  depth {} {} {}\n",
-            related.depth,
-            related.reason,
-            symbol_inline(&related.symbol)
-        ));
-    }
+
     output.push_str("relationships\n");
     if report.relationships.is_empty() {
         output.push_str("  none\n");
     }
-    for relationship in &report.relationships {
+    for relation in &report.relationships {
         output.push_str(&format!(
-            "  {} relation:{} {} -> {}\n",
-            relationship.kind,
-            relationship.relation_id,
-            symbol_inline(&relationship.source),
-            symbol_inline(&relationship.target)
+            "  {} #{} -> #{} relation:{}\n",
+            relation.kind,
+            relation.source_id.get(),
+            relation.target_id.get(),
+            relation.relation_id,
         ));
-        if let Some(site) = &relationship.site {
-            output.push_str(&format!("    site {}\n", location_range(&site.location)));
-            if !site.text.is_empty() {
-                output.push_str(&format!("    expression {}\n", site.text));
-            }
+    }
+
+    if !report.blast_radius.callers.is_empty() || !report.blast_radius.tests.is_empty() {
+        output.push_str("blast radius\n");
+        for caller in &report.blast_radius.callers {
+            output.push_str(&format!(
+                "  caller {} ({})\n",
+                caller.qualified_name, caller.path
+            ));
+        }
+        for caller in &report.blast_radius.tests {
+            output.push_str(&format!(
+                "  test {} ({})\n",
+                caller.qualified_name, caller.path
+            ));
         }
     }
+
+    if !report.call_flow.is_empty() {
+        output.push_str("call flow\n");
+        for hop in &report.call_flow {
+            output.push_str(&format!(
+                "  #{} -> #{}\n",
+                hop.from_id.get(),
+                hop.to_id.get()
+            ));
+        }
+    }
+
     output.push_str("files\n");
     if report.files.is_empty() {
         output.push_str("  none\n");
     }
     for file in &report.files {
-        output.push_str(&format!(
-            "  {} matched={} related={}\n",
-            file.path, file.matched_symbols, file.related_symbols
-        ));
+        output.push_str(&format!("  {}\n", file.path));
+        if let Some(skeleton) = &file.skeleton {
+            for line in skeleton.lines() {
+                output.push_str("    ");
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
     }
+
+    output.push_str(&format!(
+        "budget {}/{} chars{}\n",
+        report.budget.total_chars,
+        report.budget.max_total_chars,
+        if report.budget.truncated {
+            " (truncated)"
+        } else {
+            ""
+        },
+    ));
     output
 }
 
