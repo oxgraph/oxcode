@@ -59,6 +59,12 @@ measurement, not a noisy agent average).
 
 ## Agent benchmark: oxcode-cli vs the no-tool control on Tokio
 
+> Note: this section reports an earlier **two-arm** suite (`empty` vs `oxcode-cli`).
+> The consolidated **three-arm** suite further down (which adds `oxcode-mcp`) is the
+> current headline. oxcode-cli's qualitative result — statistically tied with the
+> baseline — reproduces there (−4% tool calls, +15% tokens, quality 0.96 vs 0.98);
+> the exact percentages differ run-to-run because n=6 token/wall deltas are noisy.
+
 - codex / gpt-5.5, oxcode **release** build, `empty` vs `oxcode-cli`, RUNS=6, median + 95% CI.
 - codegraph reference: README "Benchmark Results" (Opus 4.8, MCP `codegraph_explore`, median of 4), re-validated 2026-06-02. Comparable unit = improvement vs each tool's own control.
 
@@ -88,13 +94,74 @@ the tokio corpus took **26.89 s** debug vs **1.25 s** release (21x), and the run
 `bench-rust.sh` now builds `--release`. After the fix, oxcode query p50 fell to
 931 ms and tool share from 40% to 2.9%.
 
+## Agent benchmark: oxcode-mcp — the predicted MCP lever, confirmed
+
+The section above closed on a prediction: the codegraph gap is **delivery**, and the
+next lever is exposing oxcode as an MCP with a one-call `explore` tool. We built it
+— `crates/oxcode-mcp`, seven tools, `oxcode_explore` primary, serving the *same*
+bounded PageRank-curated `context` — and re-ran the Tokio task as a third arm in
+one suite alongside `empty` and `oxcode-cli` (codex / gpt-5.5, release, n=6, same
+blind judge).
+
+| metric (Tokio, n=6 medians) | empty | oxcode-cli | oxcode-mcp |
+|---|---:|---:|---:|
+| tool calls | 28 | 27 | **5** |
+| tokens | 395k | 455k | **104k** |
+| cost (est. $) | 0.170 | 0.177 | **0.073** |
+| wall time | 97s | 111s | **39s** |
+| answer quality (blind judge) | 0.98 | 0.96 | 0.93 |
+
+Improvement vs each tool's own no-tool control:
+
+| metric | oxcode-mcp vs empty | oxcode-cli vs empty | codegraph vs empty (published) |
+|---|---:|---:|---:|
+| tool calls (fewer) | **−84%** | −4% | −57% |
+| tokens (fewer) | **−74%** | +15% | −38% |
+| cost (cheaper) | **−57%** | +4% | even |
+| wall time (faster) | **−60%** | +14% | −18% |
+| answer quality | −6% (0.93 vs 0.98) | −2% (tied) | not measured |
+
+### Reading it honestly
+
+- **Delivery was the binding constraint, and MCP removes it.** Same index, same
+  curated-context payload — only the delivery changed (one-call MCP tool vs a CLI
+  the agent composes), and tool calls collapsed 28 → 5. The CLI arm stays tied with
+  the baseline; the MCP arm wins decisively on every efficiency axis and **exceeds
+  codegraph's published reductions** (−84% vs −57% tool calls, −74% vs −38% tokens).
+  This is the clean experiment the prior section asked for: holding payload fixed
+  and changing only delivery isolates delivery as the cause.
+- **The win carries a small, real quality cost — and the gate catches it.** MCP
+  quality is 0.93 vs the baseline's 0.98, and the per-run distributions barely
+  overlap (MCP max 0.95 < baseline min 0.97), so it is signal, not n=6 noise. The
+  judge breakdown shows a *completeness* cost, not a correctness one: the one-call
+  answers stay correct (~0.92) and well-grounded (~0.96) but undercover secondary
+  concepts (e.g. `block_on`, `JoinHandle`) that the read-everything baseline
+  surfaces by brute force. A quality-blind benchmark like codegraph's would report
+  the −84% / −74% efficiency win and hide this cost — which is exactly why oxcode
+  keeps the quality row.
+- **Next lever:** close the completeness gap without giving back efficiency — nudge
+  `oxcode_explore` to surface a few more secondary symbols, raise its default
+  `max_bytes`, or have the arm prompt take one or two more targeted follow-ups.
+
+### codex headless MCP gotcha (found and fixed wiring this arm)
+
+`codex exec --json` *does* expose MCP tools headlessly (codex 0.133.0), but its
+non-interactive approval gate auto-cancels every MCP call with `user cancelled MCP
+tool call` (failing in ~3 ms) under `--ask-for-approval never --ignore-user-config`.
+The fix is one config override, which `run-codex-arm.sh` passes for the MCP arm:
+`-c mcp_servers.oxcode.default_tools_approval_mode=approve` (project `trust_level`
+does *not* help). The server binary is kept off the agent's PATH so the agent must
+use the MCP tools, not a shell binary.
+
 ## Reproduce
 
 ```bash
 scripts/agent-eval/bench-rust.sh --skip-smoke \
-  --tasks tokio-runtime-schedule --arms empty,oxcode-cli --runs 6
+  --tasks tokio-runtime-schedule --arms empty,oxcode-cli,oxcode-mcp --runs 6
+# vs-control deltas, per treatment arm (oxcode-mcp shown; swap for oxcode-cli):
 node scripts/agent-eval/compare-codegraph.mjs \
-  --metrics target/agent-eval/<suite>/suite-metrics.json --task tokio-runtime-schedule
+  --metrics target/agent-eval/<suite>/suite-metrics.json --task tokio-runtime-schedule \
+  --treatment-arm oxcode-mcp --baseline-arm empty
 ```
 
 Generated suites live under ignored `target/agent-eval/` and are not committed.
