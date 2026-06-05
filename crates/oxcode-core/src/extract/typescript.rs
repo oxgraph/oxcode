@@ -93,6 +93,27 @@ fn parse(path: &Path, parser_name: &str, source: &[u8]) -> Result<Tree> {
     })
 }
 
+/// Extracts symbols from a `<script>` body parsed as TypeScript.
+///
+/// `source` is expected to be the whole host file with non-script bytes masked
+/// to whitespace, so the extracted spans stay accurate to the original file.
+/// Used by the Svelte/Vue host extractors.
+pub(crate) fn extract_script(
+    relative_path: &str,
+    base_scope: &[String],
+    language: LanguageId,
+    source: &[u8],
+) -> Result<Extraction> {
+    let tree = parse(Path::new(relative_path), "typescript", source)?;
+    Ok(extract_module(
+        relative_path,
+        base_scope,
+        language,
+        source,
+        &tree,
+    ))
+}
+
 /// Extracts code graph nodes and references from one TS/JS source file.
 fn extract_module(
     relative_path: &str,

@@ -491,6 +491,39 @@ fn cli_indexes_a_python_project_via_the_generic_extractor() {
         .stdout(contains("\"helper\""));
 }
 
+#[test]
+fn cli_indexes_a_svelte_component_via_embedded_script() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path().to_str().expect("utf8 path");
+    write(
+        temp.path().join("src/App.svelte"),
+        "<h1>hi</h1>\n<script>\nfunction helper() { return 1; }\nfunction entry() { return helper(); }\n</script>\n",
+    );
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["index", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("indexed"));
+
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .arg("languages")
+        .assert()
+        .success()
+        .stdout(contains("svelte"));
+
+    // The `<script>` function is indexed and its in-script call resolves.
+    Command::cargo_bin("oxcode")
+        .expect("binary")
+        .args(["calls", "src::App::entry", "--json", "--path", root])
+        .assert()
+        .success()
+        .stdout(contains("\"status\": \"matched\""))
+        .stdout(contains("\"helper\""));
+}
+
 fn rust_project() -> TempDir {
     let temp = TempDir::new().expect("temp dir");
     write(

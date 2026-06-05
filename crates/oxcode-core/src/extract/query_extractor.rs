@@ -482,6 +482,102 @@ mod tests {
     }
 
     #[test]
+    fn generic_languages_extract_expected_symbols() {
+        struct Case {
+            lang: &'static str,
+            relative: &'static str,
+            source: &'static str,
+            want: &'static [(&'static str, NodeKind)],
+        }
+        let cases = [
+            Case {
+                lang: "csharp",
+                relative: "App.cs",
+                source: "class C { void M() { Helper(); } void Helper() {} }",
+                want: &[("C", NodeKind::Class), ("M", NodeKind::Method)],
+            },
+            Case {
+                lang: "php",
+                relative: "app.php",
+                source: "<?php\nfunction helper() {}\nclass C { function m() {} }",
+                want: &[("helper", NodeKind::Function), ("m", NodeKind::Method)],
+            },
+            Case {
+                lang: "ruby",
+                relative: "app.rb",
+                source: "class C\n  def m\n  end\nend\n",
+                want: &[("C", NodeKind::Class), ("m", NodeKind::Method)],
+            },
+            Case {
+                lang: "swift",
+                relative: "app.swift",
+                source: "class C {}\nfunc top() {}\n",
+                want: &[("C", NodeKind::Class), ("top", NodeKind::Function)],
+            },
+            Case {
+                lang: "kotlin",
+                relative: "app.kt",
+                source: "class C\nfun top() {}\n",
+                want: &[("C", NodeKind::Class), ("top", NodeKind::Function)],
+            },
+            Case {
+                lang: "scala",
+                relative: "app.scala",
+                source: "object O { def m(): Unit = {} }\n",
+                want: &[("O", NodeKind::Class), ("m", NodeKind::Function)],
+            },
+            Case {
+                lang: "dart",
+                relative: "app.dart",
+                source: "class C { void m() {} }\nvoid top() {}\n",
+                want: &[("C", NodeKind::Class), ("top", NodeKind::Function)],
+            },
+            Case {
+                lang: "lua",
+                relative: "app.lua",
+                source: "function entry()\n  helper()\nend\n",
+                want: &[("entry", NodeKind::Function)],
+            },
+            Case {
+                lang: "luau",
+                relative: "app.luau",
+                source: "function entry()\nend\n",
+                want: &[("entry", NodeKind::Function)],
+            },
+            Case {
+                lang: "objc",
+                relative: "app.m",
+                source: "@implementation C\n- (void)m {}\n@end\n",
+                want: &[("C", NodeKind::Class), ("m", NodeKind::Method)],
+            },
+            Case {
+                lang: "pascal",
+                relative: "app.pas",
+                source: "function Entry: Integer;\nbegin\nend;\n",
+                want: &[("Entry", NodeKind::Function)],
+            },
+        ];
+        for case in cases {
+            let extraction = extract(case.lang, case.relative, case.source);
+            for (name, kind) in case.want {
+                assert!(
+                    extraction
+                        .nodes
+                        .iter()
+                        .any(|node| node.name == *name && node.kind == *kind),
+                    "{}: expected {kind:?} {name}, got {:?}",
+                    case.lang,
+                    extraction
+                        .nodes
+                        .iter()
+                        .map(|node| (node.name.as_str(), node.kind))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn python_functions_and_calls_are_extracted() {
         let source = "def helper():\n    return 1\n\ndef entry():\n    return helper()\n";
         let extraction = extract("python", "mod.py", source);

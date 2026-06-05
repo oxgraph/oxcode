@@ -14,6 +14,7 @@ use crate::{
 
 mod cargo;
 mod cst;
+mod embedded;
 mod go;
 mod profile;
 mod profiles;
@@ -33,8 +34,9 @@ mod walker;
 /// reported as skipped rather than silently dropped.
 pub(crate) const RECOGNIZED_SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs", "py", "pyi", "go", "java", "c",
-    "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", //
-    "rb", "php", "cs", "kt", "swift", "scala", "lua",
+    "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "cs", "php", "rb", "swift", "kt", "kts", "scala",
+    "sc", "dart", "lua", "luau", "m", "mm", "pas", "dpr", "dpk", "lpr", "svelte", "vue", //
+    "liquid",
 ];
 
 /// Package-manifest filenames whose contents can change crate/module-derived
@@ -97,6 +99,8 @@ impl Registry {
             Box::new(rust::RustExtractor),
             Box::new(go::GoExtractor),
             Box::new(typescript::TypeScriptExtractor),
+            Box::new(embedded::ScriptHostExtractor::svelte()),
+            Box::new(embedded::ScriptHostExtractor::vue()),
         ];
         // Generic query-driven profiles cover the long tail; they are registered
         // after the hand-written extractors, which claim their extensions first.
@@ -291,8 +295,10 @@ mod tests {
         assert!(registry().extractor_for(Path::new("main.go")).is_some());
         assert!(registry().extractor_for(Path::new("app.ts")).is_some());
         assert!(registry().extractor_for(Path::new("app.py")).is_some());
+        assert!(registry().extractor_for(Path::new("App.cs")).is_some());
+        assert!(registry().extractor_for(Path::new("App.svelte")).is_some());
         // A recognized-but-unsupported language has no extractor.
-        assert!(registry().extractor_for(Path::new("app.rb")).is_none());
+        assert!(registry().extractor_for(Path::new("page.liquid")).is_none());
     }
 
     #[test]
@@ -331,10 +337,11 @@ mod tests {
     #[test]
     fn recognized_unsupported_excludes_supported_languages() {
         // Recognized source, no extractor yet -> unsupported.
-        assert!(is_recognized_unsupported(Path::new("app.rb")));
+        assert!(is_recognized_unsupported(Path::new("page.liquid")));
         // Recognized source with an extractor -> not unsupported.
         assert!(!is_recognized_unsupported(Path::new("lib.rs")));
         assert!(!is_recognized_unsupported(Path::new("app.py")));
+        assert!(!is_recognized_unsupported(Path::new("app.rb")));
         // Unknown extension -> not a recognized source at all.
         assert!(!is_recognized_unsupported(Path::new("notes.txt")));
     }
