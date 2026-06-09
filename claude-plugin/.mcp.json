@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "oxcode": {
+      "type": "stdio",
+      "command": "oxcode",
+      "args": ["mcp"]
+    }
+  }
+}
