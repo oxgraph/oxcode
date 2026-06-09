@@ -63,6 +63,19 @@ Optionally auto-allow the read-only tools in `~/.claude/settings.json`:
 `mcp__oxcode__oxcode_explore`, `_search`, `_callers`, `_callees`, `_symbol`,
 `_files`, `_status`.
 
+#### Claude Code plugin (one-command install)
+
+Instead of hand-editing the config above, install the bundled plugin from the
+oxgraph marketplace — it wires up the MCP server for you:
+
+```sh
+/plugin marketplace add oxgraph/oxgraph
+/plugin install oxcode@oxgraph
+```
+
+The plugin still needs the `oxcode` binary on your `PATH` and an indexed project
+(steps 1–2). See [`claude-plugin/README.md`](claude-plugin/README.md).
+
 ## How Indexing Works
 
 1. **Extraction** — tree-sitter parses each source file into a syntax tree. A

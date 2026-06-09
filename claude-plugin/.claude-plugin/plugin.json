@@ -1,0 +1,9 @@
+{
+  "name": "oxcode",
+  "description": "PageRank-curated code intelligence for coding agents. Bundles the oxcode MCP server (explore/search/callers/callees/symbol/files/status) over stdio.",
+  "author": { "name": "oxgraph", "email": "michael@snowmead.com" },
+  "homepage": "https://oxgraph.io",
+  "repository": "https://github.com/oxgraph/oxcode",
+  "license": "MIT",
+  "keywords": ["mcp", "code-intelligence", "code-navigation", "pagerank", "oxgraph"]
+}
