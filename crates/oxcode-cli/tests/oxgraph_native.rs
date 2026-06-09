@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use oxcode_core::{
-    ExpandedQueryValue, GraphDirection, IndexStats, OxElementId, OxQueryResult, OxQueryValue,
-    ProjectIndex,
+    ExpandedQueryValue, GraphDirection, IndexProgress, IndexStage, IndexStats, OxElementId,
+    OxQueryResult, OxQueryValue, ProjectIndex,
 };
 use tempfile::TempDir;
 
@@ -161,6 +161,55 @@ fn indexing_persists_unresolved_references() {
     );
     let status = oxcode_core::project_status(temp.path()).expect("status");
     assert_eq!(status.unresolved_references, stats.unresolved_references);
+}
+
+#[test]
+fn index_progress_reports_each_stage_in_order() {
+    let temp = rust_project();
+
+    // A cold index passes through all four stages, in order, 1..=4 of 4.
+    let mut cold = Vec::new();
+    oxcode_core::index_project_with_progress(temp.path(), |progress| cold.push(progress))
+        .expect("cold index");
+    assert_eq!(
+        cold,
+        vec![
+            IndexProgress {
+                stage: IndexStage::Scan,
+                step: 1,
+                total: 4
+            },
+            IndexProgress {
+                stage: IndexStage::Extract,
+                step: 2,
+                total: 4
+            },
+            IndexProgress {
+                stage: IndexStage::Resolve,
+                step: 3,
+                total: 4
+            },
+            IndexProgress {
+                stage: IndexStage::Store,
+                step: 4,
+                total: 4
+            },
+        ]
+    );
+
+    // An unchanged re-index short-circuits after the digest check, so only the
+    // Scan milestone fires before the cached stats are returned.
+    let mut warm = Vec::new();
+    oxcode_core::index_project_with_progress(temp.path(), |progress| warm.push(progress))
+        .expect("warm index");
+    assert_eq!(
+        warm,
+        vec![IndexProgress {
+            stage: IndexStage::Scan,
+            step: 1,
+            total: 4
+        }]
+    );
 }
 
 fn assert_index_stats(stats: &IndexStats) {

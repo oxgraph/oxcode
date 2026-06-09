@@ -42,6 +42,52 @@ pub struct GraphWalk {
     pub limit: usize,
 }
 
+/// A stage of the indexing pipeline, reported through the
+/// [`index_project_with_progress`] callback as each phase begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStage {
+    /// Discovering source files and hashing them into a content digest.
+    Scan,
+    /// Parsing sources into symbols and edges (tree-sitter extraction).
+    Extract,
+    /// Resolving cross-file references into graph edges.
+    Resolve,
+    /// Reconciling the resolved index into the OxGraph database.
+    Store,
+}
+
+impl IndexStage {
+    /// A short human-readable label for the stage, suitable for a progress
+    /// message.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scan => "scanning sources",
+            Self::Extract => "extracting symbols",
+            Self::Resolve => "resolving references",
+            Self::Store => "reconciling database",
+        }
+    }
+}
+
+/// A single progress milestone emitted while indexing: the stage that is
+/// starting and its position in the fixed sequence of [`IndexProgress::TOTAL`]
+/// stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexProgress {
+    /// The stage that is now beginning.
+    pub stage: IndexStage,
+    /// The 1-based position of this stage (monotonically increasing).
+    pub step: u32,
+    /// The total number of stages in a full index (always [`Self::TOTAL`]).
+    pub total: u32,
+}
+
+impl IndexProgress {
+    /// The fixed number of stages a full (non-no-op) index passes through.
+    pub const TOTAL: u32 = 4;
+}
+
 /// Indexes one project root into a native OxGraph database.
 ///
 /// Re-indexing an unchanged project is a near-instant no-op: a content digest
@@ -50,6 +96,28 @@ pub struct GraphWalk {
 /// recorded stats are returned without re-extracting, re-resolving, or
 /// rebuilding the database.
 pub fn index_project(root: impl AsRef<Path>) -> Result<IndexStats> {
+    index_project_with_progress(root, |_| {})
+}
+
+/// Indexes one project root into a native OxGraph database, reporting each
+/// pipeline stage to `on_progress` as it begins.
+///
+/// Identical to [`index_project`] except that `on_progress` is invoked with an
+/// [`IndexProgress`] at the start of each of the four heavy stages (`Scan →
+/// Extract → Resolve → Store`). On the near-instant unchanged-digest path only
+/// the `Scan` milestone fires before the cached stats are returned. The
+/// callback runs synchronously on the calling thread.
+pub fn index_project_with_progress(
+    root: impl AsRef<Path>,
+    mut on_progress: impl FnMut(IndexProgress),
+) -> Result<IndexStats> {
+    let stage = |stage: IndexStage, step: u32| IndexProgress {
+        stage,
+        step,
+        total: IndexProgress::TOTAL,
+    };
+
+    on_progress(stage(IndexStage::Scan, 1));
     let root = paths::canonical_root(root.as_ref())?;
     let files = scan::discover_source_files(&root);
     let scope = manifest::scope_token(&root)?;
@@ -62,6 +130,7 @@ pub fn index_project(root: impl AsRef<Path>) -> Result<IndexStats> {
         return Ok(existing.into_stats(root, database_path));
     }
 
+    on_progress(stage(IndexStage::Extract, 2));
     let cache = cache::load(&root, scope);
     let (input, next_cache) = extract::extract_project(&root, &cache)?;
     let failed_files = input
@@ -74,10 +143,12 @@ pub fn index_project(root: impl AsRef<Path>) -> Result<IndexStats> {
         .iter()
         .filter(|diagnostic| diagnostic.status == FileParseStatus::Partial)
         .count();
+    on_progress(stage(IndexStage::Resolve, 3));
     let resolved = resolve::resolve_extractions(input.extractions)?;
     // Reconcile the database against the resolved index in place: unchanged
     // symbols and edges keep their ids (only the changed delta mutates) and the
     // first index simply mints everything against a fresh store.
+    on_progress(stage(IndexStage::Store, 4));
     let database = store::oxgraph::reconcile_database(&root, &resolved)?;
     let stats = IndexStats {
         root,

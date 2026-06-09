@@ -5,12 +5,17 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use oxcode_core::{GraphDirection, NodeKind, ProjectIndex};
+use oxcode_core::{GraphDirection, IndexProgress, NodeKind, ProjectIndex};
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
+    ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        CallToolResult, Content, Meta, ProgressNotificationParam, ServerCapabilities, ServerInfo,
+        TasksCapability,
+    },
+    schemars, task_handler,
+    task_manager::OperationProcessor,
+    tool, tool_handler, tool_router,
     transport::stdio,
 };
 use serde::Deserialize;
@@ -30,14 +35,19 @@ pub(crate) fn serve() -> anyhow::Result<()> {
 
 /// Server instructions steering agents to the one-call `oxcode_explore` tool.
 const INSTRUCTIONS: &str = "This server answers questions about the indexed code repository in the \
-working directory. For almost any code-understanding question, call `oxcode_explore` first with the \
+working directory. If `oxcode_status` reports no database, call `oxcode_index` first to build it \
+(it accepts an optional `path`, defaults to the working directory, and re-indexing after changes is \
+incremental). For almost any code-understanding question, call `oxcode_explore` first with the \
 user's question verbatim: it returns the most relevant symbols (ranked by graph centrality), their \
 source, the relationships among them, the blast radius, and the call flow — in one call. Use \
 `oxcode_callers`/`oxcode_callees`/`oxcode_symbol` to follow specific edges, and \
-`oxcode_search`/`oxcode_files` only when explore did not surface the target. Prefer these tools over \
-shelling out to grep or reading files. Do not edit files.";
+`oxcode_search`/`oxcode_files` only when explore did not surface the target. Prefer these query \
+tools over shelling out to grep or reading files; `oxcode_index` is the only tool that writes \
+(it maintains `.oxcode/`). Do not edit source files.";
 
-/// MCP server over oxcode's read-only queries, caching one opened index per root.
+/// MCP server over oxcode's queries plus an `oxcode_index` build tool, caching
+/// one opened index per root and driving task-augmented calls through an
+/// [`OperationProcessor`].
 #[derive(Clone)]
 pub(crate) struct OxcodeServer {
     #[expect(
@@ -46,6 +56,8 @@ pub(crate) struct OxcodeServer {
     )]
     tool_router: ToolRouter<OxcodeServer>,
     indexes: Arc<Mutex<HashMap<PathBuf, Arc<ProjectIndex>>>>,
+    /// Backs the rmcp `#[task_handler]` lifecycle for task-augmented tool calls.
+    operations: Arc<Mutex<OperationProcessor>>,
 }
 
 /// A code question to answer in one curated call.
@@ -112,6 +124,13 @@ pub(crate) struct StatusParams {
     pub path: Option<String>,
 }
 
+/// A project root to build or refresh the index for.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct IndexParams {
+    /// Project root to index; defaults to the server's working directory.
+    pub path: Option<String>,
+}
+
 #[tool_router]
 impl OxcodeServer {
     /// Builds an empty server; the index is opened lazily on the first tool call.
@@ -120,11 +139,13 @@ impl OxcodeServer {
         Self {
             tool_router: Self::tool_router(),
             indexes: Arc::new(Mutex::new(HashMap::new())),
+            operations: Arc::new(Mutex::new(OperationProcessor::new())),
         }
     }
 
     #[tool(
-        description = "Answer a code question in one call: returns the most relevant symbols ranked by graph centrality, their source, relationships, blast radius, and call flow for the query. Use this first for any code-understanding question."
+        description = "Answer a code question in one call: returns the most relevant symbols ranked by graph centrality, their source, relationships, blast radius, and call flow for the query. Use this first for any code-understanding question.",
+        execution(task_support = "optional")
     )]
     async fn oxcode_explore(
         &self,
@@ -135,6 +156,59 @@ impl OxcodeServer {
         let max_bytes = params.max_bytes.unwrap_or(20_000);
         let report = blocking(move || index.context(&query, 8, 1, max_bytes)).await?;
         json_result(&report)
+    }
+
+    #[tool(
+        description = "Build or refresh the oxcode index for a project (defaults to the working directory), writing .oxcode/index.oxgdb/. Run this first when oxcode_status reports no database, and after code changes to refresh it (re-indexing is incremental). Reports scan/extract/resolve/store progress when invoked with a progress token.",
+        execution(task_support = "optional")
+    )]
+    async fn oxcode_index(
+        &self,
+        Parameters(params): Parameters<IndexParams>,
+        meta: Meta,
+        peer: Peer<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = resolve_root(params.path);
+        let index_root = root.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IndexProgress>();
+        let handle = tokio::task::spawn_blocking(move || {
+            oxcode_core::index_project_with_progress(&index_root, |progress| {
+                // The receiver is dropped when no progress token was supplied;
+                // a failed send just means nobody is listening.
+                let _ = tx.send(progress);
+            })
+        });
+
+        // Forward each stage milestone as an MCP progress notification when the
+        // client opted in with a progress token. Draining the channel until the
+        // sender drops also serves as the await point for the blocking index.
+        if let Some(token) = meta.get_progress_token() {
+            while let Some(progress) = rx.recv().await {
+                let _ = peer
+                    .notify_progress(ProgressNotificationParam {
+                        progress_token: token.clone(),
+                        progress: f64::from(progress.step),
+                        total: Some(f64::from(progress.total)),
+                        message: Some(progress.stage.label().to_owned()),
+                    })
+                    .await;
+            }
+        } else {
+            drop(rx);
+        }
+
+        let stats = handle
+            .await
+            .map_err(|error| {
+                McpError::internal_error(format!("oxcode index task failed: {error}"), None)
+            })?
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        // The on-disk database just changed; drop any cached reader for this
+        // root so the next query reopens the freshly reconciled index.
+        self.indexes.lock().await.remove(&root);
+
+        json_result(&stats)
     }
 
     #[tool(
@@ -233,10 +307,16 @@ impl OxcodeServer {
 }
 
 #[tool_handler]
+#[task_handler(processor = self.operations)]
 impl ServerHandler for OxcodeServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(INSTRUCTIONS)
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks_with(TasksCapability::server_default())
+                .build(),
+        )
+        .with_instructions(INSTRUCTIONS)
     }
 }
 
