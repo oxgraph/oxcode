@@ -364,3 +364,295 @@ fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpErro
         .map_err(|error| McpError::internal_error(format!("serialize failed: {error}"), None))?;
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
+
+#[cfg(test)]
+mod tests {
+    //! In-process integration tests: a real `OxcodeServer` and an MCP client are
+    //! wired together over `tokio::io::duplex`, exercising the full JSON-RPC stack
+    //! (the canonical rmcp test pattern). These guard tool registration, the
+    //! `oxcode_index` build path, stage progress notifications, and the task
+    //! lifecycle — none of which were covered before.
+
+    use std::{
+        future::{Future, ready},
+        sync::Mutex as StdMutex,
+        time::Duration,
+    };
+
+    use rmcp::{
+        ClientHandler, RoleClient,
+        model::{
+            CallToolRequestParams, ClientRequest, GetTaskInfoParams, GetTaskResultParams, Request,
+            ServerResult, TaskStatus, TaskSupport,
+        },
+        service::{MaybeSendFuture, NotificationContext, PeerRequestOptions, RunningService},
+    };
+
+    use super::*;
+
+    /// MCP client that records every progress notification it receives.
+    #[derive(Clone, Default)]
+    struct TestClient {
+        progress: Arc<StdMutex<Vec<ProgressNotificationParam>>>,
+    }
+
+    impl ClientHandler for TestClient {
+        fn on_progress(
+            &self,
+            params: ProgressNotificationParam,
+            _context: NotificationContext<RoleClient>,
+        ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+            if let Ok(mut sink) = self.progress.lock() {
+                sink.push(params);
+            }
+            ready(())
+        }
+    }
+
+    /// Wires a fresh `OxcodeServer` to a `TestClient` over an in-memory duplex
+    /// pipe and returns the connected client service.
+    async fn connect(
+        progress: Arc<StdMutex<Vec<ProgressNotificationParam>>>,
+    ) -> RunningService<RoleClient, TestClient> {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = OxcodeServer::new()
+                .serve(server_transport)
+                .await
+                .expect("server serve");
+            let _ = server.waiting().await;
+        });
+        TestClient { progress }
+            .serve(client_transport)
+            .await
+            .expect("client connect")
+    }
+
+    /// Writes a minimal two-function Rust project into a fresh temp dir.
+    fn rust_project() -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn helper() {}\npub fn entry() {\n    helper();\n}\n",
+        )
+        .expect("write lib.rs");
+        temp
+    }
+
+    /// Builds a tool-call params object for `name` with JSON `arguments`.
+    fn tool_call(name: &'static str, arguments: serde_json::Value) -> CallToolRequestParams {
+        let mut params = CallToolRequestParams::new(name);
+        params.arguments = arguments.as_object().cloned();
+        params
+    }
+
+    /// Extracts the single text content block from a tool result.
+    fn result_text(result: &CallToolResult) -> &str {
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.as_str())
+            .expect("text content")
+    }
+
+    /// Waits (bounded) for the progress sink to hold at least `n` notifications,
+    /// since the client dispatches them asynchronously.
+    async fn wait_for_progress(progress: &Arc<StdMutex<Vec<ProgressNotificationParam>>>, n: usize) {
+        for _ in 0..100 {
+            if progress.lock().expect("lock").len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Polls `tasks/get` until the task reaches a terminal status (or times out),
+    /// returning the last observed status.
+    async fn poll_until_terminal(
+        client: &RunningService<RoleClient, TestClient>,
+        task_id: &str,
+    ) -> TaskStatus {
+        let mut status = TaskStatus::Working;
+        for _ in 0..200 {
+            let info = client
+                .send_request(ClientRequest::GetTaskInfoRequest(Request::new(
+                    GetTaskInfoParams {
+                        meta: None,
+                        task_id: task_id.to_owned(),
+                    },
+                )))
+                .await
+                .expect("tasks/get");
+            if let ServerResult::GetTaskResult(result) = info {
+                status = result.task.status;
+            }
+            if status != TaskStatus::Working {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        status
+    }
+
+    #[tokio::test]
+    async fn lists_tools_with_task_support() {
+        let client = connect(Arc::default()).await;
+        let tools = client.list_all_tools().await.expect("list tools");
+
+        let index = tools
+            .iter()
+            .find(|tool| tool.name == "oxcode_index")
+            .expect("oxcode_index is registered");
+        assert!(
+            index.input_schema.get("required").is_none(),
+            "oxcode_index path is optional, so the schema has no required fields"
+        );
+
+        let task_support = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.execution.as_ref())
+                .and_then(|execution| execution.task_support)
+        };
+        assert_eq!(task_support("oxcode_index"), Some(TaskSupport::Optional));
+        assert_eq!(task_support("oxcode_explore"), Some(TaskSupport::Optional));
+        // Read-only query tools are not task-augmentable.
+        assert_eq!(task_support("oxcode_search"), None);
+        assert_eq!(task_support("oxcode_status"), None);
+    }
+
+    #[tokio::test]
+    async fn indexes_then_explores_through_mcp() {
+        let project = rust_project();
+        let path = project.path().to_string_lossy().into_owned();
+        let client = connect(Arc::default()).await;
+
+        // Synchronous (non-task) build returns IndexStats directly.
+        let indexed = client
+            .call_tool(tool_call(
+                "oxcode_index",
+                serde_json::json!({ "path": path }),
+            ))
+            .await
+            .expect("index call");
+        assert_ne!(indexed.is_error, Some(true), "index succeeded");
+        let stats: serde_json::Value =
+            serde_json::from_str(result_text(&indexed)).expect("IndexStats json");
+        assert!(stats["files"].as_u64().unwrap_or(0) >= 1, "indexed a file");
+        assert!(stats["symbols"].as_u64().unwrap_or(0) >= 2, "found symbols");
+
+        // The freshly built index is queryable in the same session (cache evicted).
+        let explored = client
+            .call_tool(tool_call(
+                "oxcode_explore",
+                serde_json::json!({ "path": path, "query": "entry" }),
+            ))
+            .await
+            .expect("explore call");
+        assert_ne!(explored.is_error, Some(true), "explore succeeded");
+        assert!(
+            result_text(&explored).contains("entry"),
+            "explore surfaces the `entry` symbol"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_emits_stage_progress() {
+        let project = rust_project();
+        let path = project.path().to_string_lossy().into_owned();
+        let progress = Arc::new(StdMutex::new(Vec::new()));
+        let client = connect(Arc::clone(&progress)).await;
+
+        // A cancellable request always carries a progress token, so the server
+        // streams stage notifications back to `TestClient::on_progress`.
+        let params = tool_call("oxcode_index", serde_json::json!({ "path": path }));
+        let handle = client
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(Request::new(params)),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .expect("send index");
+        handle.await_response().await.expect("index response");
+
+        wait_for_progress(&progress, 4).await;
+        let captured = progress.lock().expect("lock").clone();
+        let messages: Vec<_> = captured
+            .iter()
+            .filter_map(|notification| notification.message.clone())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "scanning sources",
+                "extracting symbols",
+                "resolving references",
+                "reconciling database",
+            ]
+        );
+        let steps: Vec<f64> = captured.iter().map(|n| n.progress).collect();
+        assert_eq!(steps, [1.0, 2.0, 3.0, 4.0], "progress increases 1..=4");
+        assert!(
+            captured.iter().all(|n| n.total == Some(4.0)),
+            "every step reports a total of 4"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_augmented_index_completes() {
+        let project = rust_project();
+        let path = project.path().to_string_lossy().into_owned();
+        let client = connect(Arc::default()).await;
+
+        // Task-augment the call: typed `call_tool` cannot carry a task field, so
+        // send the request directly and expect an immediate CreateTaskResult.
+        let mut params = tool_call("oxcode_index", serde_json::json!({ "path": path }));
+        params.task = serde_json::json!({ "ttl": 60_000 }).as_object().cloned();
+        let created = client
+            .send_request(ClientRequest::CallToolRequest(Request::new(params)))
+            .await
+            .expect("enqueue task");
+        let task_id = match created {
+            ServerResult::CreateTaskResult(result) => {
+                assert_eq!(result.task.status, TaskStatus::Working);
+                result.task.task_id
+            }
+            other => panic!("expected CreateTaskResult, got {other:?}"),
+        };
+
+        // Poll tasks/get to a terminal status before fetching the result
+        // (rmcp's tasks/result destructively consumes the completed entry).
+        let status = poll_until_terminal(&client, &task_id).await;
+        assert_eq!(status, TaskStatus::Completed, "task ran to completion");
+
+        // tasks/result returns the deferred CallToolResult carrying the same
+        // IndexStats a synchronous call would have produced. rmcp decodes the
+        // payload (a serialized CallToolResult) straight into the matching
+        // ServerResult::CallToolResult variant; accept the raw payload too.
+        let payload = client
+            .send_request(ClientRequest::GetTaskResultRequest(Request::new(
+                GetTaskResultParams {
+                    meta: None,
+                    task_id,
+                },
+            )))
+            .await
+            .expect("tasks/result");
+        let text = match payload {
+            ServerResult::CallToolResult(result) => result_text(&result).to_owned(),
+            ServerResult::GetTaskPayloadResult(payload) => payload.0["content"][0]["text"]
+                .as_str()
+                .expect("tool result text")
+                .to_owned(),
+            other => panic!("expected the deferred tool result, got {other:?}"),
+        };
+        let stats: serde_json::Value = serde_json::from_str(&text).expect("IndexStats json");
+        assert!(
+            stats["symbols"].as_u64().unwrap_or(0) >= 2,
+            "deferred result carries IndexStats"
+        );
+    }
+}
