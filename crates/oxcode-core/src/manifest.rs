@@ -24,11 +24,7 @@ use crate::{
 };
 
 /// Manifest format version; a mismatch forces a full re-index.
-///
-/// Bumped to `2` for the oxgraph 0.4 store-format break (OXGT container v2 +
-/// OXGDB v3): a 0.3-era index cannot be opened, so the first index run after
-/// the upgrade must rebuild from scratch.
-const MANIFEST_FORMAT: u32 = 2;
+const MANIFEST_FORMAT: u32 = 1;
 
 /// Manifest filename inside the `.oxcode` index directory.
 const MANIFEST_FILE: &str = "manifest.json";
