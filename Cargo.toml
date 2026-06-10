@@ -32,9 +32,3 @@ tree-sitter = "0.26"
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-# TEMPORARY: oxgraph 0.4.0 is not yet published; resolve the whole family from
-# the sibling checkout (on the 0.4 stack tip). Delete this table when 0.4.0
-# lands on crates.io.
-[patch.crates-io]
-oxgraph = { path = "../oxgraph/crates/oxgraph" }
