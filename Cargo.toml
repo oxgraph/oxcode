@@ -16,7 +16,7 @@ anyhow = "1.0.100"
 assert_cmd = "2.0.18"
 clap = { version = "4.5.53", features = ["derive"] }
 ignore = "0.4.25"
-oxgraph = { version = "0.3.2", features = ["db", "graph", "topology"] }
+oxgraph = { version = "0.4.0", features = ["db", "graph", "topology"] }
 predicates = "3.1.3"
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -32,3 +32,9 @@ tree-sitter = "0.26"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# TEMPORARY: oxgraph 0.4.0 is not yet published; resolve the whole family from
+# the sibling checkout (on the 0.4 stack tip). Delete this table when 0.4.0
+# lands on crates.io.
+[patch.crates-io]
+oxgraph = { path = "../oxgraph/crates/oxgraph" }
