@@ -31,4 +31,8 @@ tokio.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+# The MCP integration tests in `src/mcp.rs` act as an in-process MCP client over
+# `tokio::io::duplex`, which needs rmcp's client role. This is dev-only and does
+# not change the published binary's feature set.
+rmcp = { workspace = true, features = ["client"] }
 tempfile.workspace = true
