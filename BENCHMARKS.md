@@ -1,49 +1,51 @@
-# oxcode benchmarks — on oxgraph 0.3.0
+# oxcode benchmarks — on oxgraph 0.4.0
 
-End-to-end code-indexing performance after moving oxcode onto the **oxgraph 0.3.0**
-engine (identity-reconcile writes + zero-copy index open), versus the previous
-engine.
+End-to-end code-indexing performance of oxcode on the **oxgraph 0.4.0** engine,
+versus the same oxcode pipeline on the previous published engine (0.3.2).
 
 ## Method
 
-- **baseline**: oxcode at its pre-overhaul commit on published **oxgraph 0.2.4**
-  (`apply_delta` wholesale rewrite + O(total-incidences) tombstone).
-- **current**: oxcode on **oxgraph 0.3.0** (`reconcile_database`: `upsert`/`retain`
-  identity reconcile; zero-copy index open).
-- Identical source corpora; `--release` binaries; sequential runs on an idle
-  16-core machine. Incremental reindex = append one function to a source file and
-  re-index, verified by querying the new symbol afterward.
-- Measured 2026-06-03.
+- **baseline**: oxcode at its pre-migration commit on published **oxgraph 0.3.2**.
+- **current**: oxcode on **oxgraph 0.4.0** (write-through snapshot encode,
+  Arc-shared copy-on-write write path, checksummed self-verifying container).
+- Corpus: the **oxgraph workspace** itself — 673 files · 10,428 symbols ·
+  166,101 edges. Both columns measured against the same fresh corpus copy.
+- Harness: `scripts/bench/oxcode-perf.sh` — fresh rsync copy (excluding
+  `target/.git/.oxcode`); cold index; reindex with no change; reindex after a
+  one-file edit (persistence-verified by querying the appended marker symbol);
+  symbol-query p50 over 5 runs. `--release` binaries, sequential runs on an
+  idle 16-core machine.
+- Measured 2026-06-10.
 
 ## Results
 
-### storage-hub — 328 files · 40,749 symbols · 527,999 edges
+### oxgraph workspace — 673 files · 10,428 symbols · 166,101 edges
 
-| metric | 0.2.4 | 0.3.0 | change |
+| metric | oxgraph 0.3.2 | oxgraph 0.4.0 | change |
 | --- | ---: | ---: | ---: |
-| **reindex after 1-file edit** | **> 150 s** (~62 min, O(n²)) | **4,842 ms** | **≈ 770× faster** |
-| symbol query (p50) | 3,902 ms | 988 ms | 3.9× faster |
-| cold index | 15,165 ms | 11,968 ms | 1.3× faster |
-| reindex, no change | 1,349 ms | 834 ms | 1.6× faster |
+| cold index | 5,124 ms | 4,717 ms | ~8% faster |
+| reindex, no change | 69 ms | 66 ms | flat |
+| reindex after 1-file edit | 1,425 ms | 1,410 ms | flat |
+| symbol query (p50) | 406 ms | 395 ms | flat |
+| db size | 282.2 MiB | 282.2 MiB | flat |
+| delta-log after edit | 2.8 MiB | 2.8 MiB | flat |
 
-### harnessing — 76 files · 11,091 symbols · 45,901 edges
+## Reading the numbers
 
-| metric | 0.2.4 | 0.3.0 | change |
-| --- | ---: | ---: | ---: |
-| **reindex after 1-file edit** | **27,648 ms** | **444 ms** | **62× faster** |
-| symbol query (p50) | 457 ms | 154 ms | 3.0× faster |
-| cold index | 1,797 ms | 1,313 ms | 1.4× faster |
-
-## Why
-
-- **Incremental reindex** was inverted on 0.2.4 — a one-file edit reindex was
-  *slower than a full rebuild* because the store replaced all edges wholesale and
-  the engine's tombstone was O(total incidences), making bulk delete O(n²) (~62 min
-  on storage-hub). oxcode now drives oxgraph 0.3.0's identity-reconcile verbs:
-  unchanged symbols/edges keep their ids and emit zero mutations, so reindex is
-  O(change) — and the per-reindex WAL dropped from ~953 MB to ~5 MB.
-- **Query latency** dropped 3–4× because 0.3.0 opens the database without
-  rebuilding the index (it is persisted and borrowed from the memory map).
+- 0.4.0 is an architecture and format release — one snapshot write path, a
+  self-checking container (per-section CRC-32C + table CRC, verified at bind),
+  subsystem-typed errors, and structural sharing on the database write path —
+  that **holds end-to-end indexing performance** while restructuring the
+  engine underneath.
+- The cold-index improvement comes from the write-through snapshot encode:
+  freeze streams sections to their final offsets instead of owning every
+  payload and copying the whole snapshot again (~1x peak memory, was ~2x).
+- The engine-level wins are visible in oxgraph's own criterion suites rather
+  than these corpus metrics: a single-element write over a committed-but-
+  unfolded overlay of 100k entries dropped from ~18 ms to ~9-10 ms
+  (Arc-shared copy-on-write seeding), and integrity checking moved from a
+  whole-base CRC scan to per-section verification at bind time with no open
+  regression.
 
 See the engine-side notes in
 [oxgraph `BENCHMARKS.md`](https://github.com/oxgraph/oxgraph/blob/main/BENCHMARKS.md).
