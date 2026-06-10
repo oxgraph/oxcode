@@ -947,7 +947,7 @@ fn lookup_symbols_by_property(
     property: ElementProperty,
     value: &str,
 ) -> Result<Vec<SymbolSummary>> {
-    let value_property = PropertyValue::Text(value.to_string());
+    let value_property = PropertyValue::from(value);
     let index_name = format!("element_{}_eq", property.key());
     let index_id = read
         .catalog()
@@ -956,7 +956,7 @@ fn lookup_symbols_by_property(
             item: "index",
             name: index_name,
         })?;
-    let subjects = read.lookup(index_id, oxgraph::db::Match::Equal(&value_property))?;
+    let subjects = read.lookup(index_id, oxgraph::db::IndexProbe::Equal(&value_property))?;
     let mut symbols = subjects
         .into_iter()
         .filter_map(|subject| match subject {
@@ -1650,7 +1650,7 @@ fn optional_text_property(
     key: PropertyKeyId,
 ) -> Option<String> {
     match read.property(subject, key).as_ref() {
-        Some(PropertyValue::Text(value)) => Some(value.clone()),
+        Some(PropertyValue::Text(value)) => Some(value.to_string()),
         Some(PropertyValue::Boolean(_) | PropertyValue::Integer(_)) | None => None,
     }
 }
@@ -1677,9 +1677,9 @@ fn optional_usize_property(
 fn count_equal(read: &oxgraph::db::Reader, name: &str, value: &str) -> Result<usize> {
     match read.catalog().index_id(name) {
         Some(index_id) => {
-            let value = PropertyValue::Text(value.to_owned());
+            let value = PropertyValue::from(value);
             Ok(read
-                .lookup(index_id, oxgraph::db::Match::Equal(&value))?
+                .lookup(index_id, oxgraph::db::IndexProbe::Equal(&value))?
                 .len())
         }
         None => Ok(0),
