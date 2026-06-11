@@ -1,8 +1,9 @@
 [package]
 name = "oxcode-model"
-version = "0.1.0"
+version = "0.1.1"
 description = "Storage-neutral code graph model types for oxcode."
 categories = ["development-tools"]
+readme = "README.md"
 
 authors.workspace = true
 edition.workspace = true
