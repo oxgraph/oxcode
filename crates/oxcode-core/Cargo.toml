@@ -1,6 +1,6 @@
 [package]
 name = "oxcode-core"
-version = "0.1.1"
+version = "0.1.2"
 description = "OxGraph-native code indexing and navigation engine."
 categories = ["development-tools"]
 readme = "README.md"
@@ -15,7 +15,7 @@ rust-version.workspace = true
 
 [dependencies]
 ignore.workspace = true
-oxcode-model = { path = "../oxcode-model", version = "0.1.1" }
+oxcode-model = { path = "../oxcode-model", version = "0.1.2" }
 oxgraph.workspace = true
 serde.workspace = true
 serde_json.workspace = true
