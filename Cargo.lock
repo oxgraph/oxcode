@@ -947,7 +947,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -1459,9 +1459,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8246cfda041befe913440e75cf6b46a13bb2f86d9924975c6ed93bbe47a20400"
+checksum = "82fe8ff4c83917a531c444506ec232a195a35d183dde84a215c77507b0f4d85a"
 dependencies = [
  "oxgraph-db",
  "oxgraph-graph",
@@ -1471,9 +1471,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-algo"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4a56caa65ca796cb622a8910ddb6790c623a444f99d43e2bd0594746f61fa"
+checksum = "48149219544f78c9aa0a19641883bee91f65c93ccff365f04182698162836aa5"
 dependencies = [
  "oxgraph-graph",
  "oxgraph-hyper",
@@ -1482,9 +1482,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-csc"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f7ca05d59fa019020aca659c564f4165ed3b8b6ef12af5f84dc6c91a58b4d0a"
+checksum = "2f18be8d85237b4c886e610fac9ecb23a49bf3e0460b58d532b20be211e5eaca"
 dependencies = [
  "oxgraph-csr",
  "oxgraph-graph",
@@ -1495,9 +1495,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-csr"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b81aecc91c1d8d37760b390c1084d0368c6a54106de5c90c0b5980acf0988a5a"
+checksum = "072e2bdef648830c7c9b622af9ce4e68ba46918924c70cfc592032201aefe14d"
 dependencies = [
  "oxgraph-graph",
  "oxgraph-layout-util",
@@ -1507,9 +1507,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-db"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa57e6906216f329047ad405d66036a44c63a81dc26fea6a8257bab9bd130a18"
+checksum = "3412398f21da544fe694b558b5ee1d6eb54f36566994409a45a3987497349156"
 dependencies = [
  "crc32c",
  "oxgraph-algo",
@@ -1529,27 +1529,27 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-graph"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e552d4d6a7ab5b52e1ae9aeeec166d1d24d7eb1df483546a0d9c1dddfd7b2af"
+checksum = "d8391a95ef48867ff349db0d2a583e1ed0a859e7dd95c46837bfdb99282613c8"
 dependencies = [
  "oxgraph-topology",
 ]
 
 [[package]]
 name = "oxgraph-hyper"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "350f8a9c8dc9b099a16444c7f730cd0f4d0f23137f9de930a6d7bf0ca257fc24"
+checksum = "1ce75442e8801036827486d4ce0780b0e52600901cb0816e57664a35be7a20eb"
 dependencies = [
  "oxgraph-topology",
 ]
 
 [[package]]
 name = "oxgraph-hyper-bcsr"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45bbe2bc555acfbb1f0f340832f27808e244160c9f524db2cf8854065823ee07"
+checksum = "d4a5f73e2d561b4a5af212035a74c392eac8a92114b711b351a9e3cf2feb5d67"
 dependencies = [
  "oxgraph-hyper",
  "oxgraph-layout-util",
@@ -1559,27 +1559,27 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-layout-util"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6638157212ef243b4483982941b1b8721c5469019d132b59602b1ee1b3508a4f"
+checksum = "9b547655888f19185abc4ea3d74d172fb1ee790ec92b24fe9489fd30a886c71c"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
 name = "oxgraph-mmap"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e8fa91466820346b93befec204e4190a615d30755cc5d303a1609348dd519dc"
+checksum = "753eae0bf3c3eb30eb7d08209d0c51f2fe7625d0f1b5ba852f8e0368fe957686"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "oxgraph-property"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53aa4a8ef718e3bd5f2d1b3461739bdca7ab9574a3084bdcef7277a604255165"
+checksum = "23360e03e9a954487fca323ac79b51685da13c3c4c98df48f031fa9dbce54b39"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1593,9 +1593,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-snapshot"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddcd4ed6ed15b6580b24a1d3bc20b7d012bde15ee75c8b65182c4192a35e3bb1"
+checksum = "5e9c87e50d5ced891f35f21b03cbf5e4de6b035bc1e954228e58bb48b8403eb1"
 dependencies = [
  "oxgraph-layout-util",
  "zerocopy",
@@ -1603,9 +1603,9 @@ dependencies = [
 
 [[package]]
 name = "oxgraph-topology"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f1610e1e7713c431d590a0542f7c0b5f8ee7615cbeebd5d651e48d509de4d16"
+checksum = "6e69d473e42f9e85bf3c4b2707379266cd546d2f898d44c7e395066ebaa8b47b"
 
 [[package]]
 name = "parking_lot"
@@ -3056,7 +3056,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
 dependencies = [
  "windows-collections",
- "windows-core 0.61.2",
+ "windows-core",
  "windows-future",
  "windows-link 0.1.3",
  "windows-numerics",
@@ -3068,7 +3068,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -3080,21 +3080,8 @@ dependencies = [
  "windows-implement",
  "windows-interface",
  "windows-link 0.1.3",
- "windows-result 0.3.4",
- "windows-strings 0.4.2",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
+ "windows-result",
+ "windows-strings",
 ]
 
 [[package]]
@@ -3103,7 +3090,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc6a41e98427b19fe4b73c550f060b59fa592d7d686537eebf9385621bfbad8e"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
  "windows-threading",
 ]
@@ -3148,7 +3135,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
 ]
 
@@ -3162,30 +3149,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link 0.2.1",
 ]
 
 [[package]]
