@@ -1,6 +1,7 @@
 //! Command-line interface for `oxcode`.
 
 mod mcp;
+mod update;
 
 use std::path::PathBuf;
 
@@ -106,6 +107,8 @@ enum Command {
     },
     /// Run the MCP server over stdio (for coding agents).
     Mcp,
+    /// Update the `oxcode` binary in place to the latest release.
+    Update,
     /// Execute an OxGraph database query.
     #[command(
         long_about = "Execute a raw OxGraph database query.\n\nAccepted OxQL profile:\n  CATALOG\n  MATCH ELEMENTS\n  MATCH ELEMENTS HAS LABEL <label>\n  MATCH ELEMENTS WHERE <property> = '<value>'\n  MATCH RELATIONS TYPE <type>\n  GRAPH calls WALK FROM <element-id> DEPTH <n> [DIRECTION outgoing|incoming|both] [LIMIT n]\n\nUse `oxcode symbols <keywords>` for keyword discovery."
@@ -379,7 +382,11 @@ fn run() -> Result<()> {
             let report = ProjectIndex::open(&path.path)?.explain(&query)?;
             println!("{report}");
         }
-        Command::Mcp => mcp::serve()?,
+        Command::Mcp => {
+            update::auto_update_and_reexec();
+            mcp::serve()?;
+        }
+        Command::Update => update::update_command()?,
     }
     Ok(())
 }

@@ -25,8 +25,9 @@ the result instead of blocking; otherwise they run as ordinary synchronous calls
 ## Prerequisites
 
 The plugin ships configuration only — it **cannot bundle the `oxcode` binary**.
-You must have it installed and on your `PATH`. A project must be indexed before
-the query tools can answer anything — either run `oxcode index` once, or call the
+You must have it installed and on your `PATH` once; from then on it keeps itself
+current (see [Updates](#updates)). A project must be indexed before the query
+tools can answer anything — either run `oxcode index` once, or call the
 `oxcode_index` MCP tool from the agent.
 
 1. **Install the CLI** (binary is `oxcode`; the crate is `oxcode-cli` because the
@@ -76,7 +77,28 @@ Then `/mcp` lists the connected `oxcode` server and its tools.
 
 ## Updates
 
-Third-party marketplaces don't auto-update by default. Refresh with:
+There are two independent pieces, and they update separately.
+
+**The binary self-updates.** From v0.1.2 on, `oxcode mcp` checks GitHub for a
+newer release on startup and, if one exists, installs it in place and re-execs
+into it **before serving** — so the agent always talks to the latest tools. Run
+`oxcode update` to do it on demand. Controls:
+
+- `OXCODE_NO_AUTO_UPDATE=1` — disable the startup check entirely (CI, offline,
+  air-gapped, or reproducible environments).
+- `GITHUB_TOKEN` / `GH_TOKEN` — used if set, to avoid unauthenticated GitHub API
+  rate limits.
+
+The check is best-effort: if the network is down or slow it's skipped (bounded
+by a short timeout) and the current binary serves. Updater output goes to
+stderr; stdout stays reserved for the MCP transport.
+
+> One-time bootstrap: the self-update code only exists from v0.1.2 onward. If you
+> have an older `oxcode`, update once manually (re-run the installer above, or
+> `cargo install --force oxcode-cli`); after that it's automatic.
+
+**The plugin** (this config package) updates through the marketplace —
+third-party marketplaces don't auto-update by default:
 
 ```sh
 /plugin marketplace update oxgraph

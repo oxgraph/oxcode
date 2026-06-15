@@ -14,6 +14,10 @@ rust-version = "1.95"
 [workspace.dependencies]
 anyhow = "1.0.100"
 assert_cmd = "2.0.18"
+axoupdater = { version = "0.10.0", default-features = false, features = [
+  "blocking",
+  "github_releases",
+] }
 clap = { version = "4.5.53", features = ["derive"] }
 ignore = "0.4.25"
 oxgraph = { version = "0.4.0", features = ["db", "graph", "topology"] }
