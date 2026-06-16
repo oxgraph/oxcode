@@ -1,0 +1,89 @@
+# Custom dist publish job: publishes the npm launcher (@snowmead/oxcode-mcp) and
+# registers the server in the official MCP Registry (io.github.snowmead/oxcode).
+# dist invokes this during the release's publish phase (see `publish-jobs` in the
+# dist config), passing the plan and inheriting repo secrets — so it runs on the
+# same `v*` tag that builds binaries. The npm + server.json versions are stamped
+# from the oxcode-cli crate version so they can never drift from the release.
+#
+# npm auth is OIDC "trusted publishing" — no NPM_TOKEN. Because the publish runs
+# inside THIS reusable workflow, npm validates the CALLER's filename, so the npm
+# Trusted Publisher must be configured with workflow `release.yml` (org oxgraph,
+# repo oxcode). id-token: write is required in both release.yml's job and here,
+# and it needs npm >= 11.5.1 / Node >= 22.14 (we bump npm below).
+#
+# The MCP Registry publish still needs one secret:
+#   MCP_GITHUB_TOKEN — GitHub PAT for user `snowmead` (read:org, read:user);
+#                      a user PAT grants the io.github.snowmead/* namespace even
+#                      though this repo lives under the oxgraph org (OIDC would
+#                      auth as oxgraph, so PAT — not github-oidc — is required).
+name: publish-npm
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    # id-token: write is required in BOTH the caller (release.yml) and here for
+    # npm OIDC trusted publishing.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4.2.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # OIDC trusted publishing needs npm >= 11.5.1 (newer than the npm bundled
+      # with Node 24).
+      - name: Upgrade npm for OIDC publishing
+        run: npm install -g npm@latest
+
+      # Stamp the release version (from the oxcode-cli crate — the published
+      # binary) into both the npm package and the registry manifest.
+      - name: Stamp release version
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' crates/oxcode-cli/Cargo.toml | cut -d'"' -f2)"
+          echo "Publishing @snowmead/oxcode-mcp and io.github.snowmead/oxcode at $VERSION"
+          ( cd npm && npm version "$VERSION" --no-git-tag-version --allow-same-version )
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+
+      # Must publish to npm BEFORE the registry publish: the registry validates
+      # the live package and its `mcpName` field. OIDC trusted publishing — no
+      # token; provenance is auto-generated since the repo and package are public.
+      - name: Publish @snowmead/oxcode-mcp to npm (OIDC trusted publishing)
+        run: npm publish ./npm --access public
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry (GitHub PAT)
+        env:
+          MCP_GITHUB_TOKEN: ${{ secrets.MCP_GITHUB_TOKEN }}
+        run: ./mcp-publisher login github --token "$MCP_GITHUB_TOKEN"
+
+      # npm's CDN can lag a few seconds behind publish, and the registry
+      # validates the live package, so retry a handful of times.
+      - name: Publish to MCP Registry
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if ./mcp-publisher publish; then
+              exit 0
+            fi
+            echo "publish attempt $attempt failed; waiting for npm propagation..." >&2
+            sleep 30
+          done
+          echo "mcp-publisher publish failed after retries" >&2
+          exit 1

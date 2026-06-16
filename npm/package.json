@@ -1,0 +1,37 @@
+{
+  "name": "@snowmead/oxcode-mcp",
+  "version": "0.2.0",
+  "description": "npm launcher for the oxcode MCP server — PageRank-curated code intelligence for coding agents. Requires the self-updating `oxcode` binary on PATH.",
+  "mcpName": "io.github.snowmead/oxcode",
+  "type": "commonjs",
+  "bin": {
+    "oxcode-mcp": "bin/oxcode-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "author": {
+    "name": "oxgraph",
+    "email": "michael@snowmead.com"
+  },
+  "homepage": "https://oxgraph.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oxgraph/oxcode.git",
+    "directory": "npm"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "code-intelligence",
+    "code-navigation",
+    "pagerank",
+    "oxgraph",
+    "oxcode"
+  ]
+}

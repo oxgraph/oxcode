@@ -17,7 +17,8 @@ targets = [
   "x86_64-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
 ]
-# Publish the workspace crates to crates.io on the same tag (custom job).
-publish-jobs = ["./publish-crates"]
+# Publish the workspace crates to crates.io and the npm launcher + MCP Registry
+# entry on the same tag (custom jobs).
+publish-jobs = ["./publish-crates", "./publish-npm"]
 # Only run the cheap "plan" check on PRs; full builds on tags.
 pr-run-mode = "plan"

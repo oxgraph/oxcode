@@ -1,0 +1,34 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.snowmead/oxcode",
+  "description": "PageRank-curated code intelligence for coding agents over an indexed source repository.",
+  "repository": {
+    "url": "https://github.com/oxgraph/oxcode",
+    "source": "github"
+  },
+  "version": "0.2.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@snowmead/oxcode-mcp",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OXCODE_NO_AUTO_UPDATE",
+          "description": "Set to 1 to disable the binary's startup self-update check (CI, offline, or reproducible environments).",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "GITHUB_TOKEN",
+          "description": "Optional: used during self-update to avoid unauthenticated GitHub API rate limits.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
