@@ -64,6 +64,12 @@ Via the oxgraph marketplace:
 On install you'll be asked to approve the `oxcode` MCP server (same per-server
 approval as a project `.mcp.json`).
 
+**Not on Claude Code?** oxcode is also in the official
+[MCP Registry](https://registry.modelcontextprotocol.io) as
+`io.github.snowmead/oxcode`, and an npm launcher (`@snowmead/oxcode-mcp`, run via
+`npx -y @snowmead/oxcode-mcp`) is available for other MCP clients — both run the
+same `oxcode mcp` binary, so the PATH prerequisite below still applies.
+
 ### Local testing
 
 To try the plugin straight from a checkout without going through the
