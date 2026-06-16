@@ -396,6 +396,12 @@ impl ReadSession<'_> {
             else {
                 continue;
             };
+            // Crate layer cake only: a crate-root file's module is the crate node,
+            // so module-level lifts read as crate→module — drop those, keep
+            // crate→crate.
+            if target.kind != NodeKind::Package {
+                continue;
+            }
             dependencies.push(ContextDependency {
                 source_id: source.id,
                 source: source.qualified_name.clone(),
@@ -475,13 +481,21 @@ impl ReadSession<'_> {
 
         let rank_by_relation = self.rank_hyperedges(seed_ids);
 
-        // Hyperedge relations touching any selected symbol, deduplicated.
-        let relation_ids: BTreeSet<RelationId> = symbols
+        // Expand from the selected symbols to their containment ancestors (file →
+        // module(s) → package) so the full membership lineage surfaces — not just
+        // leaf-level file membership. Collecting incidences over this set pulls in
+        // the file→symbols, module→files, and crate→modules membership hyperedges.
+        let mut elements: BTreeSet<ElementId> = BTreeSet::new();
+        for symbol in symbols {
+            let element = ElementId::new(symbol.id.get());
+            elements.insert(element);
+            elements.extend(self.container_ancestors(element));
+        }
+
+        // Hyperedge relations touching any element in the expanded set, deduplicated.
+        let relation_ids: BTreeSet<RelationId> = elements
             .iter()
-            .flat_map(|symbol| {
-                self.read
-                    .element_incidences(ElementId::new(symbol.id.get()))
-            })
+            .flat_map(|element| self.read.element_incidences(*element))
             .map(|incidence| incidence.relation)
             .filter(|relation| self.is_hyperedge_relation(*relation, &kind_by_type))
             .collect();
@@ -520,6 +534,38 @@ impl ReadSession<'_> {
             .is_some_and(|relation_type| kind_by_type.contains_key(&relation_type))
     }
 
+    /// Walks the `Contains` spine upward from a symbol to its containers
+    /// (impl block / file → module(s) → package), bounded in depth. The spine is
+    /// oriented parent → child, so each step follows the single incoming `Contains`
+    /// edge whose source is the parent. Used to pull a symbol's full architectural
+    /// nesting into the hyperedge set.
+    fn container_ancestors(&self, symbol: ElementId) -> Vec<ElementId> {
+        const MAX_DEPTH: usize = 6;
+
+        let mut ancestors = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut current = symbol;
+        for _ in 0..MAX_DEPTH {
+            let Some(parent) = direct_relation_edges(
+                &self.read,
+                EdgeKind::Contains,
+                current,
+                EdgeVisitDirection::Incoming,
+                4,
+            )
+            .into_iter()
+            .next() else {
+                break;
+            };
+            if !seen.insert(parent.neighbor.get()) {
+                break;
+            }
+            ancestors.push(parent.neighbor);
+            current = parent.neighbor;
+        }
+        ancestors
+    }
+
     /// Reads one hyperedge relation back into a [`ContextHyperedge`]: its kind,
     /// roled participants, and hypergraph-PageRank score. Returns `None` when the
     /// relation is not a hyperedge or carries no roled participants.
@@ -530,25 +576,48 @@ impl ReadSession<'_> {
         role_by_id: &BTreeMap<RoleId, ParticipantRole>,
         rank_by_relation: &BTreeMap<RelationId, f64>,
     ) -> Option<ContextHyperedge> {
+        // Bound participants so a large container (a crate with dozens of modules)
+        // cannot blow the report size; the anchor is always kept (see sort below).
+        const MAX_PARTICIPANTS: usize = 24;
+
         let kind = self
             .read
             .relation(relation_id)?
             .relation_type
             .and_then(|relation_type| kind_by_type.get(&relation_type).copied())?;
-        let participants: Vec<ContextHyperedgeParticipant> = self
+        let mut participants: Vec<ContextHyperedgeParticipant> = self
             .read
             .relation_incidences(relation_id)
             .into_iter()
             .filter_map(|incidence| {
-                role_by_id
-                    .get(&incidence.role)
-                    .map(|role| ContextHyperedgeParticipant {
-                        id: SymbolId::new(incidence.element.get()),
-                        role: *role,
-                    })
+                let role = *role_by_id.get(&incidence.role)?;
+                // Resolve each participant to its name/kind so the hyperedge reads
+                // as a self-describing fact ("module X contains …") rather than
+                // bare ids an agent cannot follow.
+                let symbol =
+                    symbol_summary_from_element(&self.read, self.element_keys, incidence.element)
+                        .ok()
+                        .flatten()?;
+                Some(ContextHyperedgeParticipant {
+                    id: SymbolId::new(incidence.element.get()),
+                    role,
+                    qualified_name: symbol.qualified_name,
+                    kind: symbol.kind,
+                })
             })
             .collect();
-        (!participants.is_empty()).then(|| ContextHyperedge {
+        if participants.is_empty() {
+            return None;
+        }
+        // Anchor(s) first so the unit reads "anchor ⊃ members", then by id for
+        // determinism; truncating after this keeps the anchor when capping.
+        participants.sort_by(|left, right| {
+            anchor_first_rank(left.role)
+                .cmp(&anchor_first_rank(right.role))
+                .then(left.id.get().cmp(&right.id.get()))
+        });
+        participants.truncate(MAX_PARTICIPANTS);
+        Some(ContextHyperedge {
             relation_id: relation_id.get(),
             kind,
             participants,
@@ -1498,6 +1567,13 @@ fn preferred_context_kinds() -> Vec<NodeKind> {
     ]
     .into_iter()
     .collect()
+}
+
+/// Sort key placing a hyperedge's anchor (the container/impl unit) before its
+/// members, so a rendered hyperedge reads "anchor ⊃ members" and capping never
+/// drops the anchor.
+fn anchor_first_rank(role: ParticipantRole) -> u8 {
+    u8::from(!ParticipantRole::TARGET.contains(&role))
 }
 
 #[derive(Clone, Copy)]

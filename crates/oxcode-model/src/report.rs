@@ -113,14 +113,20 @@ pub struct ContextRelation {
     pub site: Option<CallSiteSummary>,
 }
 
-/// One participant of a [`ContextHyperedge`], referencing the symbol by id with
-/// the structural role it plays in the n-ary relation.
+/// One participant of a [`ContextHyperedge`]: the symbol, its role, and enough
+/// identity (qualified name + kind) to read the relationship without
+/// cross-referencing `ContextReport::symbols` — container participants
+/// (crates/modules/files) are not listed there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextHyperedgeParticipant {
     /// Participant symbol id.
     pub id: SymbolId,
     /// Structural role this participant plays.
     pub role: ParticipantRole,
+    /// Qualified language-level name (crate/module/type/method).
+    pub qualified_name: QualifiedName,
+    /// Stored node kind.
+    pub kind: NodeKind,
 }
 
 /// One n-ary relationship (a trait impl group or container membership) touching
