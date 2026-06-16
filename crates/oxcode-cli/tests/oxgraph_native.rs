@@ -259,3 +259,129 @@ fn write(path: impl AsRef<Path>, contents: &str) {
     }
     fs::write(path, contents).expect("write file");
 }
+
+/// The `dependencies` section is the crate layer cake only: a crate→crate
+/// dependency survives, and crate→module lifts (a crate-root file referencing a
+/// submodule symbol) never pollute it.
+#[test]
+fn context_dependencies_are_crate_to_crate_only() {
+    // Two crates where `a::foo` references `b::bar`: the real crate→crate edge.
+    let two = TempDir::new().expect("temp dir");
+    write(
+        two.path().join("crates/a/Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        two.path().join("crates/a/src/lib.rs"),
+        "pub fn foo() {\n    b::bar();\n}\n",
+    );
+    write(
+        two.path().join("crates/b/Cargo.toml"),
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write(two.path().join("crates/b/src/lib.rs"), "pub fn bar() {}\n");
+    oxcode_core::index_project(two.path()).expect("index two-crate workspace");
+    let index = ProjectIndex::open(two.path()).expect("open");
+    let report = index.context("foo", 8, 2, 20_000).expect("context");
+
+    assert!(
+        report
+            .dependencies
+            .iter()
+            .any(|dep| dep.source.as_str() == "a" && dep.target.as_str() == "b"),
+        "the crate→crate dependency a -> b must surface: {:?}",
+        report.dependencies,
+    );
+    // Every endpoint is a bare crate name — no `::`-qualified module entries.
+    for dep in &report.dependencies {
+        assert!(
+            !dep.source.as_str().contains("::") && !dep.target.as_str().contains("::"),
+            "dependencies must be crate→crate only, found {} -> {}",
+            dep.source,
+            dep.target,
+        );
+    }
+
+    // A single crate whose root references a submodule yields a crate→module
+    // DependsOn internally; that noise must be filtered out of `dependencies`.
+    let one = TempDir::new().expect("temp dir");
+    write(
+        one.path().join("src/lib.rs"),
+        "pub mod gadget;\n\npub fn run() {\n    gadget::tick();\n}\n",
+    );
+    write(one.path().join("src/gadget.rs"), "pub fn tick() {}\n");
+    oxcode_core::index_project(one.path()).expect("index single crate");
+    let index = ProjectIndex::open(one.path()).expect("open");
+    let report = index.context("run", 8, 2, 20_000).expect("context");
+    assert!(
+        report.dependencies.is_empty(),
+        "a single crate has no crate→crate deps; crate→module noise must be \
+         dropped, found {:?}",
+        report.dependencies,
+    );
+}
+
+/// Hyperedges surface the full crate→module→file→symbol containment lineage with
+/// self-describing participants, not just leaf-level file membership.
+#[test]
+fn context_hyperedges_surface_named_containment_lineage() {
+    use oxcode_core::{HyperedgeKind, NodeKind, ParticipantRole};
+
+    let temp = TempDir::new().expect("temp dir");
+    write(
+        temp.path().join("src/lib.rs"),
+        "pub mod gadget;\n\npub fn run() {\n    gadget::tick();\n}\n",
+    );
+    write(
+        temp.path().join("src/gadget.rs"),
+        "pub fn tick() {\n    helper();\n}\n\npub fn helper() {}\n",
+    );
+    oxcode_core::index_project(temp.path()).expect("index");
+    let index = ProjectIndex::open(temp.path()).expect("open");
+    let report = index.context("tick", 8, 2, 20_000).expect("context");
+
+    // Every participant is self-describing (non-empty qualified name), and each
+    // membership lists its anchor first.
+    for hyperedge in &report.hyperedges {
+        assert!(
+            !hyperedge.participants.is_empty(),
+            "hyperedge carries participants",
+        );
+        for participant in &hyperedge.participants {
+            assert!(
+                !participant.qualified_name.as_str().is_empty(),
+                "participant {participant:?} must carry a qualified name",
+            );
+        }
+        if hyperedge.kind == HyperedgeKind::Membership {
+            assert_eq!(
+                hyperedge.participants[0].role,
+                ParticipantRole::Anchor,
+                "membership renders the anchor first: {:?}",
+                hyperedge.participants,
+            );
+        }
+    }
+
+    // The ancestor walk pulls in the module- and crate-level memberships, whose
+    // anchors are container nodes that are not themselves selected symbols.
+    let anchored_by = |kind: NodeKind| {
+        report.hyperedges.iter().any(|hyperedge| {
+            hyperedge.kind == HyperedgeKind::Membership
+                && hyperedge
+                    .participants
+                    .iter()
+                    .any(|p| p.role == ParticipantRole::Anchor && p.kind == kind)
+        })
+    };
+    assert!(
+        anchored_by(NodeKind::Package),
+        "the crate (package) membership lineage must surface: {:?}",
+        report.hyperedges,
+    );
+    assert!(
+        anchored_by(NodeKind::Module),
+        "the module membership lineage must surface: {:?}",
+        report.hyperedges,
+    );
+}
