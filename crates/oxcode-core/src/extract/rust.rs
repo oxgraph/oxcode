@@ -313,6 +313,17 @@ impl RustWalker<'_> {
             self.push_reference(node, &key, trait_target, EdgeKind::Implements);
         }
 
+        // The concrete type the impl is for, as a full scoped path so the resolver
+        // can disambiguate cross-module types (e.g. `impl other::Foo`). Anchored at
+        // the type node so the reference site is the type, not the whole impl body.
+        if let Some(type_node) = field(node, "type")
+            && let Some(type_path) = type_path_segments(&type_node, self.source)
+        {
+            let type_target =
+                reference_target(type_path.join("::"), type_path, None, ReferenceKind::Type);
+            self.push_reference(&type_node, &key, type_target, EdgeKind::ImplementsFor);
+        }
+
         self.visit_children(
             node,
             VisitContext {
@@ -578,6 +589,27 @@ fn impl_type_name(node: &Node, source: &[u8]) -> Option<String> {
 /// Extracts the implemented trait's base name from an `impl_item` `trait` field.
 fn impl_trait_name(node: &Node, source: &[u8]) -> Option<String> {
     field(node, "trait").and_then(|node| base_type_name(&node, source))
+}
+
+/// Descends a type node to its nominal path segments, generics and reference
+/// markers stripped (`other::Foo<T>` → `["other", "Foo"]`), mirroring
+/// [`base_type_name`] but preserving the scoped prefix. Returns `None` for
+/// non-nominal types (tuples, slices, trait objects).
+fn type_path_segments(node: &Node, source: &[u8]) -> Option<Vec<String>> {
+    match node.kind() {
+        "type_identifier" | "identifier" | "primitive_type" => {
+            let text = clean_identifier(node_text(node, source));
+            (!text.is_empty()).then(|| vec![text])
+        }
+        "scoped_type_identifier" | "scoped_identifier" => {
+            let segments = path_segments(node_text(node, source));
+            (!segments.is_empty()).then_some(segments)
+        }
+        "generic_type" | "reference_type" | "pointer_type" => {
+            field(node, "type").and_then(|inner| type_path_segments(&inner, source))
+        }
+        _ => None,
+    }
 }
 
 /// Descends a type node to a stable, deterministic base name.

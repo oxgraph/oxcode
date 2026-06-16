@@ -20,7 +20,7 @@ axoupdater = { version = "0.10.0", default-features = false, features = [
 ] }
 clap = { version = "4.5.53", features = ["derive"] }
 ignore = "0.4.25"
-oxgraph = { version = "0.4.0", features = ["db", "graph", "topology"] }
+oxgraph = { version = "0.4.4", features = ["db", "graph", "topology"] }
 predicates = "3.1.3"
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 serde = { version = "1.0.228", features = ["derive"] }

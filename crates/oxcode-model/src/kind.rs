@@ -39,7 +39,54 @@ string_enum! {
         References => "references",
         Implements => "implements",
         Defines => "defines",
+        /// An impl block to the concrete type it implements (distinct from
+        /// `Implements`, which points at the trait).
+        ImplementsFor => "implements_for",
+        /// A container (crate/module/file) depends on another because a symbol it
+        /// contains references a symbol the other contains. Lifted, not extracted.
+        DependsOn => "depends_on",
     }
+}
+
+string_enum! {
+    /// Kind of n-ary code relationship stored as an OxGraph relation type,
+    /// complementary to [`EdgeKind`] for facts with more than two participants.
+    pub enum HyperedgeKind {
+        /// A trait implementation grouped as one fact: the impl block (anchor),
+        /// its concrete type, the implemented trait, and the methods.
+        ImplGroup => "impl_group",
+        /// A container and its direct members grouped as one fact (a module,
+        /// file, package, or other container and what it directly contains).
+        Membership => "membership",
+    }
+}
+
+string_enum! {
+    /// Structural role a participant plays in a hyperedge.
+    ///
+    /// Source-side roles ([`Self::SOURCE`]) are the parts; the single target-side
+    /// role [`Self::Anchor`] is the unit they belong to. Personalized hypergraph
+    /// PageRank flows rank from sources to targets, so orienting parts → anchor
+    /// makes anchors (containers, impl blocks) accrue architectural centrality.
+    pub enum ParticipantRole {
+        /// The unit a hyperedge centers on: an impl block or a container
+        /// (target side).
+        Anchor => "anchor",
+        /// A generic member or part — a contained symbol or an impl method
+        /// (source side).
+        Member => "member",
+        /// The concrete type of an impl group (source side).
+        ImplType => "impl_type",
+        /// The implemented trait of an impl group (source side).
+        ImplTrait => "impl_trait",
+    }
+}
+
+impl ParticipantRole {
+    /// Roles whose participants are source-side (the parts).
+    pub const SOURCE: &'static [Self] = &[Self::Member, Self::ImplType, Self::ImplTrait];
+    /// Roles whose participants are target-side (the anchor unit).
+    pub const TARGET: &'static [Self] = &[Self::Anchor];
 }
 
 string_enum! {
@@ -64,6 +111,8 @@ string_enum! {
         Trait => "trait",
         Import => "import",
         ImportGlob => "import_glob",
+        /// A reference to a concrete type (e.g. the self type of an impl block).
+        Type => "type",
     }
 }
 

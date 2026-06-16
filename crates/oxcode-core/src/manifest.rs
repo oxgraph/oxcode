@@ -100,7 +100,12 @@ fn manifest_path(root: &Path) -> PathBuf {
 /// # Errors
 ///
 /// Returns [`Error::Fs`] when a source file cannot be read.
-pub(crate) fn compute_digest(root: &Path, files: &[SourceFile], scope_token: u64) -> Result<u64> {
+pub(crate) fn compute_digest(
+    root: &Path,
+    files: &[SourceFile],
+    scope_token: u64,
+    schema_fingerprint: u64,
+) -> Result<u64> {
     let mut hasher = DefaultHasher::new();
     for file in files {
         paths::normalize_relative_path(root, &file.path).hash(&mut hasher);
@@ -111,6 +116,9 @@ pub(crate) fn compute_digest(root: &Path, files: &[SourceFile], scope_token: u64
         content.hash(&mut hasher);
     }
     scope_token.hash(&mut hasher);
+    // Fold in the storage schema shape so a schema change forces a full
+    // re-reconcile even when no source file changed.
+    schema_fingerprint.hash(&mut hasher);
     Ok(hasher.finish())
 }
 
@@ -218,12 +226,20 @@ mod tests {
             recognized_unsupported: false,
         }];
 
-        let first = compute_digest(root, &files, 0).expect("digest");
-        let again = compute_digest(root, &files, 0).expect("digest");
+        let first = compute_digest(root, &files, 0, 0).expect("digest");
+        let again = compute_digest(root, &files, 0, 0).expect("digest");
         assert_eq!(first, again, "digest is stable for unchanged content");
 
         std::fs::write(&file_path, b"fn alpha() { run(); }").expect("write");
-        let changed = compute_digest(root, &files, 0).expect("digest");
+        let changed = compute_digest(root, &files, 0, 0).expect("digest");
         assert_ne!(first, changed, "digest changes when content changes");
+
+        // A schema-shape change (different fingerprint) busts the digest even
+        // when the source content is identical.
+        let schema_changed = compute_digest(root, &files, 0, 1).expect("digest");
+        assert_ne!(
+            changed, schema_changed,
+            "digest changes when the schema fingerprint changes"
+        );
     }
 }

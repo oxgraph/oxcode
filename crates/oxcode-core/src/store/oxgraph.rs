@@ -6,18 +6,19 @@ use std::{
 };
 
 use oxcode_model::{
-    BlastCaller, BlastRadius, CALLS_PROJECTION, CallEdgeSummary, CallFlowHop, CallGraphReport,
-    CallSiteSummary, CatalogStatus, CodeLocation, ContextBudget, ContextFile, ContextRelation,
+    ARCH_HYPER_PROJECTION, BlastCaller, BlastRadius, CALLS_PROJECTION, CallEdgeSummary,
+    CallFlowHop, CallGraphReport, CallSiteSummary, CatalogStatus, CodeLocation, ContextBudget,
+    ContextDependency, ContextFile, ContextHyperedge, ContextHyperedgeParticipant, ContextRelation,
     ContextReport, EXPLORE_PROJECTION, EdgeKind, ElementProperty, ExpandedQueryReport,
     ExpandedQueryRow, ExpandedQueryValue, FileSearchReport, FileSummary, GraphDirection,
-    LanguageId, NodeKind, ProjectStatus, QualifiedName, RelationProperty, RenderedSymbol,
-    SOURCE_ROLE, Selector, SourcePath, SourceSpan, SymbolId, SymbolKey, SymbolReport,
-    SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE, TraversedSymbol,
-    projection_name,
+    HyperedgeKind, LanguageId, NodeKind, ParticipantRole, ProjectStatus, QualifiedName,
+    RelationProperty, RenderedSymbol, SOURCE_ROLE, Selector, SourcePath, SourceSpan, SymbolId,
+    SymbolKey, SymbolReport, SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE,
+    TraversedSymbol, projection_name,
 };
 use oxgraph::db::{
     Db, Direction, ElementId, PageRankConfig, PropertyKeyId, PropertySubject, PropertyValue,
-    QueryResult, QueryValue, RelationId, RelationTypeId, Walk,
+    QueryResult, QueryValue, RelationId, RelationTypeId, RoleId, Walk,
 };
 
 use crate::{
@@ -29,8 +30,8 @@ use crate::{
 
 mod write;
 
-pub(crate) use write::reconcile_database;
 use write::{edge_kind_index_name, element_index_name};
+pub(crate) use write::{reconcile_database, schema_fingerprint};
 
 /// Returns project database status.
 pub(crate) fn project_status(root: impl AsRef<Path>) -> Result<ProjectStatus> {
@@ -310,6 +311,8 @@ impl ReadSession<'_> {
             .map(|symbol| symbol.id.get())
             .collect::<BTreeSet<_>>();
         let relationships = self.context_relationships(&symbols, &selected);
+        let hyperedges = self.context_hyperedges(&symbols, &seed_ids);
+        let dependencies = self.context_dependencies(&symbols);
         let blast_radius = self.context_blast_radius(&seed_ids);
         let call_flow = self.context_call_flow(&symbols);
 
@@ -330,10 +333,76 @@ impl ReadSession<'_> {
             },
             symbols,
             relationships,
+            hyperedges,
+            dependencies,
             blast_radius,
             call_flow,
             files,
         })
+    }
+
+    /// Surfaces the crate-level dependencies of the selected symbols' crates: the
+    /// "layer cake" lifted into `DependsOn` edges. Resolves each crate's `Package`
+    /// node by its deterministic stable key and reads its outgoing dependencies.
+    fn context_dependencies(&self, symbols: &[RenderedSymbol]) -> Vec<ContextDependency> {
+        const MAX_DEPENDENCIES: usize = 32;
+
+        let crate_keys: BTreeSet<String> = symbols
+            .iter()
+            .filter_map(|symbol| symbol.qualified_name.as_str().split("::").next())
+            .filter(|crate_name| !crate_name.is_empty())
+            .map(|crate_name| format!("package:{crate_name}"))
+            .collect();
+
+        let mut dependencies = Vec::new();
+        for package_key in crate_keys {
+            if dependencies.len() >= MAX_DEPENDENCIES {
+                break;
+            }
+            self.collect_package_dependencies(&package_key, &mut dependencies);
+        }
+        dependencies.truncate(MAX_DEPENDENCIES);
+        dependencies
+    }
+
+    /// Appends one crate's outgoing `DependsOn` dependencies (each resolved to the
+    /// depended-on container's qualified name) to `dependencies`.
+    fn collect_package_dependencies(
+        &self,
+        package_key: &str,
+        dependencies: &mut Vec<ContextDependency>,
+    ) {
+        let Ok(matches) = lookup_symbols_by_property(
+            &self.read,
+            self.element_keys,
+            ElementProperty::StableKey,
+            package_key,
+        ) else {
+            return;
+        };
+        let Some(source) = matches.into_iter().next() else {
+            return;
+        };
+        let source_element = ElementId::new(source.id.get());
+        for edge in direct_relation_edges(
+            &self.read,
+            EdgeKind::DependsOn,
+            source_element,
+            EdgeVisitDirection::Outgoing,
+            64,
+        ) {
+            let Ok(Some(target)) =
+                symbol_summary_from_element(&self.read, self.element_keys, edge.neighbor)
+            else {
+                continue;
+            };
+            dependencies.push(ContextDependency {
+                source_id: source.id,
+                source: source.qualified_name.clone(),
+                target_id: target.id,
+                target: target.qualified_name,
+            });
+        }
     }
 
     /// Ranks the seed neighbourhood by personalized PageRank over the combined
@@ -350,10 +419,141 @@ impl ReadSession<'_> {
         else {
             return Vec::new();
         };
-        let config = PageRankConfig::new(0.85_f64, 1e-6_f64, 100);
         self.read
-            .personalized_pagerank(projection, seeds, config)
+            .personalized_pagerank(projection, seeds, PageRankConfig::default())
             .unwrap_or_default()
+    }
+
+    /// Ranks hyperedges as whole units by personalized hypergraph PageRank over
+    /// the architecture projection, returning a relation-id → score map. Empty
+    /// when no hyper projection exists or ranking fails.
+    fn rank_hyperedges(&self, seeds: &[ElementId]) -> BTreeMap<RelationId, f64> {
+        if seeds.is_empty() {
+            return BTreeMap::new();
+        }
+        let Some(projection) = self.read.catalog().projection_id(ARCH_HYPER_PROJECTION) else {
+            return BTreeMap::new();
+        };
+        match self.read.personalized_hypergraph_pagerank(
+            projection,
+            seeds,
+            PageRankConfig::default(),
+        ) {
+            Ok(ranks) => ranks.relations.into_iter().collect(),
+            Err(_) => BTreeMap::new(),
+        }
+    }
+
+    /// Collects the n-ary hyperedges (impl groups, container membership) touching
+    /// the selected symbols, ranked by hypergraph-PageRank centrality. This is the
+    /// architecture-altitude layer: it surfaces the containers and impl units a
+    /// selected symbol belongs to, which the binary relationship list cannot.
+    fn context_hyperedges(
+        &self,
+        symbols: &[RenderedSymbol],
+        seed_ids: &[ElementId],
+    ) -> Vec<ContextHyperedge> {
+        const MAX_HYPEREDGES: usize = 48;
+
+        // Reverse catalog maps: relation-type id → kind, role id → participant role.
+        let catalog = self.read.catalog();
+        let kind_by_type: BTreeMap<RelationTypeId, HyperedgeKind> = HyperedgeKind::ALL
+            .iter()
+            .filter_map(|kind| {
+                catalog
+                    .relation_type_id(kind.as_str())
+                    .map(|id| (id, *kind))
+            })
+            .collect();
+        if kind_by_type.is_empty() {
+            return Vec::new();
+        }
+        let role_by_id: BTreeMap<RoleId, ParticipantRole> = ParticipantRole::ALL
+            .iter()
+            .filter_map(|role| catalog.role_id(role.as_str()).map(|id| (id, *role)))
+            .collect();
+
+        let rank_by_relation = self.rank_hyperedges(seed_ids);
+
+        // Hyperedge relations touching any selected symbol, deduplicated.
+        let relation_ids: BTreeSet<RelationId> = symbols
+            .iter()
+            .flat_map(|symbol| {
+                self.read
+                    .element_incidences(ElementId::new(symbol.id.get()))
+            })
+            .map(|incidence| incidence.relation)
+            .filter(|relation| self.is_hyperedge_relation(*relation, &kind_by_type))
+            .collect();
+
+        let mut hyperedges: Vec<ContextHyperedge> = relation_ids
+            .into_iter()
+            .filter_map(|relation_id| {
+                self.read_context_hyperedge(
+                    relation_id,
+                    &kind_by_type,
+                    &role_by_id,
+                    &rank_by_relation,
+                )
+            })
+            .collect();
+
+        hyperedges.sort_by(|left, right| {
+            right
+                .pagerank
+                .total_cmp(&left.pagerank)
+                .then(left.relation_id.cmp(&right.relation_id))
+        });
+        hyperedges.truncate(MAX_HYPEREDGES);
+        hyperedges
+    }
+
+    /// Returns whether `relation`'s type is one of the hyperedge kinds.
+    fn is_hyperedge_relation(
+        &self,
+        relation: RelationId,
+        kind_by_type: &BTreeMap<RelationTypeId, HyperedgeKind>,
+    ) -> bool {
+        self.read
+            .relation(relation)
+            .and_then(|relation| relation.relation_type)
+            .is_some_and(|relation_type| kind_by_type.contains_key(&relation_type))
+    }
+
+    /// Reads one hyperedge relation back into a [`ContextHyperedge`]: its kind,
+    /// roled participants, and hypergraph-PageRank score. Returns `None` when the
+    /// relation is not a hyperedge or carries no roled participants.
+    fn read_context_hyperedge(
+        &self,
+        relation_id: RelationId,
+        kind_by_type: &BTreeMap<RelationTypeId, HyperedgeKind>,
+        role_by_id: &BTreeMap<RoleId, ParticipantRole>,
+        rank_by_relation: &BTreeMap<RelationId, f64>,
+    ) -> Option<ContextHyperedge> {
+        let kind = self
+            .read
+            .relation(relation_id)?
+            .relation_type
+            .and_then(|relation_type| kind_by_type.get(&relation_type).copied())?;
+        let participants: Vec<ContextHyperedgeParticipant> = self
+            .read
+            .relation_incidences(relation_id)
+            .into_iter()
+            .filter_map(|incidence| {
+                role_by_id
+                    .get(&incidence.role)
+                    .map(|role| ContextHyperedgeParticipant {
+                        id: SymbolId::new(incidence.element.get()),
+                        role: *role,
+                    })
+            })
+            .collect();
+        (!participants.is_empty()).then(|| ContextHyperedge {
+            relation_id: relation_id.get(),
+            kind,
+            participants,
+            pagerank: rank_by_relation.get(&relation_id).copied().unwrap_or(0.0),
+        })
     }
 
     /// Selects up to `MAX_CONTEXT_SYMBOLS` renderable symbols from the top of the
@@ -483,6 +683,7 @@ impl ReadSession<'_> {
         let element = ElementId::new(source.id.get());
         let edges: Vec<_> = EdgeKind::ALL
             .into_iter()
+            .filter(|kind| *kind != EdgeKind::DependsOn)
             .flat_map(|kind| {
                 direct_relation_edges(&self.read, kind, element, EdgeVisitDirection::Outgoing, 64)
                     .into_iter()

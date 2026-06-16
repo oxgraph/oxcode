@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeLocation, EdgeKind, GraphDirection, LanguageId, NodeKind, QualifiedName, SourcePath,
-    SymbolId, SymbolKey,
+    CodeLocation, EdgeKind, GraphDirection, HyperedgeKind, LanguageId, NodeKind, ParticipantRole,
+    QualifiedName, SourcePath, SymbolId, SymbolKey,
 };
 
 /// Symbol details resolved from the OxGraph database.
@@ -113,6 +113,46 @@ pub struct ContextRelation {
     pub site: Option<CallSiteSummary>,
 }
 
+/// One participant of a [`ContextHyperedge`], referencing the symbol by id with
+/// the structural role it plays in the n-ary relation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextHyperedgeParticipant {
+    /// Participant symbol id.
+    pub id: SymbolId,
+    /// Structural role this participant plays.
+    pub role: ParticipantRole,
+}
+
+/// One n-ary relationship (a trait impl group or container membership) touching
+/// the selected symbols, referencing participants by id and carrying its
+/// hypergraph-PageRank centrality as a unit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextHyperedge {
+    /// OxGraph relation id.
+    pub relation_id: u64,
+    /// Kind of n-ary relationship.
+    pub kind: HyperedgeKind,
+    /// Roled participants of the hyperedge.
+    pub participants: Vec<ContextHyperedgeParticipant>,
+    /// Personalized hypergraph-PageRank score of this hyperedge as a unit.
+    pub pagerank: f64,
+}
+
+/// One architecture-level dependency between the crate containers owning the
+/// selected symbols (a lifted `DependsOn` edge): the source crate depends on the
+/// target crate. Surfaced separately from symbol-level relationships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextDependency {
+    /// Depending container's node id.
+    pub source_id: SymbolId,
+    /// Depending container's qualified name (crate/module).
+    pub source: QualifiedName,
+    /// Depended-on container's node id.
+    pub target_id: SymbolId,
+    /// Depended-on container's qualified name (crate/module).
+    pub target: QualifiedName,
+}
+
 /// One caller of an entry-point symbol, carried with enough identity to resolve
 /// it on its own (callers are upstream of the selected neighbourhood, so they do
 /// not appear in `ContextReport::symbols`).
@@ -185,6 +225,13 @@ pub struct ContextReport {
     pub symbols: Vec<RenderedSymbol>,
     /// Relationships among the selected symbols, referencing them by id.
     pub relationships: Vec<ContextRelation>,
+    /// N-ary relationships (impl groups, container membership) touching the
+    /// selected symbols, ranked by hypergraph PageRank — the architecture-altitude
+    /// layer complementing the binary `relationships`.
+    pub hyperedges: Vec<ContextHyperedge>,
+    /// Crate-level dependencies of the selected symbols' crates (the "layer
+    /// cake"), lifted from symbol references.
+    pub dependencies: Vec<ContextDependency>,
     /// Callers and covering tests of the entry-point symbols.
     pub blast_radius: BlastRadius,
     /// The longest call chain among the selected symbols.

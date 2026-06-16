@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EdgeKind, LanguageId, NodeKind, ReferenceKind, ResolutionKind, SourceSpan};
+use crate::{
+    EdgeKind, HyperedgeKind, LanguageId, NodeKind, ParticipantRole, ReferenceKind, ResolutionKind,
+    SourceSpan,
+};
 
 /// One source file accepted by an extractor.
 //
@@ -118,6 +121,28 @@ pub struct ResolvedEdge {
     pub reference: Option<ReferenceSite>,
 }
 
+/// One participant of a [`ResolvedHyperedge`]: a symbol and the structural role
+/// it plays in the n-ary relation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HyperedgeParticipant {
+    /// Participant symbol stable key.
+    pub key: String,
+    /// Structural role this participant plays.
+    pub role: ParticipantRole,
+}
+
+/// A resolved n-ary relation grouping more than two participants into one fact
+/// (e.g. a trait impl or a container and its members), complementary to the
+/// binary [`ResolvedEdge`] layer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ResolvedHyperedge {
+    /// Kind of n-ary relationship.
+    pub kind: HyperedgeKind,
+    /// Participants with their roles. Canonicalized (sorted, deduplicated) by the
+    /// store so the stable key and minted incidences are deterministic.
+    pub participants: Vec<HyperedgeParticipant>,
+}
+
 /// A reference that could not be resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnresolvedReference {
@@ -183,8 +208,10 @@ pub struct ResolvedIndex {
     pub files: Vec<SourceUnit>,
     /// Deterministic symbol nodes.
     pub nodes: Vec<SymbolNode>,
-    /// Resolved edges.
+    /// Resolved binary edges.
     pub edges: Vec<ResolvedEdge>,
+    /// Resolved n-ary hyperedges (impl groups, container membership).
+    pub hyperedges: Vec<ResolvedHyperedge>,
     /// References that could not be resolved.
     pub unresolved: Vec<UnresolvedReference>,
 }

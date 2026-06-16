@@ -20,12 +20,14 @@ use std::{
 };
 
 use oxcode_model::{
-    EXPLORE_PROJECTION, EdgeKind, ElementProperty, NodeKind, PropertyKind, RelationProperty,
-    ResolvedEdge, ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE,
-    UnresolvedReference, projection_name,
+    ARCH_HYPER_PROJECTION, EXPLORE_PROJECTION, EdgeKind, ElementProperty, HyperedgeKind, NodeKind,
+    ParticipantRole, PropertyKind, RelationProperty, ResolvedEdge, ResolvedHyperedge,
+    ResolvedIndex, SOURCE_ROLE, SourceSpan, SymbolNode, TARGET_ROLE, UnresolvedReference,
+    projection_name,
 };
 use oxgraph::db::{
-    Bound, Db, DbError, ElementId, Int, PropertyFamily, RelationId, Schema, Text, Writer,
+    Bound, Db, DbError, ElementId, Int, PropertyFamily, RelationId, RoleId, Schema, Text, Writer,
+    encode_composite_key,
 };
 
 use crate::{
@@ -37,6 +39,14 @@ use crate::{
 const STABLE_KEY_INDEX: &str = "element_stable_key_eq";
 /// Equality index name resolving a relation by its [`RelationProperty::EdgeStableKey`].
 const EDGE_KEY_INDEX: &str = "relation_edge_key_eq";
+/// Equality index name resolving a hyperedge relation by its
+/// [`RelationProperty::HyperedgeStableKey`]. Separate from [`EDGE_KEY_INDEX`] so
+/// the binary-edge and hyperedge reconcile/prune passes never touch each other.
+const HYPER_KEY_INDEX: &str = "relation_hyperedge_key_eq";
+
+/// Resolved `(element, role)` participant endpoints for one hyperedge, in the
+/// shape [`Writer::upsert_relation`] consumes.
+type HyperedgeEndpoints = Vec<(ElementId, RoleId)>;
 
 /// Equality index name for one indexed element property key.
 pub(super) fn element_index_name(key: &str) -> String {
@@ -57,12 +67,21 @@ pub(super) fn edge_kind_index_name() -> String {
 /// nothing new (the apply is idempotent).
 fn code_schema() -> Schema {
     let mut schema = Schema::new().role(SOURCE_ROLE).role(TARGET_ROLE);
+    // Hyperedge participant roles (anchor/member/impl_type/impl_trait) sit
+    // alongside the binary source/target roles.
+    for role in ParticipantRole::ALL {
+        schema = schema.role(role.as_str());
+    }
 
     for kind in NodeKind::ALL {
         schema = schema.label(kind.as_str());
     }
     schema = schema.label(NodeKind::Unresolved.as_str());
     for kind in EdgeKind::ALL {
+        schema = schema.relation_type(kind.as_str());
+    }
+    // Hyperedge kinds are relation types too, persisted alongside binary edges.
+    for kind in HyperedgeKind::ALL {
         schema = schema.relation_type(kind.as_str());
     }
 
@@ -91,6 +110,7 @@ fn code_schema() -> Schema {
     }
     schema = schema
         .equality_index(EDGE_KEY_INDEX, RelationProperty::EdgeStableKey.key())
+        .equality_index(HYPER_KEY_INDEX, RelationProperty::HyperedgeStableKey.key())
         .equality_index(&edge_kind_index_name(), RelationProperty::EdgeKind.key());
 
     // One graph projection per edge kind so navigation can traverse any kind.
@@ -98,11 +118,40 @@ fn code_schema() -> Schema {
         let name = projection_name(kind);
         schema = schema.graph_projection(&name, &[kind.as_str()], SOURCE_ROLE, TARGET_ROLE);
     }
-    // One combined projection spanning every edge kind, used by the curated
-    // `context` command to rank the neighbourhood with personalized PageRank.
-    let explore_kinds: Vec<&str> = EdgeKind::ALL.iter().map(|kind| kind.as_str()).collect();
+    // Combined projection used by `context` to rank the neighbourhood with
+    // personalized PageRank. Excludes `Contains` (structural containment would let
+    // file/module/crate hubs distort symbol relevance) and `DependsOn` (a
+    // container-altitude edge); both have their own projections from the loop above.
+    let explore_kinds: Vec<&str> = EdgeKind::ALL
+        .iter()
+        .filter(|kind| !matches!(kind, EdgeKind::Contains | EdgeKind::DependsOn))
+        .map(|kind| kind.as_str())
+        .collect();
     schema = schema.graph_projection(EXPLORE_PROJECTION, &explore_kinds, SOURCE_ROLE, TARGET_ROLE);
+
+    // One hypergraph projection spanning every hyperedge kind. Participants are
+    // oriented parts -> anchor (sources -> targets), so personalized hypergraph
+    // PageRank flows rank toward the anchor unit (container or impl block).
+    let hyper_kinds: Vec<&str> = HyperedgeKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect();
+    let source_roles: Vec<&str> = ParticipantRole::SOURCE.iter().map(|r| r.as_str()).collect();
+    let target_roles: Vec<&str> = ParticipantRole::TARGET.iter().map(|r| r.as_str()).collect();
+    schema = schema.hypergraph_projection(
+        ARCH_HYPER_PROJECTION,
+        &hyper_kinds,
+        &source_roles,
+        &target_roles,
+    );
     schema
+}
+
+/// Returns the content fingerprint of the code-graph schema, so the indexer can
+/// fold it into its staleness digest: a schema change then forces a full
+/// re-reconcile even when no source content changed.
+pub(crate) fn schema_fingerprint() -> u64 {
+    code_schema().fingerprint()
 }
 
 /// Declares one typed property key on the schema, mapping the model's value kind
@@ -152,6 +201,7 @@ pub(crate) fn reconcile_database(root: &Path, index: &ResolvedIndex) -> Result<P
         .map(|node| node.stable_key.as_str())
         .collect();
     let edge_keys: Vec<String> = index.edges.iter().map(edge_stable_key).collect();
+    let hyperedge_keys: Vec<String> = index.hyperedges.iter().map(hyperedge_stable_key).collect();
 
     database.write(|writer| {
         let bound = writer.apply_schema(&schema)?;
@@ -186,7 +236,10 @@ pub(crate) fn reconcile_database(root: &Path, index: &ResolvedIndex) -> Result<P
         writer.retain(stable_key_eq, &keep_element_keys)?;
 
         // 3. Upsert edges by a deterministic per-edge key (an unchanged edge keeps its relation id
-        //    and endpoints).
+        //    and endpoints), recording the kept key at the point of upsert so the prune set in step
+        //    4 cannot drift from the skip decision here (an edge whose endpoint went missing is
+        //    skipped and therefore never recorded → pruned).
+        let mut kept_edge_keys: Vec<&str> = Vec::with_capacity(index.edges.len());
         for (edge, key) in index.edges.iter().zip(&edge_keys) {
             let (Some(&source), Some(&target)) = (
                 id_by_key.get(&edge.source_key),
@@ -204,20 +257,34 @@ pub(crate) fn reconcile_database(root: &Path, index: &ResolvedIndex) -> Result<P
                 ],
             )?;
             set_relation_properties(writer, &bound, relation, edge)?;
+            kept_edge_keys.push(key.as_str());
         }
 
-        // 4. Prune vanished edges: keep every current edge key. An edge dropped because an endpoint
-        //    went missing is absent from `keep` and pruned.
-        let kept_edge_keys: Vec<&str> = index
-            .edges
-            .iter()
-            .zip(&edge_keys)
-            .filter(|(edge, _)| {
-                id_by_key.contains_key(&edge.source_key) && id_by_key.contains_key(&edge.target_key)
-            })
-            .map(|(_, key)| key.as_str())
-            .collect();
+        // 4. Prune vanished edges: keep exactly the edges upserted above.
         writer.retain(edge_key_eq, &kept_edge_keys)?;
+
+        // 5. Upsert hyperedges by a deterministic key over their roled participant set.
+        //    `upsert_relation` mints one incidence per (element, role), so an unchanged hyperedge
+        //    keeps its relation id; a changed participant set yields a new key and is re-minted
+        //    (the old one pruned in step 6).
+        let hyper_key_eq = bound.equality_index::<Text>(HYPER_KEY_INDEX)?;
+        let mut kept_hyper_keys: Vec<&str> = Vec::with_capacity(index.hyperedges.len());
+        for (hyperedge, key) in index.hyperedges.iter().zip(&hyperedge_keys) {
+            let Some(endpoints) = hyperedge_endpoints(&bound, &id_by_key, hyperedge)? else {
+                continue;
+            };
+            writer.upsert_relation(
+                hyper_key_eq,
+                key.as_str(),
+                bound.relation_type(hyperedge.kind.as_str())?,
+                &endpoints,
+            )?;
+            kept_hyper_keys.push(key.as_str());
+        }
+
+        // 6. Prune vanished hyperedges: keep exactly the hyperedges upserted above (one whose
+        //    participant went missing is skipped and therefore never recorded → pruned).
+        writer.retain(hyper_key_eq, &kept_hyper_keys)?;
 
         Ok(())
     })?;
@@ -245,13 +312,48 @@ pub(super) fn edge_stable_key(edge: &ResolvedEdge) -> String {
         ),
         None => "-".to_owned(),
     };
-    format!(
-        "{}|{}|{}|{}",
-        edge.source_key,
+    encode_composite_key(&[
+        &edge.source_key,
         edge.kind.as_str(),
-        edge.target_key,
-        site
-    )
+        &edge.target_key,
+        &site,
+    ])
+}
+
+/// Builds the deterministic identity key for an n-ary hyperedge over its roled
+/// participant set.
+///
+/// Participants arrive canonicalized (sorted + deduplicated) from the resolver,
+/// so the key is order-independent. Fields are joined via
+/// [`encode_composite_key`], whose length-prefixing keeps the concatenation
+/// injective — distinct participant sets never collide (unlike a naive `:`-join,
+/// since stable keys already contain `:`/`::`).
+fn hyperedge_stable_key(hyperedge: &ResolvedHyperedge) -> String {
+    let mut fields = Vec::with_capacity(1 + hyperedge.participants.len() * 2);
+    fields.push(hyperedge.kind.as_str());
+    for participant in &hyperedge.participants {
+        fields.push(participant.key.as_str());
+        fields.push(participant.role.as_str());
+    }
+    encode_composite_key(&fields)
+}
+
+/// Resolves a hyperedge's participants to `(element, role)` endpoint pairs, or
+/// `None` when any participant's symbol is absent from the store (it was pruned),
+/// so the caller skips minting a dangling hyperedge.
+fn hyperedge_endpoints(
+    bound: &Bound,
+    id_by_key: &BTreeMap<String, ElementId>,
+    hyperedge: &ResolvedHyperedge,
+) -> std::result::Result<Option<HyperedgeEndpoints>, DbError> {
+    let mut endpoints = Vec::with_capacity(hyperedge.participants.len());
+    for participant in &hyperedge.participants {
+        let Some(&element) = id_by_key.get(&participant.key) else {
+            return Ok(None);
+        };
+        endpoints.push((element, bound.role(participant.role.as_str())?));
+    }
+    Ok(Some(endpoints))
 }
 
 /// Builds the deterministic stable key for one unresolved-reference diagnostic.
@@ -643,4 +745,52 @@ fn set_element_span(
         ElementProperty::EndColumn,
         span.end_column,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use oxcode_model::{HyperedgeKind, HyperedgeParticipant, ParticipantRole, ResolvedHyperedge};
+
+    use super::hyperedge_stable_key;
+
+    fn participant(key: &str, role: ParticipantRole) -> HyperedgeParticipant {
+        HyperedgeParticipant {
+            key: key.to_owned(),
+            role,
+        }
+    }
+
+    #[test]
+    fn hyperedge_stable_key_is_collision_free_and_kind_sensitive() {
+        // A naive ':'-join would render both participant sets as "a:b:c"; the
+        // reserved control separators keep distinct sets distinct.
+        let left = ResolvedHyperedge {
+            kind: HyperedgeKind::Membership,
+            participants: vec![
+                participant("a", ParticipantRole::Anchor),
+                participant("b:c", ParticipantRole::Member),
+            ],
+        };
+        let right = ResolvedHyperedge {
+            kind: HyperedgeKind::Membership,
+            participants: vec![
+                participant("a:b", ParticipantRole::Anchor),
+                participant("c", ParticipantRole::Member),
+            ],
+        };
+        assert_ne!(hyperedge_stable_key(&left), hyperedge_stable_key(&right));
+
+        // The key is a pure function of the hyperedge.
+        assert_eq!(
+            hyperedge_stable_key(&left),
+            hyperedge_stable_key(&left.clone())
+        );
+
+        // Kind participates in identity: same participants, different kind.
+        let as_impl = ResolvedHyperedge {
+            kind: HyperedgeKind::ImplGroup,
+            participants: left.participants.clone(),
+        };
+        assert_ne!(hyperedge_stable_key(&left), hyperedge_stable_key(&as_impl));
+    }
 }

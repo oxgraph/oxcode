@@ -121,7 +121,8 @@ pub fn index_project_with_progress(
     let root = paths::canonical_root(root.as_ref())?;
     let files = scan::discover_source_files(&root);
     let scope = manifest::scope_token(&root)?;
-    let digest = manifest::compute_digest(&root, &files, scope)?;
+    let digest =
+        manifest::compute_digest(&root, &files, scope, store::oxgraph::schema_fingerprint())?;
     let database_path = paths::database_dir(&root);
     if database_path.exists()
         && let Some(existing) = manifest::load(&root)

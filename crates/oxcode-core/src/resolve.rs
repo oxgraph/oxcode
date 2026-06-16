@@ -11,8 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oxcode_model::{
-    EdgeKind, Extraction, ReferenceKind, ReferenceSite, ResolutionKind, ResolvedEdge,
-    ResolvedIndex, SymbolNode, UnresolvedReference,
+    EdgeKind, Extraction, HyperedgeKind, HyperedgeParticipant, LanguageId, NodeKind,
+    ParticipantRole, ReferenceKind, ReferenceSite, ResolutionKind, ResolvedEdge, ResolvedHyperedge,
+    ResolvedIndex, SourceSpan, SymbolNode, UnresolvedReference,
 };
 
 use crate::error::Result;
@@ -81,12 +82,398 @@ pub fn resolve_extractions(extractions: Vec<Extraction>) -> Result<ResolvedIndex
         }
     }
 
+    let mut edges: Vec<ResolvedEdge> = edge_set.into_iter().collect();
+
+    // Synthesize the crate/module containment spine and lifted dependency graph
+    // AFTER resolution (so synthesized nodes never entered `SymbolIndex` and could
+    // not pollute name resolution), then group hyperedges over the enriched graph.
+    let (container_nodes, container_edges) = synthesize_architecture(&symbols, &edges);
+    symbols.extend(container_nodes);
+    edges.extend(container_edges);
+
+    let hyperedges = group_hyperedges(&symbols, &edges);
+
     Ok(ResolvedIndex {
         files,
         nodes: symbols,
-        edges: edge_set.into_iter().collect(),
+        edges,
+        hyperedges,
         unresolved,
     })
+}
+
+/// Returns whether a repository-relative path is a library/binary source file
+/// (under a `src/` directory). Only these are woven into the crate/module spine
+/// and dependency graph; `tests/`/`examples/`/`benches/`/`build.rs` are separate
+/// build targets, not part of the module tree.
+fn is_library_source(file_path: &str) -> bool {
+    file_path.split('/').any(|segment| segment == "src")
+}
+
+/// The container node keys a library file belongs to, at each altitude.
+struct FileContainers {
+    /// `Package` node key (the crate).
+    crate_key: String,
+    /// Deepest `Module` node key, or the crate key for a crate-root file.
+    module_key: String,
+    /// The `File` node key.
+    file_key: String,
+}
+
+/// Synthesizes crate/module container nodes + the `Contains` spine, and lifts
+/// symbol edges into file/module/crate `DependsOn` edges. Pure post-processing
+/// over resolved File nodes + edges; container nodes carry a real representative
+/// file path so search/render stay sound.
+fn synthesize_architecture(
+    nodes: &[SymbolNode],
+    edges: &[ResolvedEdge],
+) -> (Vec<SymbolNode>, Vec<ResolvedEdge>) {
+    let (mut minter, library_files) = ContainerMinter::new(nodes);
+    let mut spine: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut containers: BTreeMap<&str, FileContainers> = BTreeMap::new();
+
+    for file in &library_files {
+        let segments: Vec<&str> = file
+            .qualified_name
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let Some(&crate_name) = segments.first() else {
+            continue;
+        };
+        let crate_key = minter.key(NodeKind::Package, crate_name, file);
+
+        let mut parent_key = crate_key.clone();
+        let mut module_key = crate_key.clone();
+        for end in 2..=segments.len() {
+            let key = minter.key(NodeKind::Module, &segments[..end].join("::"), file);
+            spine.insert((parent_key, key.clone()));
+            parent_key = key.clone();
+            module_key = key;
+        }
+        spine.insert((parent_key, file.stable_key.clone()));
+        containers.insert(
+            file.file_path.as_str(),
+            FileContainers {
+                crate_key,
+                module_key,
+                file_key: file.stable_key.clone(),
+            },
+        );
+    }
+
+    let deps = lift_dependencies(nodes, edges, &containers);
+
+    let mut out_edges = Vec::with_capacity(spine.len() + deps.len());
+    out_edges.extend(
+        spine
+            .into_iter()
+            .map(|(source_key, target_key)| ResolvedEdge {
+                source_key,
+                target_key,
+                kind: EdgeKind::Contains,
+                resolution: ResolutionKind::Exact,
+                reference: None,
+            }),
+    );
+    out_edges.extend(
+        deps.into_iter()
+            .map(|(source_key, target_key)| ResolvedEdge {
+                source_key,
+                target_key,
+                kind: EdgeKind::DependsOn,
+                resolution: ResolutionKind::Exact,
+                reference: None,
+            }),
+    );
+    (minter.new_nodes.into_values().collect(), out_edges)
+}
+
+/// Mints (or reuses) crate/module container nodes, deduplicating into `new_nodes`.
+struct ContainerMinter<'a> {
+    /// Existing real container nodes by `(kind, qualified name)` → stable key, so
+    /// a synthetic node is never minted when an inline `mod` already covers it.
+    existing: BTreeMap<(NodeKind, &'a str), &'a str>,
+    /// Representative `(path, language)` for a container qualified name, when a
+    /// library file's module path equals it exactly.
+    file_for_qname: BTreeMap<&'a str, (&'a str, &'a LanguageId)>,
+    /// Synthesized container nodes by stable key.
+    new_nodes: BTreeMap<String, SymbolNode>,
+}
+
+impl<'a> ContainerMinter<'a> {
+    /// Indexes existing containers and library-source files from `nodes`.
+    fn new(nodes: &'a [SymbolNode]) -> (Self, Vec<&'a SymbolNode>) {
+        let mut existing = BTreeMap::new();
+        let mut file_for_qname = BTreeMap::new();
+        let mut library_files = Vec::new();
+        for node in nodes {
+            match node.kind {
+                NodeKind::Module | NodeKind::Namespace | NodeKind::Package => {
+                    existing
+                        .entry((node.kind, node.qualified_name.as_str()))
+                        .or_insert(node.stable_key.as_str());
+                }
+                NodeKind::File if is_library_source(&node.file_path) => {
+                    library_files.push(node);
+                    file_for_qname
+                        .entry(node.qualified_name.as_str())
+                        .or_insert((node.file_path.as_str(), &node.language));
+                }
+                _ => {}
+            }
+        }
+        (
+            Self {
+                existing,
+                file_for_qname,
+                new_nodes: BTreeMap::new(),
+            },
+            library_files,
+        )
+    }
+
+    /// Returns the stable key for the `kind` container named `qualified_name`,
+    /// reusing a real node when present, else minting a synthetic one located at a
+    /// representative file (or the triggering file).
+    fn key(
+        &mut self,
+        kind: NodeKind,
+        qualified_name: &str,
+        triggering_file: &SymbolNode,
+    ) -> String {
+        if let Some(&key) = self.existing.get(&(kind, qualified_name)) {
+            return key.to_owned();
+        }
+        let prefix = if kind == NodeKind::Package {
+            "package"
+        } else {
+            "module"
+        };
+        let stable_key = format!("{prefix}:{qualified_name}");
+        if !self.new_nodes.contains_key(&stable_key) {
+            let (file_path, language) = self.file_for_qname.get(qualified_name).map_or_else(
+                || {
+                    (
+                        triggering_file.file_path.clone(),
+                        triggering_file.language.clone(),
+                    )
+                },
+                |(path, language)| ((*path).to_owned(), (*language).clone()),
+            );
+            let node = SymbolNode {
+                stable_key: stable_key.clone(),
+                name: qualified_name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(qualified_name)
+                    .to_owned(),
+                qualified_name: qualified_name.to_owned(),
+                kind,
+                raw_kind: Some("synthesized".to_owned()),
+                language,
+                file_path,
+                span: SourceSpan::default(),
+                signature: None,
+                docstring: None,
+                source_preview: None,
+            };
+            self.new_nodes.insert(stable_key.clone(), node);
+        }
+        stable_key
+    }
+}
+
+/// Lifts symbol-level dependency edges to file/module/crate `DependsOn` pairs,
+/// deduplicated. Only edges between two library symbols contribute; an edge
+/// within the same container at a level emits nothing at that level.
+fn lift_dependencies(
+    nodes: &[SymbolNode],
+    edges: &[ResolvedEdge],
+    containers: &BTreeMap<&str, FileContainers>,
+) -> BTreeSet<(String, String)> {
+    let file_of_symbol: BTreeMap<&str, &str> = nodes
+        .iter()
+        .map(|node| (node.stable_key.as_str(), node.file_path.as_str()))
+        .collect();
+
+    let mut deps: BTreeSet<(String, String)> = BTreeSet::new();
+    for edge in edges {
+        if !matches!(
+            edge.kind,
+            EdgeKind::Calls
+                | EdgeKind::References
+                | EdgeKind::Imports
+                | EdgeKind::Implements
+                | EdgeKind::ImplementsFor
+        ) {
+            continue;
+        }
+        // Only confident resolutions lift: a real cross-container dependency uses a
+        // crate-qualified path, an import, an enclosing scope, or a receiver type.
+        // `Simple` (bare last-segment) and `Ambiguous` matches cross container
+        // boundaries by coincidence and would fabricate false dependencies.
+        if !matches!(
+            edge.resolution,
+            ResolutionKind::Exact
+                | ResolutionKind::Scoped
+                | ResolutionKind::Import
+                | ResolutionKind::Receiver
+        ) {
+            continue;
+        }
+        let (Some(source), Some(target)) = (
+            file_of_symbol
+                .get(edge.source_key.as_str())
+                .and_then(|path| containers.get(path)),
+            file_of_symbol
+                .get(edge.target_key.as_str())
+                .and_then(|path| containers.get(path)),
+        ) else {
+            continue;
+        };
+        for (from, to) in [
+            (&source.file_key, &target.file_key),
+            (&source.module_key, &target.module_key),
+            (&source.crate_key, &target.crate_key),
+        ] {
+            if from != to {
+                deps.insert((from.clone(), to.clone()));
+            }
+        }
+    }
+    deps
+}
+
+/// Returns whether `kind` is an architecture-level container whose direct
+/// membership is worth grouping into a `Membership` hyperedge for altitude
+/// ranking. Leaf-type containers (structs, enums) are intentionally excluded —
+/// their members are fields/methods, not architectural structure.
+fn is_architecture_container(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::File | NodeKind::Module | NodeKind::Namespace | NodeKind::Package
+    )
+}
+
+/// Groups resolved binary structure into n-ary hyperedges: trait impls
+/// (`ImplGroup`) and high-level container membership (`Membership`). This is pure
+/// post-processing over already-resolved nodes and edges — no parsing — so the
+/// hyperedge layer adds no extraction cost.
+///
+/// The impl group's concrete type is omitted: no resolved edge links an impl
+/// block to the type it is `impl`-ing, so the type is not yet an addressable
+/// participant (added once resolution emits that edge).
+fn group_hyperedges(nodes: &[SymbolNode], edges: &[ResolvedEdge]) -> Vec<ResolvedHyperedge> {
+    let kind_by_key: BTreeMap<&str, NodeKind> = nodes
+        .iter()
+        .map(|node| (node.stable_key.as_str(), node.kind))
+        .collect();
+    let mut out_by_source: BTreeMap<&str, Vec<&ResolvedEdge>> = BTreeMap::new();
+    for edge in edges {
+        out_by_source
+            .entry(edge.source_key.as_str())
+            .or_default()
+            .push(edge);
+    }
+
+    let mut hyperedges = Vec::new();
+
+    // Membership: each architecture-level container and the symbols it directly
+    // contains. Anchor = container (target side), members = contained (source).
+    for (&container, container_edges) in &out_by_source {
+        if !kind_by_key
+            .get(container)
+            .is_some_and(|kind| is_architecture_container(*kind))
+        {
+            continue;
+        }
+        let mut builder = HyperedgeBuilder::new(HyperedgeKind::Membership, container);
+        for edge in container_edges {
+            if edge.kind == EdgeKind::Contains {
+                builder.participant(&edge.target_key, ParticipantRole::Member);
+            }
+        }
+        hyperedges.extend(builder.build());
+    }
+
+    // ImplGroup: each impl block, the trait it implements, and its methods.
+    // Anchor = impl block (target side), trait/methods = source side.
+    for node in nodes {
+        if node.kind != NodeKind::ImplBlock {
+            continue;
+        }
+        let mut builder = HyperedgeBuilder::new(HyperedgeKind::ImplGroup, &node.stable_key);
+        for edge in out_by_source
+            .get(node.stable_key.as_str())
+            .into_iter()
+            .flatten()
+        {
+            let role = match edge.kind {
+                EdgeKind::Implements => ParticipantRole::ImplTrait,
+                EdgeKind::ImplementsFor => ParticipantRole::ImplType,
+                EdgeKind::Contains => ParticipantRole::Member,
+                _ => continue,
+            };
+            builder.participant(&edge.target_key, role);
+        }
+        hyperedges.extend(builder.build());
+    }
+
+    hyperedges.sort();
+    hyperedges
+}
+
+/// Accumulates a hyperedge around a single anchor, then canonicalizes and
+/// validates it on [`Self::build`].
+///
+/// A hyperedge always has exactly one target-side [`ParticipantRole::Anchor`]
+/// (seeded at construction) and zero or more source-side participants added with
+/// [`Self::participant`].
+struct HyperedgeBuilder {
+    /// Kind of the hyperedge under construction.
+    kind: HyperedgeKind,
+    /// Accumulated participants, beginning with the anchor.
+    participants: Vec<HyperedgeParticipant>,
+}
+
+impl HyperedgeBuilder {
+    /// Starts a `kind` hyperedge anchored on `anchor` (the target-side unit).
+    fn new(kind: HyperedgeKind, anchor: &str) -> Self {
+        Self {
+            kind,
+            participants: vec![HyperedgeParticipant {
+                key: anchor.to_owned(),
+                role: ParticipantRole::Anchor,
+            }],
+        }
+    }
+
+    /// Adds one source-side participant playing `role`.
+    fn participant(&mut self, key: &str, role: ParticipantRole) -> &mut Self {
+        self.participants.push(HyperedgeParticipant {
+            key: key.to_owned(),
+            role,
+        });
+        self
+    }
+
+    /// Canonicalizes participants (sort + dedup) and yields the hyperedge, or
+    /// `None` when it has no source-side participant beyond the anchor — the
+    /// hypergraph projection only materializes relations carrying both a source
+    /// and a target.
+    fn build(mut self) -> Option<ResolvedHyperedge> {
+        self.participants.sort();
+        self.participants.dedup();
+        let has_source = self
+            .participants
+            .iter()
+            .any(|participant| participant.role != ParticipantRole::Anchor);
+        has_source.then_some(ResolvedHyperedge {
+            kind: self.kind,
+            participants: self.participants,
+        })
+    }
 }
 
 /// Outcome of resolving one reference.
@@ -346,6 +733,171 @@ mod tests {
             references,
         }])
         .expect("resolve")
+    }
+
+    #[test]
+    fn synthesize_architecture_mints_containers_and_lifts_crate_deps() {
+        let file_node = |crate_qn: &str, path: &str| SymbolNode {
+            stable_key: format!("file:{path}"),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            qualified_name: crate_qn.to_string(),
+            kind: NodeKind::File,
+            raw_kind: Some("source_file".to_string()),
+            language: LanguageId::from("rust"),
+            file_path: path.to_string(),
+            span: SourceSpan::default(),
+            signature: None,
+            docstring: None,
+            source_preview: None,
+        };
+        let function = |key: &str, qn: &str, path: &str| SymbolNode {
+            stable_key: key.to_string(),
+            name: qn.rsplit("::").next().unwrap_or(qn).to_string(),
+            qualified_name: qn.to_string(),
+            kind: NodeKind::Function,
+            raw_kind: None,
+            language: LanguageId::from("rust"),
+            file_path: path.to_string(),
+            span: SourceSpan::default(),
+            signature: None,
+            docstring: None,
+            source_preview: None,
+        };
+        let nodes = vec![
+            file_node("a", "crates/a/src/lib.rs"),
+            file_node("b", "crates/b/src/lib.rs"),
+            function("sym_a", "a::foo", "crates/a/src/lib.rs"),
+            function("sym_b", "b::bar", "crates/b/src/lib.rs"),
+        ];
+        let edges = vec![ResolvedEdge {
+            source_key: "sym_a".to_string(),
+            target_key: "sym_b".to_string(),
+            kind: EdgeKind::Calls,
+            resolution: ResolutionKind::Exact,
+            reference: None,
+        }];
+
+        let (new_nodes, new_edges) = synthesize_architecture(&nodes, &edges);
+
+        assert!(
+            new_nodes
+                .iter()
+                .any(|n| n.stable_key == "package:a" && n.kind == NodeKind::Package)
+        );
+        assert!(new_nodes.iter().any(|n| n.stable_key == "package:b"));
+        let has_edge = |kind: EdgeKind, src: &str, tgt: &str| {
+            new_edges
+                .iter()
+                .any(|e| e.kind == kind && e.source_key == src && e.target_key == tgt)
+        };
+        // Crate-level dependency a -> b (a symbol in a calls one in b).
+        assert!(has_edge(EdgeKind::DependsOn, "package:a", "package:b"));
+        // File-level dependency too.
+        assert!(has_edge(
+            EdgeKind::DependsOn,
+            "file:crates/a/src/lib.rs",
+            "file:crates/b/src/lib.rs"
+        ));
+        // Containment spine: the crate contains its root file.
+        assert!(has_edge(
+            EdgeKind::Contains,
+            "package:a",
+            "file:crates/a/src/lib.rs"
+        ));
+        // No self-dependency within one crate.
+        assert!(!has_edge(EdgeKind::DependsOn, "package:a", "package:a"));
+    }
+
+    #[test]
+    fn group_hyperedges_builds_impl_group_and_container_membership() {
+        let module = symbol("m", "crate::m", NodeKind::Module, 0);
+        let strukt = symbol("Foo", "crate::m::Foo", NodeKind::Struct, 10);
+        let impl_block = symbol(
+            "impl Foo",
+            "crate::m::impl Display for Foo",
+            NodeKind::ImplBlock,
+            20,
+        );
+        let trait_node = symbol("Display", "core::fmt::Display", NodeKind::Trait, 30);
+        let method = symbol("fmt", "crate::m::Foo::fmt", NodeKind::Method, 40);
+
+        let edge = |source: &SymbolNode, target: &SymbolNode, kind| ResolvedEdge {
+            source_key: source.stable_key.clone(),
+            target_key: target.stable_key.clone(),
+            kind,
+            resolution: ResolutionKind::Exact,
+            reference: None,
+        };
+        let edges = vec![
+            edge(&module, &strukt, EdgeKind::Contains),
+            edge(&module, &impl_block, EdgeKind::Contains),
+            edge(&impl_block, &method, EdgeKind::Contains),
+            edge(&impl_block, &trait_node, EdgeKind::Implements),
+            edge(&impl_block, &strukt, EdgeKind::ImplementsFor),
+        ];
+        let nodes = vec![
+            module.clone(),
+            strukt.clone(),
+            impl_block.clone(),
+            trait_node.clone(),
+            method.clone(),
+        ];
+
+        let hyperedges = group_hyperedges(&nodes, &edges);
+
+        let anchor_key = |hyperedge: &ResolvedHyperedge| {
+            hyperedge
+                .participants
+                .iter()
+                .find(|participant| participant.role == ParticipantRole::Anchor)
+                .expect("anchor")
+                .key
+                .clone()
+        };
+        let role_keys = |hyperedge: &ResolvedHyperedge, role: ParticipantRole| {
+            hyperedge
+                .participants
+                .iter()
+                .filter(|participant| participant.role == role)
+                .map(|participant| participant.key.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The impl block anchors one ImplGroup carrying its trait and method.
+        let impl_group = hyperedges
+            .iter()
+            .find(|hyperedge| hyperedge.kind == HyperedgeKind::ImplGroup)
+            .expect("impl group");
+        assert_eq!(anchor_key(impl_group), impl_block.stable_key);
+        assert_eq!(
+            role_keys(impl_group, ParticipantRole::ImplTrait),
+            vec![trait_node.stable_key.clone()]
+        );
+        assert_eq!(
+            role_keys(impl_group, ParticipantRole::Member),
+            vec![method.stable_key.clone()]
+        );
+        assert_eq!(
+            role_keys(impl_group, ParticipantRole::ImplType),
+            vec![strukt.stable_key.clone()]
+        );
+
+        // The module anchors one Membership over the symbols it contains.
+        let membership = hyperedges
+            .iter()
+            .find(|hyperedge| hyperedge.kind == HyperedgeKind::Membership)
+            .expect("membership");
+        assert_eq!(anchor_key(membership), module.stable_key);
+        let members = role_keys(membership, ParticipantRole::Member);
+        assert!(members.contains(&strukt.stable_key));
+        assert!(members.contains(&impl_block.stable_key));
+
+        // A struct is not an architecture container: its members are not grouped.
+        assert!(
+            !hyperedges
+                .iter()
+                .any(|hyperedge| anchor_key(hyperedge) == strukt.stable_key)
+        );
     }
 
     #[test]
