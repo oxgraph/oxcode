@@ -1,6 +1,6 @@
 [package]
 name = "oxcode-cli"
-version = "0.1.2"
+version = "0.2.0"
 description = "Index source code into a graph and serve it to coding agents — `oxcode` CLI."
 categories = ["development-tools", "command-line-utilities"]
 readme = "README.md"
@@ -23,7 +23,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 axoupdater.workspace = true
 clap.workspace = true
-oxcode-core = { path = "../oxcode-core", version = "0.1.2" }
+oxcode-core = { path = "../oxcode-core", version = "0.2.0" }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
