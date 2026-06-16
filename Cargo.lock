@@ -1399,7 +1399,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "oxcode-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "oxcode-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ignore",
  "oxcode-model",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "oxcode-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",

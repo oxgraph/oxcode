@@ -76,6 +76,24 @@ oxgraph marketplace — it wires up the MCP server for you:
 The plugin still needs the `oxcode` binary on your `PATH` and an indexed project
 (steps 1–2). See [`claude-plugin/README.md`](claude-plugin/README.md).
 
+#### Other MCP clients (registry / npm)
+
+oxcode is listed in the official [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.snowmead/oxcode`, so registry-aware clients can discover it. For
+clients that prefer an `npx` launch command there's also an npm package:
+
+```json
+{
+  "mcpServers": {
+    "oxcode": { "command": "npx", "args": ["-y", "@snowmead/oxcode-mcp"] }
+  }
+}
+```
+
+`@snowmead/oxcode-mcp` is a thin wrapper that runs `oxcode mcp`, so it still needs
+the `oxcode` binary on your `PATH` (step 1) — if you have it, `command: "oxcode"`
+above is the simpler config.
+
 ## How Indexing Works
 
 1. **Extraction** — tree-sitter parses each source file into a syntax tree. A
