@@ -138,6 +138,21 @@ pub struct ContextHyperedge {
     pub pagerank: f64,
 }
 
+/// One architecture-level dependency between the crate containers owning the
+/// selected symbols (a lifted `DependsOn` edge): the source crate depends on the
+/// target crate. Surfaced separately from symbol-level relationships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextDependency {
+    /// Depending container's node id.
+    pub source_id: SymbolId,
+    /// Depending container's qualified name (crate/module).
+    pub source: QualifiedName,
+    /// Depended-on container's node id.
+    pub target_id: SymbolId,
+    /// Depended-on container's qualified name (crate/module).
+    pub target: QualifiedName,
+}
+
 /// One caller of an entry-point symbol, carried with enough identity to resolve
 /// it on its own (callers are upstream of the selected neighbourhood, so they do
 /// not appear in `ContextReport::symbols`).
@@ -214,6 +229,9 @@ pub struct ContextReport {
     /// selected symbols, ranked by hypergraph PageRank — the architecture-altitude
     /// layer complementing the binary `relationships`.
     pub hyperedges: Vec<ContextHyperedge>,
+    /// Crate-level dependencies of the selected symbols' crates (the "layer
+    /// cake"), lifted from symbol references.
+    pub dependencies: Vec<ContextDependency>,
     /// Callers and covering tests of the entry-point symbols.
     pub blast_radius: BlastRadius,
     /// The longest call chain among the selected symbols.

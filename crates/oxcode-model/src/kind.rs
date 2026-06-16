@@ -39,6 +39,12 @@ string_enum! {
         References => "references",
         Implements => "implements",
         Defines => "defines",
+        /// An impl block to the concrete type it implements (distinct from
+        /// `Implements`, which points at the trait).
+        ImplementsFor => "implements_for",
+        /// A container (crate/module/file) depends on another because a symbol it
+        /// contains references a symbol the other contains. Lifted, not extracted.
+        DependsOn => "depends_on",
     }
 }
 
@@ -105,6 +111,8 @@ string_enum! {
         Trait => "trait",
         Import => "import",
         ImportGlob => "import_glob",
+        /// A reference to a concrete type (e.g. the self type of an impl block).
+        Type => "type",
     }
 }
 

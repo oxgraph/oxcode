@@ -140,6 +140,16 @@ pub fn format_context_report(report: &ContextReport) -> String {
         }
     }
 
+    if !report.dependencies.is_empty() {
+        output.push_str("dependencies\n");
+        for dependency in &report.dependencies {
+            output.push_str(&format!(
+                "  {} -> {}\n",
+                dependency.source, dependency.target
+            ));
+        }
+    }
+
     if !report.blast_radius.callers.is_empty() || !report.blast_radius.tests.is_empty() {
         output.push_str("blast radius\n");
         for caller in &report.blast_radius.callers {

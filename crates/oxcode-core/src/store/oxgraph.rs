@@ -8,13 +8,13 @@ use std::{
 use oxcode_model::{
     ARCH_HYPER_PROJECTION, BlastCaller, BlastRadius, CALLS_PROJECTION, CallEdgeSummary,
     CallFlowHop, CallGraphReport, CallSiteSummary, CatalogStatus, CodeLocation, ContextBudget,
-    ContextFile, ContextHyperedge, ContextHyperedgeParticipant, ContextRelation, ContextReport,
-    EXPLORE_PROJECTION, EdgeKind, ElementProperty, ExpandedQueryReport, ExpandedQueryRow,
-    ExpandedQueryValue, FileSearchReport, FileSummary, GraphDirection, HyperedgeKind, LanguageId,
-    NodeKind, ParticipantRole, ProjectStatus, QualifiedName, RelationProperty, RenderedSymbol,
-    SOURCE_ROLE, Selector, SourcePath, SourceSpan, SymbolId, SymbolKey, SymbolReport,
-    SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE, TraversedSymbol,
-    projection_name,
+    ContextDependency, ContextFile, ContextHyperedge, ContextHyperedgeParticipant, ContextRelation,
+    ContextReport, EXPLORE_PROJECTION, EdgeKind, ElementProperty, ExpandedQueryReport,
+    ExpandedQueryRow, ExpandedQueryValue, FileSearchReport, FileSummary, GraphDirection,
+    HyperedgeKind, LanguageId, NodeKind, ParticipantRole, ProjectStatus, QualifiedName,
+    RelationProperty, RenderedSymbol, SOURCE_ROLE, Selector, SourcePath, SourceSpan, SymbolId,
+    SymbolKey, SymbolReport, SymbolSearchMatch, SymbolSearchReport, SymbolSummary, TARGET_ROLE,
+    TraversedSymbol, projection_name,
 };
 use oxgraph::db::{
     Db, Direction, ElementId, PageRankConfig, PropertyKeyId, PropertySubject, PropertyValue,
@@ -312,6 +312,7 @@ impl ReadSession<'_> {
             .collect::<BTreeSet<_>>();
         let relationships = self.context_relationships(&symbols, &selected);
         let hyperedges = self.context_hyperedges(&symbols, &seed_ids);
+        let dependencies = self.context_dependencies(&symbols);
         let blast_radius = self.context_blast_radius(&seed_ids);
         let call_flow = self.context_call_flow(&symbols);
 
@@ -333,10 +334,75 @@ impl ReadSession<'_> {
             symbols,
             relationships,
             hyperedges,
+            dependencies,
             blast_radius,
             call_flow,
             files,
         })
+    }
+
+    /// Surfaces the crate-level dependencies of the selected symbols' crates: the
+    /// "layer cake" lifted into `DependsOn` edges. Resolves each crate's `Package`
+    /// node by its deterministic stable key and reads its outgoing dependencies.
+    fn context_dependencies(&self, symbols: &[RenderedSymbol]) -> Vec<ContextDependency> {
+        const MAX_DEPENDENCIES: usize = 32;
+
+        let crate_keys: BTreeSet<String> = symbols
+            .iter()
+            .filter_map(|symbol| symbol.qualified_name.as_str().split("::").next())
+            .filter(|crate_name| !crate_name.is_empty())
+            .map(|crate_name| format!("package:{crate_name}"))
+            .collect();
+
+        let mut dependencies = Vec::new();
+        for package_key in crate_keys {
+            if dependencies.len() >= MAX_DEPENDENCIES {
+                break;
+            }
+            self.collect_package_dependencies(&package_key, &mut dependencies);
+        }
+        dependencies.truncate(MAX_DEPENDENCIES);
+        dependencies
+    }
+
+    /// Appends one crate's outgoing `DependsOn` dependencies (each resolved to the
+    /// depended-on container's qualified name) to `dependencies`.
+    fn collect_package_dependencies(
+        &self,
+        package_key: &str,
+        dependencies: &mut Vec<ContextDependency>,
+    ) {
+        let Ok(matches) = lookup_symbols_by_property(
+            &self.read,
+            self.element_keys,
+            ElementProperty::StableKey,
+            package_key,
+        ) else {
+            return;
+        };
+        let Some(source) = matches.into_iter().next() else {
+            return;
+        };
+        let source_element = ElementId::new(source.id.get());
+        for edge in direct_relation_edges(
+            &self.read,
+            EdgeKind::DependsOn,
+            source_element,
+            EdgeVisitDirection::Outgoing,
+            64,
+        ) {
+            let Ok(Some(target)) =
+                symbol_summary_from_element(&self.read, self.element_keys, edge.neighbor)
+            else {
+                continue;
+            };
+            dependencies.push(ContextDependency {
+                source_id: source.id,
+                source: source.qualified_name.clone(),
+                target_id: target.id,
+                target: target.qualified_name,
+            });
+        }
     }
 
     /// Ranks the seed neighbourhood by personalized PageRank over the combined
@@ -617,6 +683,7 @@ impl ReadSession<'_> {
         let element = ElementId::new(source.id.get());
         let edges: Vec<_> = EdgeKind::ALL
             .into_iter()
+            .filter(|kind| *kind != EdgeKind::DependsOn)
             .flat_map(|kind| {
                 direct_relation_edges(&self.read, kind, element, EdgeVisitDirection::Outgoing, 64)
                     .into_iter()

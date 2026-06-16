@@ -118,9 +118,15 @@ fn code_schema() -> Schema {
         let name = projection_name(kind);
         schema = schema.graph_projection(&name, &[kind.as_str()], SOURCE_ROLE, TARGET_ROLE);
     }
-    // One combined projection spanning every edge kind, used by the curated
-    // `context` command to rank the neighbourhood with personalized PageRank.
-    let explore_kinds: Vec<&str> = EdgeKind::ALL.iter().map(|kind| kind.as_str()).collect();
+    // Combined projection used by `context` to rank the neighbourhood with
+    // personalized PageRank. Excludes `Contains` (structural containment would let
+    // file/module/crate hubs distort symbol relevance) and `DependsOn` (a
+    // container-altitude edge); both have their own projections from the loop above.
+    let explore_kinds: Vec<&str> = EdgeKind::ALL
+        .iter()
+        .filter(|kind| !matches!(kind, EdgeKind::Contains | EdgeKind::DependsOn))
+        .map(|kind| kind.as_str())
+        .collect();
     schema = schema.graph_projection(EXPLORE_PROJECTION, &explore_kinds, SOURCE_ROLE, TARGET_ROLE);
 
     // One hypergraph projection spanning every hyperedge kind. Participants are
