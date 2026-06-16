@@ -11,8 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oxcode_model::{
-    EdgeKind, Extraction, ReferenceKind, ReferenceSite, ResolutionKind, ResolvedEdge,
-    ResolvedIndex, SymbolNode, UnresolvedReference,
+    EdgeKind, Extraction, HyperedgeKind, HyperedgeParticipant, NodeKind, ParticipantRole,
+    ReferenceKind, ReferenceSite, ResolutionKind, ResolvedEdge, ResolvedHyperedge, ResolvedIndex,
+    SymbolNode, UnresolvedReference,
 };
 
 use crate::error::Result;
@@ -81,12 +82,146 @@ pub fn resolve_extractions(extractions: Vec<Extraction>) -> Result<ResolvedIndex
         }
     }
 
+    let edges: Vec<ResolvedEdge> = edge_set.into_iter().collect();
+    let hyperedges = group_hyperedges(&symbols, &edges);
+
     Ok(ResolvedIndex {
         files,
         nodes: symbols,
-        edges: edge_set.into_iter().collect(),
+        edges,
+        hyperedges,
         unresolved,
     })
+}
+
+/// Returns whether `kind` is an architecture-level container whose direct
+/// membership is worth grouping into a `Membership` hyperedge for altitude
+/// ranking. Leaf-type containers (structs, enums) are intentionally excluded —
+/// their members are fields/methods, not architectural structure.
+fn is_architecture_container(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::File | NodeKind::Module | NodeKind::Namespace | NodeKind::Package
+    )
+}
+
+/// Groups resolved binary structure into n-ary hyperedges: trait impls
+/// (`ImplGroup`) and high-level container membership (`Membership`). This is pure
+/// post-processing over already-resolved nodes and edges — no parsing — so the
+/// hyperedge layer adds no extraction cost.
+///
+/// The impl group's concrete type is omitted: no resolved edge links an impl
+/// block to the type it is `impl`-ing, so the type is not yet an addressable
+/// participant (added once resolution emits that edge).
+fn group_hyperedges(nodes: &[SymbolNode], edges: &[ResolvedEdge]) -> Vec<ResolvedHyperedge> {
+    let kind_by_key: BTreeMap<&str, NodeKind> = nodes
+        .iter()
+        .map(|node| (node.stable_key.as_str(), node.kind))
+        .collect();
+    let mut out_by_source: BTreeMap<&str, Vec<&ResolvedEdge>> = BTreeMap::new();
+    for edge in edges {
+        out_by_source
+            .entry(edge.source_key.as_str())
+            .or_default()
+            .push(edge);
+    }
+
+    let mut hyperedges = Vec::new();
+
+    // Membership: each architecture-level container and the symbols it directly
+    // contains. Anchor = container (target side), members = contained (source).
+    for (&container, container_edges) in &out_by_source {
+        if !kind_by_key
+            .get(container)
+            .is_some_and(|kind| is_architecture_container(*kind))
+        {
+            continue;
+        }
+        let mut builder = HyperedgeBuilder::new(HyperedgeKind::Membership, container);
+        for edge in container_edges {
+            if edge.kind == EdgeKind::Contains {
+                builder.participant(&edge.target_key, ParticipantRole::Member);
+            }
+        }
+        hyperedges.extend(builder.build());
+    }
+
+    // ImplGroup: each impl block, the trait it implements, and its methods.
+    // Anchor = impl block (target side), trait/methods = source side.
+    for node in nodes {
+        if node.kind != NodeKind::ImplBlock {
+            continue;
+        }
+        let mut builder = HyperedgeBuilder::new(HyperedgeKind::ImplGroup, &node.stable_key);
+        for edge in out_by_source
+            .get(node.stable_key.as_str())
+            .into_iter()
+            .flatten()
+        {
+            let role = match edge.kind {
+                EdgeKind::Implements => ParticipantRole::ImplTrait,
+                EdgeKind::Contains => ParticipantRole::Member,
+                _ => continue,
+            };
+            builder.participant(&edge.target_key, role);
+        }
+        hyperedges.extend(builder.build());
+    }
+
+    hyperedges.sort();
+    hyperedges
+}
+
+/// Accumulates a hyperedge around a single anchor, then canonicalizes and
+/// validates it on [`Self::build`].
+///
+/// A hyperedge always has exactly one target-side [`ParticipantRole::Anchor`]
+/// (seeded at construction) and zero or more source-side participants added with
+/// [`Self::participant`].
+struct HyperedgeBuilder {
+    /// Kind of the hyperedge under construction.
+    kind: HyperedgeKind,
+    /// Accumulated participants, beginning with the anchor.
+    participants: Vec<HyperedgeParticipant>,
+}
+
+impl HyperedgeBuilder {
+    /// Starts a `kind` hyperedge anchored on `anchor` (the target-side unit).
+    fn new(kind: HyperedgeKind, anchor: &str) -> Self {
+        Self {
+            kind,
+            participants: vec![HyperedgeParticipant {
+                key: anchor.to_owned(),
+                role: ParticipantRole::Anchor,
+            }],
+        }
+    }
+
+    /// Adds one source-side participant playing `role`.
+    fn participant(&mut self, key: &str, role: ParticipantRole) -> &mut Self {
+        self.participants.push(HyperedgeParticipant {
+            key: key.to_owned(),
+            role,
+        });
+        self
+    }
+
+    /// Canonicalizes participants (sort + dedup) and yields the hyperedge, or
+    /// `None` when it has no source-side participant beyond the anchor — the
+    /// hypergraph projection only materializes relations carrying both a source
+    /// and a target.
+    fn build(mut self) -> Option<ResolvedHyperedge> {
+        self.participants.sort();
+        self.participants.dedup();
+        let has_source = self
+            .participants
+            .iter()
+            .any(|participant| participant.role != ParticipantRole::Anchor);
+        has_source.then_some(ResolvedHyperedge {
+            kind: self.kind,
+            participants: self.participants,
+        })
+    }
 }
 
 /// Outcome of resolving one reference.
@@ -346,6 +481,93 @@ mod tests {
             references,
         }])
         .expect("resolve")
+    }
+
+    #[test]
+    fn group_hyperedges_builds_impl_group_and_container_membership() {
+        let module = symbol("m", "crate::m", NodeKind::Module, 0);
+        let strukt = symbol("Foo", "crate::m::Foo", NodeKind::Struct, 10);
+        let impl_block = symbol(
+            "impl Foo",
+            "crate::m::impl Display for Foo",
+            NodeKind::ImplBlock,
+            20,
+        );
+        let trait_node = symbol("Display", "core::fmt::Display", NodeKind::Trait, 30);
+        let method = symbol("fmt", "crate::m::Foo::fmt", NodeKind::Method, 40);
+
+        let edge = |source: &SymbolNode, target: &SymbolNode, kind| ResolvedEdge {
+            source_key: source.stable_key.clone(),
+            target_key: target.stable_key.clone(),
+            kind,
+            resolution: ResolutionKind::Exact,
+            reference: None,
+        };
+        let edges = vec![
+            edge(&module, &strukt, EdgeKind::Contains),
+            edge(&module, &impl_block, EdgeKind::Contains),
+            edge(&impl_block, &method, EdgeKind::Contains),
+            edge(&impl_block, &trait_node, EdgeKind::Implements),
+        ];
+        let nodes = vec![
+            module.clone(),
+            strukt.clone(),
+            impl_block.clone(),
+            trait_node.clone(),
+            method.clone(),
+        ];
+
+        let hyperedges = group_hyperedges(&nodes, &edges);
+
+        let anchor_key = |hyperedge: &ResolvedHyperedge| {
+            hyperedge
+                .participants
+                .iter()
+                .find(|participant| participant.role == ParticipantRole::Anchor)
+                .expect("anchor")
+                .key
+                .clone()
+        };
+        let role_keys = |hyperedge: &ResolvedHyperedge, role: ParticipantRole| {
+            hyperedge
+                .participants
+                .iter()
+                .filter(|participant| participant.role == role)
+                .map(|participant| participant.key.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The impl block anchors one ImplGroup carrying its trait and method.
+        let impl_group = hyperedges
+            .iter()
+            .find(|hyperedge| hyperedge.kind == HyperedgeKind::ImplGroup)
+            .expect("impl group");
+        assert_eq!(anchor_key(impl_group), impl_block.stable_key);
+        assert_eq!(
+            role_keys(impl_group, ParticipantRole::ImplTrait),
+            vec![trait_node.stable_key.clone()]
+        );
+        assert_eq!(
+            role_keys(impl_group, ParticipantRole::Member),
+            vec![method.stable_key.clone()]
+        );
+
+        // The module anchors one Membership over the symbols it contains.
+        let membership = hyperedges
+            .iter()
+            .find(|hyperedge| hyperedge.kind == HyperedgeKind::Membership)
+            .expect("membership");
+        assert_eq!(anchor_key(membership), module.stable_key);
+        let members = role_keys(membership, ParticipantRole::Member);
+        assert!(members.contains(&strukt.stable_key));
+        assert!(members.contains(&impl_block.stable_key));
+
+        // A struct is not an architecture container: its members are not grouped.
+        assert!(
+            !hyperedges
+                .iter()
+                .any(|hyperedge| anchor_key(hyperedge) == strukt.stable_key)
+        );
     }
 
     #[test]

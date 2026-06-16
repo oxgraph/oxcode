@@ -19,6 +19,11 @@ pub const CALLS_PROJECTION: &str = "calls";
 /// ranked by personalized PageRank for the curated `context` command.
 pub const EXPLORE_PROJECTION: &str = "explore";
 
+/// Catalog name of the hypergraph projection spanning every hyperedge kind,
+/// ranked by personalized hypergraph PageRank so containers and impl groups
+/// surface for architecture-altitude questions.
+pub const ARCH_HYPER_PROJECTION: &str = "arch_hyper";
+
 /// Returns the catalog name of the graph projection for `edge_kind`. The
 /// `calls` projection keeps its historical name; every other kind is
 /// `edges_<kind>`, so navigation can traverse any code edge kind.
@@ -174,6 +179,10 @@ pub enum RelationProperty {
     /// Deterministic, per-edge identity key used to resolve-or-mint the relation
     /// across reindexes (the relation analogue of [`ElementProperty::StableKey`]).
     EdgeStableKey,
+    /// Deterministic identity key for an n-ary hyperedge relation, kept in its own
+    /// property (and index) so binary-edge and hyperedge reconcile/prune never
+    /// clobber each other.
+    HyperedgeStableKey,
     /// Edge kind spelling.
     EdgeKind,
     /// How the edge target was resolved.
@@ -200,6 +209,7 @@ impl RelationProperty {
     /// Every relation property, in registration order.
     pub const ALL: &'static [Self] = &[
         Self::EdgeStableKey,
+        Self::HyperedgeStableKey,
         Self::EdgeKind,
         Self::Resolution,
         Self::SiteFilePath,
@@ -217,6 +227,7 @@ impl RelationProperty {
     pub const fn key(self) -> &'static str {
         match self {
             Self::EdgeStableKey => "edge_stable_key",
+            Self::HyperedgeStableKey => "hyperedge_stable_key",
             Self::EdgeKind => "edge_kind",
             Self::Resolution => "resolution",
             Self::SiteFilePath => "site_file_path",

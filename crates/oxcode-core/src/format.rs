@@ -1,6 +1,7 @@
 use oxcode_model::{
     CallEdgeSummary, CallGraphReport, CodeLocation, ContextReport, ExpandedQueryReport,
-    ExpandedQueryValue, FileSearchReport, SymbolReport, SymbolSearchReport, SymbolSummary,
+    ExpandedQueryValue, FileSearchReport, ParticipantRole, SymbolReport, SymbolSearchReport,
+    SymbolSummary,
 };
 use oxgraph::db::{PropertySubject, QueryValue};
 
@@ -112,6 +113,31 @@ pub fn format_context_report(report: &ContextReport) -> String {
             relation.target_id.get(),
             relation.relation_id,
         ));
+    }
+
+    if !report.hyperedges.is_empty() {
+        output.push_str("hyperedges\n");
+        for hyperedge in &report.hyperedges {
+            let anchor = hyperedge
+                .participants
+                .iter()
+                .find(|participant| participant.role == ParticipantRole::Anchor)
+                .map_or_else(
+                    || "-".to_owned(),
+                    |participant| format!("#{}", participant.id.get()),
+                );
+            let members = hyperedge
+                .participants
+                .iter()
+                .filter(|participant| participant.role != ParticipantRole::Anchor)
+                .map(|participant| format!("#{}", participant.id.get()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str(&format!(
+                "  {} pagerank={:.4} anchor:{anchor} members:[{members}] relation:{}\n",
+                hyperedge.kind, hyperedge.pagerank, hyperedge.relation_id,
+            ));
+        }
     }
 
     if !report.blast_radius.callers.is_empty() || !report.blast_radius.tests.is_empty() {

@@ -39,7 +39,9 @@ working directory. If `oxcode_status` reports no database, call `oxcode_index` f
 (it accepts an optional `path`, defaults to the working directory, and re-indexing after changes is \
 incremental). For almost any code-understanding question, call `oxcode_explore` first with the \
 user's question verbatim: it returns the most relevant symbols (ranked by graph centrality), their \
-source, the relationships among them, the blast radius, and the call flow — in one call. Use \
+source, the relationships among them, the n-ary hyperedges they belong to (trait impl groups and \
+container/module membership, ranked by hypergraph PageRank — the architecture-altitude layer), the \
+blast radius, and the call flow — in one call. Use \
 `oxcode_callers`/`oxcode_callees`/`oxcode_symbol` to follow specific edges, and \
 `oxcode_search`/`oxcode_files` only when explore did not surface the target. Prefer these query \
 tools over shelling out to grep or reading files; `oxcode_index` is the only tool that writes \
@@ -144,7 +146,7 @@ impl OxcodeServer {
     }
 
     #[tool(
-        description = "Answer a code question in one call: returns the most relevant symbols ranked by graph centrality, their source, relationships, blast radius, and call flow for the query. Use this first for any code-understanding question.",
+        description = "Answer a code question in one call: returns the most relevant symbols ranked by graph centrality, their source, relationships, n-ary hyperedges (trait impl groups and container membership, ranked by hypergraph PageRank for architecture-altitude questions), blast radius, and call flow for the query. Use this first for any code-understanding question.",
         execution(task_support = "optional")
     )]
     async fn oxcode_explore(
