@@ -1,0 +1,84 @@
+# Appends a "## Changes" commit list to each GitHub Release.
+#
+# The release itself is created by the dist-generated `release.yml` (the `host`
+# job) using the default GITHUB_TOKEN. GitHub suppresses workflow runs that would
+# be triggered by GITHUB_TOKEN-caused events, so an `on: release` trigger would
+# never fire for dist releases. Instead this triggers on the *completion of the
+# Release workflow* (`workflow_run`), which is not suppressed and guarantees the
+# release already exists. It is a standalone file, so regenerating `release.yml`
+# with `dist generate` never touches it.
+#
+# Everything is read through the GitHub API (`gh`) — no source checkout — so the
+# privileged `workflow_run` job never checks out (untrusted) repository code.
+name: release-notes
+
+on:
+  workflow_run:
+    workflows: ["Release"] # matches `name: Release` in release.yml
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  append-changes:
+    # Only successful, tag-push release runs (release.yml also runs on PRs).
+    if: >
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Append "## Changes" to the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          # All version tags (name + commit sha), via the API — no checkout needed.
+          gh api "repos/$REPO/tags" --paginate > "$RUNNER_TEMP/tags.json"
+
+          # The version tag at the released commit.
+          TAG="$(jq -r --arg s "$HEAD_SHA" '.[] | select(.commit.sha == $s) | .name' \
+                 "$RUNNER_TEMP/tags.json" | grep -E '^v[0-9]' | head -n1 || true)"
+          if [ -z "$TAG" ]; then
+            echo "No version tag at $HEAD_SHA; nothing to do."
+            exit 0
+          fi
+
+          # The previous version tag (next one below TAG in semver order).
+          PREV="$(jq -r '.[].name' "$RUNNER_TEMP/tags.json" | grep -E '^v[0-9]' | sort -rV \
+                  | awk -v t="$TAG" 'found{print; exit} $0==t{found=1}')"
+
+          # Commits in the release, newest first, via the API.
+          # `compare/BASE...HEAD` returns commits in HEAD but not BASE; for the
+          # first release (no prior tag) list all commits up to the tag instead.
+          if [ -n "$PREV" ]; then
+            CHANGES="$(gh api "repos/$REPO/compare/$PREV...$TAG" \
+              --jq '[.commits[] | "- \(.sha[0:7]) \(.commit.message | split("\n")[0])"] | reverse | join("\n")')"
+          else
+            CHANGES="$(gh api --paginate "repos/$REPO/commits?sha=$TAG&per_page=100" \
+              --jq '[.[] | "- \(.sha[0:7]) \(.commit.message | split("\n")[0])"] | join("\n")')"
+          fi
+          if [ -z "$CHANGES" ]; then
+            echo "No commits to list; nothing to do."
+            exit 0
+          fi
+
+          # Append once: skip if a Changes section is already present (re-run safe).
+          BODY="$(gh release view "$TAG" --json body --jq '.body')"
+          case "$BODY" in
+            *"## Changes"*)
+              echo "Release $TAG already has a Changes section; skipping."
+              exit 0
+              ;;
+          esac
+
+          {
+            printf '%s\n\n## Changes\n\n' "$BODY"
+            printf '%s\n' "$CHANGES"
+          } > "$RUNNER_TEMP/notes.md"
+
+          gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "Appended the commit list ${PREV:+since $PREV }to the $TAG release notes."
