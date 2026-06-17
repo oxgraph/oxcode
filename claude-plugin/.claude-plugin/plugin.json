@@ -1,7 +1,7 @@
 {
   "name": "oxcode",
   "version": "0.4.0",
-  "description": "PageRank-curated code intelligence for coding agents. Bundles the oxcode MCP server over stdio (self-updating from v0.1.2): oxcode_index builds/refreshes the index; explore/search/callers/callees/symbol/files/status query it. explore also surfaces n-ary impl/module hyperedges and a crate dependency graph for architecture-altitude context.",
+  "description": "PageRank-curated code intelligence for coding agents. Bundles the oxcode MCP server over stdio (self-updating from v0.1.2): oxcode_watch builds the index and keeps it current as files change — a file lock elects a single writer per folder while other instances serve reads; explore/search/callers/callees/symbol/files/status query it. explore also surfaces n-ary impl/module hyperedges and a crate dependency graph for architecture-altitude context.",
   "author": { "name": "oxgraph", "email": "michael@snowmead.com" },
   "homepage": "https://oxgraph.io",
   "repository": "https://github.com/oxgraph/oxcode",

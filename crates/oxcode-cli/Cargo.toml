@@ -1,6 +1,6 @@
 [package]
 name = "oxcode-cli"
-version = "0.3.0"
+version = "0.4.0"
 description = "Index source code into a graph and serve it to coding agents — `oxcode` CLI."
 categories = ["development-tools", "command-line-utilities"]
 readme = "README.md"
@@ -23,7 +23,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 axoupdater.workspace = true
 clap.workspace = true
-oxcode-core = { path = "../oxcode-core", version = "0.3.0" }
+notify-debouncer-full = "0.7"
+oxcode-core = { path = "../oxcode-core", version = "0.4.0" }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,5 +36,5 @@ predicates.workspace = true
 # The MCP integration tests in `src/mcp.rs` act as an in-process MCP client over
 # `tokio::io::duplex`, which needs rmcp's client role. This is dev-only and does
 # not change the published binary's feature set.
-rmcp = { workspace = true, features = ["client"] }
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 tempfile.workspace = true
