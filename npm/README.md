@@ -35,6 +35,8 @@ This is equivalent to running `oxcode mcp` directly — if you already have the
 binary, pointing your client at `command: "oxcode", args: ["mcp"]` is simpler and
 avoids the Node hop.
 
-Index a project first (`oxcode index`, or call the `oxcode_index` tool) so the
-read tools have data. See the [oxcode repo](https://github.com/oxgraph/oxcode)
-for the full CLI and tool list.
+Call the `oxcode_watch` tool once: it builds the index and keeps it current as
+files change. Across many `oxcode mcp` processes on one folder, a file lock elects
+a single writer (the one watcher/re-indexer) while the rest serve reads, and a
+standby takes over if the writer exits. See the
+[oxcode repo](https://github.com/oxgraph/oxcode) for the full CLI and tool list.
