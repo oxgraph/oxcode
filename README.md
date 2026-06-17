@@ -59,9 +59,15 @@ Add the server to your agent. For Claude Code (`~/.claude.json`):
 }
 ```
 
-Optionally auto-allow the read-only tools in `~/.claude/settings.json`:
-`mcp__oxcode__oxcode_explore`, `_search`, `_callers`, `_callees`, `_symbol`,
-`_files`, `_status`.
+Once wired, have the agent call `oxcode_watch` once: it builds the index and
+keeps it current as files change. Across multiple agents on one repo a file lock
+elects a single writer (the one watcher/re-indexer) while the rest serve reads, so
+you can run as many as you like. Then ask questions with `oxcode_explore`.
+
+Optionally auto-allow the tools in `~/.claude/settings.json` (the query tools are
+read-only; `oxcode_watch` only builds/maintains the local index):
+`mcp__oxcode__oxcode_watch`, `_explore`, `_search`, `_callers`, `_callees`,
+`_symbol`, `_files`, `_status`.
 
 #### Claude Code plugin (one-command install)
 
@@ -254,9 +260,12 @@ The workspace uses a hybrid Rust architecture:
 - `oxcode-core`: indexing, extraction, reference resolution, OxGraph storage,
   navigation, formatting, and the public `ProjectIndex` facade
 - `oxcode-cli`: the `oxcode` binary — the CLI commands plus the `oxcode mcp`
-  subcommand, an MCP server (stdio) exposing oxcode's read-only queries to coding
+  subcommand, an MCP server (stdio) exposing the read-only queries to coding
   agents (the one-call `oxcode_explore` tool plus `oxcode_search`,
-  `oxcode_callers`/`oxcode_callees`, `oxcode_symbol`, `oxcode_files`, `oxcode_status`)
+  `oxcode_callers`/`oxcode_callees`, `oxcode_symbol`, `oxcode_files`,
+  `oxcode_status`) and `oxcode_watch`, which builds and keeps the index current as
+  files change — a cross-process file lock elects one writer per repo while other
+  instances serve reads
 
 `oxcode-core` is split into focused internal modules: `scan`, `extract` (with
 per-language extractors and shared CST/cargo helpers), `resolve`,
