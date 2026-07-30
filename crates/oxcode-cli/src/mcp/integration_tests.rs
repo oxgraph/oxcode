@@ -22,14 +22,14 @@ use rmcp::{
 };
 
 use super::{
-    project_root::{canonicalize_root, env_project_root},
+    project_root::{canonicalize_root, oxcode_root_override},
     *,
 };
 
 /// Serializes tests that mutate process-global project-root env vars.
 static PROJECT_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Env keys consulted by [`env_project_root`], for save/restore around tests.
+/// Env keys consulted for omitted-`path` defaults, for save/restore around tests.
 const PROJECT_ROOT_ENV_KEYS: &[&str] = &[
     "OXCODE_ROOT",
     "CLAUDE_PROJECT_DIR",
@@ -235,11 +235,13 @@ async fn poll_until_terminal(
 }
 
 #[test]
-fn env_project_root_prefers_oxcode_root() {
+fn oxcode_root_override_wins_over_host_env() {
     let project = tempfile::TempDir::new().expect("temp");
+    let host = tempfile::TempDir::new().expect("host");
     let guard = ProjectRootEnvGuard::clear();
+    guard.set("CLAUDE_PROJECT_DIR", host.path());
     guard.set("OXCODE_ROOT", project.path());
-    let resolved = env_project_root().expect("OXCODE_ROOT");
+    let resolved = oxcode_root_override().expect("OXCODE_ROOT");
     assert_eq!(
         canonicalize_root(resolved),
         canonicalize_root(project.path().to_path_buf())

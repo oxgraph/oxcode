@@ -80,7 +80,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
 const INSTRUCTIONS: &str = "This server answers questions about the code repository in the current \
 project. First call `oxcode_watch` (optional `path`): it builds the index if needed and keeps it \
 current as files change. When `path` is omitted, the project root is taken from OXCODE_ROOT, \
-CLAUDE_PROJECT_DIR, WORKSPACE_FOLDER_PATHS, or the client's MCP roots — not from this process's \
+the client's MCP roots, CLAUDE_PROJECT_DIR, or WORKSPACE_FOLDER_PATHS — not from this process's \
 cwd, which MCP hosts often set to $HOME. Pass `path` explicitly when in doubt. Only one MCP \
 instance watches a given folder at a time — a file lock elects a single writer; other instances \
 serve reads and take over automatically if the writer exits. Then, for almost any \
@@ -234,7 +234,7 @@ impl OxcodeServer {
     }
 
     #[tool(
-        description = "Start (or join) watching a project so its index is built and kept current as files change. Exactly one MCP instance per folder becomes the writer (it holds a file lock and re-indexes on changes); other instances become readers that just serve queries and automatically take over if the writer exits. Call this once before querying. Optional `path` defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS / MCP roots); never silently to $HOME.",
+        description = "Start (or join) watching a project so its index is built and kept current as files change. Exactly one MCP instance per folder becomes the writer (it holds a file lock and re-indexes on changes); other instances become readers that just serve queries and automatically take over if the writer exits. Call this once before querying. Optional `path` defaults to the workspace (OXCODE_ROOT / MCP roots / CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS); never silently to $HOME.",
         execution(task_support = "optional")
     )]
     async fn oxcode_watch(
@@ -585,12 +585,15 @@ impl OxcodeServer {
     /// `on_roots_list_changed` only; this waits briefly for that in-flight fetch
     /// when the cache is still cold.
     async fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
-        // Explicit path / host env win without waiting on MCP roots.
+        // Explicit path / OXCODE_ROOT pin win without waiting on MCP roots.
+        // Host env snapshots (CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS) do
+        // not — they are fixed at process start and must lose to a refreshed
+        // roots cache after a folder switch.
         if path
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
-            || project_root::env_project_root().is_some()
+            || project_root::oxcode_root_override().is_some()
         {
             return resolve_project_root(path, None);
         }

@@ -1,9 +1,9 @@
 //! Resolve the project root for omitted MCP `path` arguments.
 //!
 //! MCP hosts often start the server process with `cwd=$HOME` even when the
-//! agent is in a project folder. Prefer host-injected env vars and parsed
-//! `file://` MCP roots over process cwd, and refuse `$HOME` unless `path` was
-//! explicit.
+//! agent is in a project folder. Prefer a live MCP roots cache (and then
+//! host-injected env snapshots) over process cwd, and refuse `$HOME` unless
+//! `path` was explicit.
 
 use std::path::{Path, PathBuf};
 
@@ -16,13 +16,19 @@ use serde::Deserialize;
 /// while the defaulting docs live in one place.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct OptionalProjectRoot {
-    /// Project root; defaults to the workspace (`OXCODE_ROOT` /
-    /// `CLAUDE_PROJECT_DIR` / `WORKSPACE_FOLDER_PATHS` / MCP roots), never
-    /// silently to `$HOME`.
+    /// Project root; defaults to the workspace (`OXCODE_ROOT` / MCP roots /
+    /// `CLAUDE_PROJECT_DIR` / `WORKSPACE_FOLDER_PATHS`), never silently to
+    /// `$HOME`.
     pub path: Option<String>,
 }
 
 /// Resolves an optional tool `path` against env defaults and a ready MCP root.
+///
+/// Order for omitted `path`: `OXCODE_ROOT` (explicit pin) → `mcp_root` (live
+/// client roots) → host env snapshots (`CLAUDE_PROJECT_DIR` /
+/// `WORKSPACE_FOLDER_PATHS`) → process cwd. Host env sits below MCP roots
+/// because those vars are fixed at process start while roots refresh on
+/// `roots/list_changed`.
 ///
 /// `mcp_root` is the first client workspace root already fetched outside the
 /// tool handler (see [`super::roots::RootsCache`]); this never calls
@@ -38,10 +44,12 @@ pub(crate) fn resolve_project_root(
         .map(PathBuf::from);
     let raw = if let Some(explicit_path) = explicit.clone() {
         explicit_path
-    } else if let Some(from_env) = env_project_root() {
-        from_env
+    } else if let Some(pin) = oxcode_root_override() {
+        pin
     } else if let Some(from_roots) = mcp_root {
         from_roots
+    } else if let Some(from_host) = host_env_project_root() {
+        from_host
     } else {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
@@ -61,23 +69,34 @@ pub(crate) fn resolve_project_root(
     Ok(root)
 }
 
-/// Project root from host-injected environment variables, in priority order.
+/// Explicit user/config pin. Wins over live MCP roots and host env snapshots.
+pub(crate) fn oxcode_root_override() -> Option<PathBuf> {
+    non_empty_env("OXCODE_ROOT")
+}
+
+/// Host-injected workspace snapshots (Claude Code / Cursor).
 ///
-/// MCP hosts frequently leave the server process cwd at `$HOME` while advertising
-/// the real workspace via these variables (Claude Code → `CLAUDE_PROJECT_DIR`,
-/// Cursor → `WORKSPACE_FOLDER_PATHS`). `OXCODE_ROOT` is the explicit override.
-pub(crate) fn env_project_root() -> Option<PathBuf> {
-    for key in ["OXCODE_ROOT", "CLAUDE_PROJECT_DIR"] {
-        if let Ok(value) = std::env::var(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(PathBuf::from(trimmed));
-            }
-        }
+/// These are set at process start and typically do not update when the client
+/// switches folders via `roots/list_changed`, so callers should prefer a ready
+/// MCP root when one is available.
+pub(crate) fn host_env_project_root() -> Option<PathBuf> {
+    if let Some(path) = non_empty_env("CLAUDE_PROJECT_DIR") {
+        return Some(path);
     }
     std::env::var("WORKSPACE_FOLDER_PATHS")
         .ok()
         .and_then(|value| first_workspace_folder(&value))
+}
+
+fn non_empty_env(key: &str) -> Option<PathBuf> {
+    std::env::var(key).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    })
 }
 
 /// First folder from a `WORKSPACE_FOLDER_PATHS` value (single path or CSV).
@@ -172,6 +191,17 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
+fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
+    // SAFETY: caller restores test-local env mutations.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -192,6 +222,55 @@ mod tests {
             first_workspace_folder("/missing/a,/missing/b"),
             Some(PathBuf::from("/missing/a"))
         );
+    }
+
+    #[test]
+    fn resolve_project_root_prefers_mcp_roots_over_host_env() {
+        let host = tempfile::TempDir::new().expect("host");
+        let live = tempfile::TempDir::new().expect("live");
+        let previous_claude = std::env::var_os("CLAUDE_PROJECT_DIR");
+        let previous_oxcode = std::env::var_os("OXCODE_ROOT");
+        let previous_workspace = std::env::var_os("WORKSPACE_FOLDER_PATHS");
+        // SAFETY: test-local env mutation; restored before return.
+        unsafe {
+            std::env::set_var("CLAUDE_PROJECT_DIR", host.path());
+            std::env::remove_var("OXCODE_ROOT");
+            std::env::remove_var("WORKSPACE_FOLDER_PATHS");
+        }
+        let with_roots =
+            resolve_project_root(None, Some(live.path().to_path_buf())).expect("mcp roots win");
+        assert_eq!(
+            with_roots,
+            canonicalize_root(live.path().to_path_buf()),
+            "live MCP roots must beat sticky CLAUDE_PROJECT_DIR"
+        );
+        let without_roots = resolve_project_root(None, None).expect("host env fallback");
+        assert_eq!(
+            without_roots,
+            canonicalize_root(host.path().to_path_buf()),
+            "host env is used only when MCP roots are absent"
+        );
+        restore_env("CLAUDE_PROJECT_DIR", previous_claude);
+        restore_env("OXCODE_ROOT", previous_oxcode);
+        restore_env("WORKSPACE_FOLDER_PATHS", previous_workspace);
+    }
+
+    #[test]
+    fn resolve_project_root_oxcode_root_pins_over_mcp_roots() {
+        let pin = tempfile::TempDir::new().expect("pin");
+        let live = tempfile::TempDir::new().expect("live");
+        let previous = std::env::var_os("OXCODE_ROOT");
+        // SAFETY: test-local env mutation; restored before return.
+        unsafe {
+            std::env::set_var("OXCODE_ROOT", pin.path());
+        }
+        let resolved = resolve_project_root(None, Some(live.path().to_path_buf())).expect("pin");
+        assert_eq!(
+            resolved,
+            canonicalize_root(pin.path().to_path_buf()),
+            "OXCODE_ROOT is an explicit pin above live MCP roots"
+        );
+        restore_env("OXCODE_ROOT", previous);
     }
 
     #[test]

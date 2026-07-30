@@ -12,6 +12,6 @@ Available tools:
 - `oxcode_files { query, path?, limit? }` — keyword search over indexed files.
 - `oxcode_status { path? }` — index status (element/relation counts).
 
-Selectors may be qualified names, `name:<name>`, `element:<id>`, or `file:<path>:<line>`. The `path` argument defaults to the workspace project root (`OXCODE_ROOT` / `CLAUDE_PROJECT_DIR` / `WORKSPACE_FOLDER_PATHS` / MCP roots), so you can omit it — pass it explicitly if the host did not advertise a workspace.
+Selectors may be qualified names, `name:<name>`, `element:<id>`, or `file:<path>:<line>`. The `path` argument defaults to the workspace project root (`OXCODE_ROOT` / MCP roots / `CLAUDE_PROJECT_DIR` / `WORKSPACE_FOLDER_PATHS`), so you can omit it — pass it explicitly if the host did not advertise a workspace.
 
 Tool results are JSON with definition paths, line ranges, signatures, docstrings, source previews, and relationship call sites. Use those fields as evidence; do not open files just to recover line numbers or a short definition already present in the tool output. After `oxcode_explore`, use at most two targeted follow-up tool calls unless you are stuck.
