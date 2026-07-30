@@ -25,7 +25,7 @@ use oxcode_core::{GraphDirection, IndexStats, NodeKind, ProjectIndex};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, TasksCapability},
+    model::{CallToolResult, Content, Root, ServerCapabilities, ServerInfo, TasksCapability},
     schemars,
     service::NotificationContext,
     task_handler,
@@ -115,9 +115,12 @@ pub(crate) struct OxcodeServer {
     /// Client MCP roots (`roots/list`), cached so omitted `path` defaults to the
     /// workspace rather than this process's cwd (often `$HOME` under MCP hosts).
     client_roots: Arc<std::sync::Mutex<Option<Vec<PathBuf>>>>,
-    /// Becomes `true` after the first init-time roots fetch attempt finishes (or
-    /// is skipped because the client has no roots capability). Tools wait on this
-    /// instead of issuing nested `roots/list` calls.
+    /// Held for the duration of every `roots/list` fetch (init or list_changed).
+    /// Cold tool resolves acquire it briefly so they observe in-flight updates
+    /// without issuing nested `roots/list` themselves.
+    roots_fetch: Arc<Mutex<()>>,
+    /// Becomes `true` after the first fetch attempt finishes (or is skipped).
+    /// Distinguishes "init not started yet" from "fetch done, cache still empty".
     roots_ready: tokio::sync::watch::Receiver<bool>,
     /// Sender half for [`Self::roots_ready`].
     roots_ready_tx: Arc<tokio::sync::watch::Sender<bool>>,
@@ -244,6 +247,7 @@ impl OxcodeServer {
             writers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             standbys: Arc::new(std::sync::Mutex::new(HashSet::new())),
             client_roots: Arc::new(std::sync::Mutex::new(None)),
+            roots_fetch: Arc::new(Mutex::new(())),
             roots_ready,
             roots_ready_tx: Arc::new(roots_ready_tx),
             debounce,
@@ -633,14 +637,19 @@ impl OxcodeServer {
         Ok(root)
     }
 
-    /// First cached client MCP root, waiting briefly for the init-time fetch.
+    /// First cached client MCP root, waiting briefly for any in-flight fetch
+    /// (init or `roots/list_changed`) when the cache is still cold.
     async fn workspace_root_after_ready(&self) -> Option<PathBuf> {
         if let Some(root) = self.cached_workspace_root() {
             return Some(root);
         }
         if !*self.roots_ready.borrow() {
+            // Init fetch has not finished (may not have started): wait for it.
             let mut ready = self.roots_ready.clone();
             let _ = tokio::time::timeout(ROOTS_READY_WAIT, ready.wait_for(|ready| *ready)).await;
+        } else {
+            // A later `roots/list_changed` refetch may be in flight — wait it out.
+            let _ = tokio::time::timeout(ROOTS_READY_WAIT, self.roots_fetch.lock()).await;
         }
         self.cached_workspace_root()
     }
@@ -656,29 +665,42 @@ impl OxcodeServer {
 
     /// Fetches `roots/list` outside tool handling and updates the cache.
     ///
-    /// On failure, leaves the previous cache untouched (so a transient error does
-    /// not erase a good root). An empty successful list clears the cache to `None`
-    /// rather than `Some([])`, so a later `roots/list_changed` can populate it
-    /// without looking like a settled empty answer forever. Always marks
-    /// [`Self::roots_ready`] so tool handlers can proceed.
+    /// RPC failures and unparseable URI lists leave the previous cache untouched.
+    /// An explicitly empty `roots` array from the client clears the cache.
     async fn fetch_client_roots(&self, peer: &Peer<RoleServer>) {
-        let supports_roots = peer
+        let _guard = self.roots_fetch.lock().await;
+        if peer
             .peer_info()
             .and_then(|info| info.capabilities.roots.as_ref())
-            .is_some();
-        if supports_roots && let Ok(result) = peer.list_roots().await {
-            let roots: Vec<PathBuf> = result
-                .roots
-                .iter()
-                .filter_map(|root| file_uri_to_path(&root.uri))
-                .collect();
-            let cached = (!roots.is_empty()).then_some(roots);
+            .is_some()
+            && let Ok(result) = peer.list_roots().await
+        {
+            self.apply_roots_list(result.roots);
+        }
+        let _ = self.roots_ready_tx.send(true);
+    }
+
+    /// Applies a `roots/list` payload to [`Self::client_roots`].
+    fn apply_roots_list(&self, roots: Vec<Root>) {
+        if roots.is_empty() {
             *self
                 .client_roots
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = cached;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return;
         }
-        let _ = self.roots_ready_tx.send(true);
+        let parsed: Vec<PathBuf> = roots
+            .iter()
+            .filter_map(|root| file_uri_to_path(&root.uri))
+            .collect();
+        if parsed.is_empty() {
+            // URIs present but none parseable — keep the previous good root.
+            return;
+        }
+        *self
+            .client_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed);
     }
 }
 
