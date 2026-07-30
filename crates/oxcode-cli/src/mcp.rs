@@ -638,18 +638,28 @@ impl OxcodeServer {
     }
 
     /// First cached client MCP root, waiting briefly for any in-flight fetch
-    /// (init or `roots/list_changed`) when the cache is still cold.
+    /// (init or `roots/list_changed`) so a folder switch is not served from a
+    /// stale cache.
     async fn workspace_root_after_ready(&self) -> Option<PathBuf> {
-        if let Some(root) = self.cached_workspace_root() {
-            return Some(root);
+        match self.roots_fetch.try_lock() {
+            Ok(_guard) => {
+                // No fetch in flight — use the cache if warm.
+                if let Some(root) = self.cached_workspace_root() {
+                    return Some(root);
+                }
+            }
+            Err(_) => {
+                // Fetch in flight — wait for the updated cache before resolving.
+                let _ = tokio::time::timeout(ROOTS_READY_WAIT, self.roots_fetch.lock()).await;
+                if let Some(root) = self.cached_workspace_root() {
+                    return Some(root);
+                }
+            }
         }
         if !*self.roots_ready.borrow() {
             // Init fetch has not finished (may not have started): wait for it.
             let mut ready = self.roots_ready.clone();
             let _ = tokio::time::timeout(ROOTS_READY_WAIT, ready.wait_for(|ready| *ready)).await;
-        } else {
-            // A later `roots/list_changed` refetch may be in flight — wait it out.
-            let _ = tokio::time::timeout(ROOTS_READY_WAIT, self.roots_fetch.lock()).await;
         }
         self.cached_workspace_root()
     }
