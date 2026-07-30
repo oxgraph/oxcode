@@ -49,6 +49,11 @@ const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(400);
 /// `OXCODE_WATCH_POLL_MS`.
 const DEFAULT_POLL: Duration = Duration::from_secs(3);
 
+/// How long an omitted-`path` resolve will wait for the in-flight
+/// `on_initialized` roots fetch before falling through to cwd. Never starts a
+/// nested `roots/list` from a tool handler.
+const ROOTS_READY_WAIT: Duration = Duration::from_millis(500);
+
 /// Filename of the advisory single-writer lock, inside the `.oxcode` index dir.
 const WATCH_LOCK_FILE: &str = "watch.lock";
 
@@ -110,6 +115,12 @@ pub(crate) struct OxcodeServer {
     /// Client MCP roots (`roots/list`), cached so omitted `path` defaults to the
     /// workspace rather than this process's cwd (often `$HOME` under MCP hosts).
     client_roots: Arc<std::sync::Mutex<Option<Vec<PathBuf>>>>,
+    /// Becomes `true` after the first init-time roots fetch attempt finishes (or
+    /// is skipped because the client has no roots capability). Tools wait on this
+    /// instead of issuing nested `roots/list` calls.
+    roots_ready: tokio::sync::watch::Receiver<bool>,
+    /// Sender half for [`Self::roots_ready`].
+    roots_ready_tx: Arc<tokio::sync::watch::Sender<bool>>,
     /// File-watcher debounce window.
     debounce: Duration,
     /// Failover poll interval for standbys.
@@ -225,6 +236,7 @@ impl OxcodeServer {
     /// tiny values).
     #[must_use]
     fn new_with(debounce: Duration, poll: Duration) -> Self {
+        let (roots_ready_tx, roots_ready) = tokio::sync::watch::channel(false);
         Self {
             tool_router: Self::tool_router(),
             indexes: Arc::new(Mutex::new(HashMap::new())),
@@ -232,6 +244,8 @@ impl OxcodeServer {
             writers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             standbys: Arc::new(std::sync::Mutex::new(HashSet::new())),
             client_roots: Arc::new(std::sync::Mutex::new(None)),
+            roots_ready,
+            roots_ready_tx: Arc::new(roots_ready_tx),
             debounce,
             poll,
         }
@@ -244,9 +258,8 @@ impl OxcodeServer {
     async fn oxcode_watch(
         &self,
         Parameters(params): Parameters<WatchParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.resolve_root(params.path, &peer).await?;
+        let root = self.resolve_root(params.path).await?;
 
         // Idempotent: already participating for this root.
         if self.is_writer(&root) {
@@ -303,9 +316,8 @@ impl OxcodeServer {
     async fn oxcode_explore(
         &self,
         Parameters(params): Parameters<ExploreParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path, &peer).await?;
+        let index = self.index_for(params.path).await?;
         let query = params.query;
         let max_bytes = params.max_bytes.unwrap_or(20_000);
         let report = blocking(move || index.context(&query, 8, 1, max_bytes)).await?;
@@ -318,9 +330,8 @@ impl OxcodeServer {
     async fn oxcode_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path, &peer).await?;
+        let index = self.index_for(params.path).await?;
         let query = params.query;
         let limit = params.limit.unwrap_or(30);
         let kinds = parse_kinds(params.kinds.as_deref());
@@ -332,20 +343,16 @@ impl OxcodeServer {
     async fn oxcode_callers(
         &self,
         Parameters(params): Parameters<CallParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_graph(params, GraphDirection::Incoming, &peer)
-            .await
+        self.call_graph(params, GraphDirection::Incoming).await
     }
 
     #[tool(description = "Find the functions called by the given symbol (outgoing call graph).")]
     async fn oxcode_callees(
         &self,
         Parameters(params): Parameters<CallParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_graph(params, GraphDirection::Outgoing, &peer)
-            .await
+        self.call_graph(params, GraphDirection::Outgoing).await
     }
 
     #[tool(
@@ -354,9 +361,8 @@ impl OxcodeServer {
     async fn oxcode_symbol(
         &self,
         Parameters(params): Parameters<SymbolParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path, &peer).await?;
+        let index = self.index_for(params.path).await?;
         let selector = params.selector;
         let value = blocking(move || resolve_symbol(&index, &selector)).await?;
         json_result(&value)
@@ -366,9 +372,8 @@ impl OxcodeServer {
     async fn oxcode_files(
         &self,
         Parameters(params): Parameters<FilesParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path, &peer).await?;
+        let index = self.index_for(params.path).await?;
         let query = params.query;
         let limit = params.limit.unwrap_or(30);
         let report = blocking(move || index.search_files(&query, limit)).await?;
@@ -381,9 +386,8 @@ impl OxcodeServer {
     async fn oxcode_status(
         &self,
         Parameters(params): Parameters<StatusParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = self.resolve_root(params.path, &peer).await?;
+        let root = self.resolve_root(params.path).await?;
         let (role, watching, reindexes) = self.watch_state(&root);
         let status_root = root.clone();
         let database = blocking(move || oxcode_core::project_status(&status_root)).await?;
@@ -399,9 +403,8 @@ impl OxcodeServer {
         &self,
         params: CallParams,
         direction: GraphDirection,
-        peer: &Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path, peer).await?;
+        let index = self.index_for(params.path).await?;
         let selector = params.selector;
         let depth = params.depth.unwrap_or(2);
         let limit = params.limit.unwrap_or(50);
@@ -413,12 +416,8 @@ impl OxcodeServer {
     /// writer for the root, the opened reader is cached and evicted on each reindex;
     /// any other process opens fresh per query so it reflects the writer's latest
     /// commit. A missing index is not built here — call `oxcode_watch` first.
-    async fn index_for(
-        &self,
-        path: Option<String>,
-        peer: &Peer<RoleServer>,
-    ) -> Result<Arc<ProjectIndex>, McpError> {
-        let root = self.resolve_root(path, peer).await?;
+    async fn index_for(&self, path: Option<String>) -> Result<Arc<ProjectIndex>, McpError> {
+        let root = self.resolve_root(path).await?;
         if self.is_writer(&root) {
             if let Some(index) = self.indexes.lock().await.get(&root) {
                 return Ok(Arc::clone(index));
@@ -598,11 +597,12 @@ impl OxcodeServer {
     /// signals over this process's cwd. MCP hosts often start servers with
     /// `cwd=$HOME` even when the agent is in a project folder; omitting `path`
     /// must not silently index the home directory.
-    async fn resolve_root(
-        &self,
-        path: Option<String>,
-        peer: &Peer<RoleServer>,
-    ) -> Result<PathBuf, McpError> {
+    ///
+    /// Never calls `roots/list` here — nested client requests during tool handling
+    /// can hang on some hosts. Roots are fetched in [`Self::fetch_client_roots`]
+    /// from `on_initialized` / `on_roots_list_changed` only; this waits briefly
+    /// for that in-flight fetch when the cache is still cold.
+    async fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
         let explicit = path
             .as_deref()
             .map(str::trim)
@@ -612,7 +612,7 @@ impl OxcodeServer {
             explicit_path
         } else if let Some(from_env) = env_project_root() {
             from_env
-        } else if let Some(from_roots) = self.workspace_root_from_client(peer).await {
+        } else if let Some(from_roots) = self.workspace_root_after_ready().await {
             from_roots
         } else {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -633,42 +633,52 @@ impl OxcodeServer {
         Ok(root)
     }
 
-    /// First client MCP root, refreshing the cache via `roots/list` when needed.
-    async fn workspace_root_from_client(&self, peer: &Peer<RoleServer>) -> Option<PathBuf> {
-        {
-            let cache = self
-                .client_roots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(roots) = cache.as_ref() {
-                return roots.first().cloned();
-            }
+    /// First cached client MCP root, waiting briefly for the init-time fetch.
+    async fn workspace_root_after_ready(&self) -> Option<PathBuf> {
+        if let Some(root) = self.cached_workspace_root() {
+            return Some(root);
         }
-        peer.peer_info()
-            .and_then(|info| info.capabilities.roots.as_ref())?;
-        let roots = match peer.list_roots().await {
-            Ok(result) => result
+        if !*self.roots_ready.borrow() {
+            let mut ready = self.roots_ready.clone();
+            let _ = tokio::time::timeout(ROOTS_READY_WAIT, ready.wait_for(|ready| *ready)).await;
+        }
+        self.cached_workspace_root()
+    }
+
+    /// First non-empty client MCP root already cached from init / list_changed.
+    fn cached_workspace_root(&self) -> Option<PathBuf> {
+        self.client_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|roots| roots.first().cloned())
+    }
+
+    /// Fetches `roots/list` outside tool handling and updates the cache.
+    ///
+    /// On failure, leaves the previous cache untouched (so a transient error does
+    /// not erase a good root). An empty successful list clears the cache to `None`
+    /// rather than `Some([])`, so a later `roots/list_changed` can populate it
+    /// without looking like a settled empty answer forever. Always marks
+    /// [`Self::roots_ready`] so tool handlers can proceed.
+    async fn fetch_client_roots(&self, peer: &Peer<RoleServer>) {
+        let supports_roots = peer
+            .peer_info()
+            .and_then(|info| info.capabilities.roots.as_ref())
+            .is_some();
+        if supports_roots && let Ok(result) = peer.list_roots().await {
+            let roots: Vec<PathBuf> = result
                 .roots
                 .iter()
                 .filter_map(|root| file_uri_to_path(&root.uri))
-                .collect::<Vec<_>>(),
-            Err(_) => return None,
-        };
-        let first = roots.first().cloned();
-        *self
-            .client_roots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(roots);
-        first
-    }
-
-    /// Refreshes the cached client MCP roots after `notifications/roots/list_changed`.
-    async fn refresh_client_roots(&self, peer: &Peer<RoleServer>) {
-        *self
-            .client_roots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let _ = self.workspace_root_from_client(peer).await;
+                .collect();
+            let cached = (!roots.is_empty()).then_some(roots);
+            *self
+                .client_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = cached;
+        }
+        let _ = self.roots_ready_tx.send(true);
     }
 }
 
@@ -780,8 +790,12 @@ impl ServerHandler for OxcodeServer {
         .with_instructions(INSTRUCTIONS)
     }
 
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.fetch_client_roots(&context.peer).await;
+    }
+
     async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
-        self.refresh_client_roots(&context.peer).await;
+        self.fetch_client_roots(&context.peer).await;
     }
 }
 
@@ -1251,7 +1265,8 @@ mod tests {
         .await
         .expect("client connect");
 
-        // No `path` argument: must resolve via roots/list to the project, not cwd.
+        // No `path` argument: `on_initialized` already cached roots/list; resolve
+        // must use that workspace root (not process cwd) without nested roots/list.
         let result = client
             .call_tool(tool_call("oxcode_watch", serde_json::json!({})))
             .await
