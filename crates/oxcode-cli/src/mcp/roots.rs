@@ -2,26 +2,38 @@
 //!
 //! Nested `roots/list` during a tool call can hang some hosts. This cache is
 //! populated from `on_initialized` / `on_roots_list_changed` only; tool
-//! handlers wait for a `Ready` publication.
+//! handlers wait for a completed publication.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use rmcp::{Peer, RoleServer, model::Root};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 use super::project_root::file_uri_to_path;
 
 /// How long an omitted-`path` resolve will wait for a roots fetch before
-/// falling through without using a possibly-stale cache.
+/// falling through.
 const ROOTS_READY_WAIT: Duration = Duration::from_millis(500);
 
 /// Published state of the client's MCP workspace roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RootsState {
-    /// A fetch has not completed yet, or a refresh is in progress.
-    Pending,
+    /// No fetch has completed yet (cold start).
+    Cold,
+    /// A refresh is in flight; holds the last completed root for failure restore.
+    Refreshing(Option<PathBuf>),
     /// Last completed fetch. `None` means the client has no usable root.
     Ready(Option<PathBuf>),
+}
+
+/// Outcome of waiting for the roots cache from a tool handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootsWait {
+    /// A completed fetch is available (`None` = client has no usable root).
+    Ready(Option<PathBuf>),
+    /// Timed out while a refresh was in flight. Callers must not fall back to
+    /// sticky host env snapshots (those can be older than the root being replaced).
+    RefreshInFlight,
 }
 
 /// Outcome of one `roots/list` attempt.
@@ -37,30 +49,35 @@ enum LoadOutcome {
 }
 
 /// Single watch-backed cache for MCP roots.
+///
+/// Fetches are serialized so overlapping `initialized` / `roots/list_changed`
+/// notifications cannot wipe or restore the wrong root.
 #[derive(Clone)]
 pub(crate) struct RootsCache {
     tx: Arc<watch::Sender<RootsState>>,
     rx: watch::Receiver<RootsState>,
+    fetch_lock: Arc<Mutex<()>>,
 }
 
 impl RootsCache {
     #[must_use]
     pub(crate) fn new() -> Self {
-        let (tx, rx) = watch::channel(RootsState::Pending);
+        let (tx, rx) = watch::channel(RootsState::Cold);
         Self {
             tx: Arc::new(tx),
             rx,
+            fetch_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Waits briefly for a completed fetch and returns the ready root, if any.
+    /// Waits briefly for a completed fetch.
     ///
-    /// Never issues `roots/list`. On timeout while still `Pending` (including an
-    /// in-flight refresh), returns `None` so the caller does not keep using a
-    /// stale workspace after a folder switch.
-    pub(crate) async fn wait_ready(&self) -> Option<PathBuf> {
+    /// Never issues `roots/list`. On timeout during a refresh, returns
+    /// [`RootsWait::RefreshInFlight`] so callers do not use a sticky host env
+    /// snapshot that may predate the workspace being refreshed.
+    pub(crate) async fn wait_ready(&self) -> RootsWait {
         if let RootsState::Ready(root) = &*self.rx.borrow() {
-            return root.clone();
+            return RootsWait::Ready(root.clone());
         }
         let mut rx = self.rx.clone();
         let finished = tokio::time::timeout(
@@ -70,24 +87,30 @@ impl RootsCache {
         .await;
         match finished {
             Ok(Ok(state)) => match &*state {
-                RootsState::Ready(root) => root.clone(),
-                RootsState::Pending => None,
+                RootsState::Ready(root) => RootsWait::Ready(root.clone()),
+                RootsState::Cold | RootsState::Refreshing(_) => RootsWait::Ready(None),
             },
-            _ => None,
+            _ => match &*self.rx.borrow() {
+                RootsState::Ready(root) => RootsWait::Ready(root.clone()),
+                RootsState::Refreshing(_) => RootsWait::RefreshInFlight,
+                RootsState::Cold => RootsWait::Ready(None),
+            },
         }
     }
 
     /// Fetches `roots/list` and publishes [`RootsState::Ready`].
     ///
-    /// Marks [`RootsState::Pending`] first so concurrent waiters observe the
+    /// Serialized: only one fetch runs at a time. Marks
+    /// [`RootsState::Refreshing`] first so concurrent waiters observe the
     /// refresh. RPC failures and unparseable URI lists restore the previous
     /// ready root; an explicitly empty list clears it.
     pub(crate) async fn fetch(&self, peer: &Peer<RoleServer>) {
+        let _guard = self.fetch_lock.lock().await;
         let previous = match &*self.rx.borrow() {
-            RootsState::Ready(root) => root.clone(),
-            RootsState::Pending => None,
+            RootsState::Ready(root) | RootsState::Refreshing(root) => root.clone(),
+            RootsState::Cold => None,
         };
-        let _ = self.tx.send(RootsState::Pending);
+        let _ = self.tx.send(RootsState::Refreshing(previous.clone()));
         let published = match self.load_root(peer).await {
             LoadOutcome::Empty => None,
             LoadOutcome::Parsed(path) => Some(path),
@@ -143,5 +166,28 @@ mod tests {
             classify_roots_list(vec![Root::new(uri)]),
             LoadOutcome::Parsed(path) if path == project.path()
         ));
+    }
+
+    #[tokio::test]
+    async fn wait_ready_timeout_during_refresh_is_in_flight() {
+        let cache = RootsCache::new();
+        let _ = cache
+            .tx
+            .send(RootsState::Refreshing(Some(PathBuf::from("/old"))));
+        assert_eq!(cache.wait_ready().await, RootsWait::RefreshInFlight);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_timeout_while_cold_allows_host_env_fallback() {
+        let cache = RootsCache::new();
+        assert_eq!(cache.wait_ready().await, RootsWait::Ready(None));
+    }
+
+    #[tokio::test]
+    async fn wait_ready_returns_ready_root() {
+        let cache = RootsCache::new();
+        let root = PathBuf::from("/project");
+        let _ = cache.tx.send(RootsState::Ready(Some(root.clone())));
+        assert_eq!(cache.wait_ready().await, RootsWait::Ready(Some(root)));
     }
 }

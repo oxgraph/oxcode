@@ -30,12 +30,17 @@ pub(crate) struct OptionalProjectRoot {
 /// because those vars are fixed at process start while roots refresh on
 /// `roots/list_changed`.
 ///
+/// When `allow_host_env` is false (roots refresh timed out in flight), host
+/// snapshots are skipped so a sticky pre-switch env cannot win over an
+/// in-progress roots update.
+///
 /// `mcp_root` is the first client workspace root already fetched outside the
 /// tool handler (see [`super::roots::RootsCache`]); this never calls
 /// `roots/list`.
 pub(crate) fn resolve_project_root(
     path: Option<String>,
     mcp_root: Option<PathBuf>,
+    allow_host_env: bool,
 ) -> Result<PathBuf, McpError> {
     let explicit = path
         .as_deref()
@@ -48,8 +53,12 @@ pub(crate) fn resolve_project_root(
         pin
     } else if let Some(from_roots) = mcp_root {
         from_roots
-    } else if let Some(from_host) = host_env_project_root() {
-        from_host
+    } else if allow_host_env {
+        if let Some(from_host) = host_env_project_root() {
+            from_host
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
     } else {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
@@ -237,18 +246,24 @@ mod tests {
             std::env::remove_var("OXCODE_ROOT");
             std::env::remove_var("WORKSPACE_FOLDER_PATHS");
         }
-        let with_roots =
-            resolve_project_root(None, Some(live.path().to_path_buf())).expect("mcp roots win");
+        let with_roots = resolve_project_root(None, Some(live.path().to_path_buf()), true)
+            .expect("mcp roots win");
         assert_eq!(
             with_roots,
             canonicalize_root(live.path().to_path_buf()),
             "live MCP roots must beat sticky CLAUDE_PROJECT_DIR"
         );
-        let without_roots = resolve_project_root(None, None).expect("host env fallback");
+        let without_roots = resolve_project_root(None, None, true).expect("host env fallback");
         assert_eq!(
             without_roots,
             canonicalize_root(host.path().to_path_buf()),
             "host env is used only when MCP roots are absent"
+        );
+        let suppressed = resolve_project_root(None, None, false).expect("no host env");
+        assert_ne!(
+            suppressed,
+            canonicalize_root(host.path().to_path_buf()),
+            "refresh-in-flight must not fall back to sticky host env"
         );
         restore_env("CLAUDE_PROJECT_DIR", previous_claude);
         restore_env("OXCODE_ROOT", previous_oxcode);
@@ -264,7 +279,8 @@ mod tests {
         unsafe {
             std::env::set_var("OXCODE_ROOT", pin.path());
         }
-        let resolved = resolve_project_root(None, Some(live.path().to_path_buf())).expect("pin");
+        let resolved =
+            resolve_project_root(None, Some(live.path().to_path_buf()), true).expect("pin");
         assert_eq!(
             resolved,
             canonicalize_root(pin.path().to_path_buf()),

@@ -37,7 +37,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
-use roots::RootsCache;
+use roots::{RootsCache, RootsWait};
 use serde::Deserialize;
 use tokio::sync::{
     Mutex,
@@ -595,10 +595,14 @@ impl OxcodeServer {
             .is_some_and(|value| !value.is_empty())
             || project_root::oxcode_root_override().is_some()
         {
-            return resolve_project_root(path, None);
+            return resolve_project_root(path, None, true);
         }
-        let mcp_root = self.roots.wait_ready().await;
-        resolve_project_root(path, mcp_root)
+        match self.roots.wait_ready().await {
+            RootsWait::Ready(mcp_root) => resolve_project_root(path, mcp_root, true),
+            // Refresh timed out: do not fall through to sticky host env, which
+            // can be older than the MCP root being replaced.
+            RootsWait::RefreshInFlight => resolve_project_root(path, None, false),
+        }
     }
 }
 
