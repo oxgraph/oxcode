@@ -31,8 +31,10 @@ enum RootsState {
 pub(crate) enum RootsWait {
     /// A completed fetch is available (`None` = client has no usable root).
     Ready(Option<PathBuf>),
-    /// Timed out while a refresh was in flight. Callers must not fall back to
-    /// sticky host env snapshots (those can be older than the root being replaced).
+    /// Timed out while replacing a previously ready root. Callers must not fall
+    /// back to sticky host env snapshots (those can be older than the root being
+    /// replaced). Cold-start / `Refreshing(None)` timeouts are [`Ready`]`(None)`
+    /// instead, so host env remains available.
     RefreshInFlight,
 }
 
@@ -92,8 +94,11 @@ impl RootsCache {
             },
             _ => match &*self.rx.borrow() {
                 RootsState::Ready(root) => RootsWait::Ready(root.clone()),
-                RootsState::Refreshing(_) => RootsWait::RefreshInFlight,
-                RootsState::Cold => RootsWait::Ready(None),
+                // Only suppress host env when replacing a previously ready root.
+                // Cold start / Refreshing(None) still allows CLAUDE_PROJECT_DIR
+                // and WORKSPACE_FOLDER_PATHS if roots/list is slow.
+                RootsState::Refreshing(Some(_)) => RootsWait::RefreshInFlight,
+                RootsState::Refreshing(None) | RootsState::Cold => RootsWait::Ready(None),
             },
         }
     }
@@ -175,6 +180,17 @@ mod tests {
             .tx
             .send(RootsState::Refreshing(Some(PathBuf::from("/old"))));
         assert_eq!(cache.wait_ready().await, RootsWait::RefreshInFlight);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_timeout_on_first_fetch_allows_host_env() {
+        let cache = RootsCache::new();
+        let _ = cache.tx.send(RootsState::Refreshing(None));
+        assert_eq!(
+            cache.wait_ready().await,
+            RootsWait::Ready(None),
+            "cold-start Refreshing(None) must not suppress host env"
+        );
     }
 
     #[tokio::test]
