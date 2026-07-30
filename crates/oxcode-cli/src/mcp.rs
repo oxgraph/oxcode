@@ -334,7 +334,8 @@ impl OxcodeServer {
         Parameters(params): Parameters<CallParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_graph(params, GraphDirection::Incoming, &peer).await
+        self.call_graph(params, GraphDirection::Incoming, &peer)
+            .await
     }
 
     #[tool(description = "Find the functions called by the given symbol (outgoing call graph).")]
@@ -343,7 +344,8 @@ impl OxcodeServer {
         Parameters(params): Parameters<CallParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_graph(params, GraphDirection::Outgoing, &peer).await
+        self.call_graph(params, GraphDirection::Outgoing, &peer)
+            .await
     }
 
     #[tool(
@@ -865,7 +867,8 @@ fn percent_decode(input: &str) -> String {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+            && let (Some(high), Some(low)) =
+                (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
         {
             out.push((high << 4) | low);
             index += 3;
@@ -934,9 +937,10 @@ mod tests {
     //! and the task lifecycle. The cross-process guarantee is proven separately by
     //! `tests/multiprocess.rs` (real spawned processes).
 
-    use std::time::Duration;
-
-    use std::sync::{Mutex, MutexGuard};
+    use std::{
+        sync::{Mutex, MutexGuard},
+        time::Duration,
+    };
 
     use rmcp::{
         ClientHandler, RoleClient,
@@ -954,8 +958,11 @@ mod tests {
     static PROJECT_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Env keys consulted by [`env_project_root`], for save/restore around tests.
-    const PROJECT_ROOT_ENV_KEYS: &[&str] =
-        &["OXCODE_ROOT", "CLAUDE_PROJECT_DIR", "WORKSPACE_FOLDER_PATHS"];
+    const PROJECT_ROOT_ENV_KEYS: &[&str] = &[
+        "OXCODE_ROOT",
+        "CLAUDE_PROJECT_DIR",
+        "WORKSPACE_FOLDER_PATHS",
+    ];
 
     /// Clears project-root env vars for the duration of a test; restores on drop.
     struct ProjectRootEnvGuard {
