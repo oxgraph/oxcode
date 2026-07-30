@@ -23,10 +23,12 @@ use notify_debouncer_full::{
 };
 use oxcode_core::{GraphDirection, IndexStats, NodeKind, ProjectIndex};
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
+    ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo, TasksCapability},
-    schemars, task_handler,
+    schemars,
+    service::NotificationContext,
+    task_handler,
     task_manager::OperationProcessor,
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -70,17 +72,19 @@ pub(crate) fn serve() -> anyhow::Result<()> {
 }
 
 /// Server instructions steering agents to `oxcode_watch` then `oxcode_explore`.
-const INSTRUCTIONS: &str = "This server answers questions about the code repository in the working \
-directory. First call `oxcode_watch` (optional `path`, defaults to the working directory): it builds \
-the index if needed and keeps it current as files change. Only one MCP instance watches a given \
-folder at a time — a file lock elects a single writer; other instances serve reads and take over \
-automatically if the writer exits. Then, for almost any code-understanding question, call \
-`oxcode_explore` first with the user's question verbatim: it returns the most relevant symbols \
-(ranked by graph centrality), their source, the relationships among them, the n-ary hyperedges they \
-belong to (trait impl groups and container/module membership, ranked by hypergraph PageRank — the \
-architecture-altitude layer), the blast radius, and the call flow — in one call. Use \
-`oxcode_callers`/`oxcode_callees`/`oxcode_symbol` to follow specific edges, and \
-`oxcode_search`/`oxcode_files` only when explore did not surface the target. Prefer these query \
+const INSTRUCTIONS: &str = "This server answers questions about the code repository in the current \
+project. First call `oxcode_watch` (optional `path`): it builds the index if needed and keeps it \
+current as files change. When `path` is omitted, the project root is taken from OXCODE_ROOT, \
+CLAUDE_PROJECT_DIR, WORKSPACE_FOLDER_PATHS, or the client's MCP roots — not from this process's \
+cwd, which MCP hosts often set to $HOME. Pass `path` explicitly when in doubt. Only one MCP \
+instance watches a given folder at a time — a file lock elects a single writer; other instances \
+serve reads and take over automatically if the writer exits. Then, for almost any \
+code-understanding question, call `oxcode_explore` first with the user's question verbatim: it \
+returns the most relevant symbols (ranked by graph centrality), their source, the relationships \
+among them, the n-ary hyperedges they belong to (trait impl groups and container/module membership, \
+ranked by hypergraph PageRank — the architecture-altitude layer), the blast radius, and the call \
+flow — in one call. Use `oxcode_callers`/`oxcode_callees`/`oxcode_symbol` to follow specific edges, \
+and `oxcode_search`/`oxcode_files` only when explore did not surface the target. Prefer these query \
 tools over shelling out to grep or reading files. Every tool except `oxcode_watch` is read-only; do \
 not edit source files.";
 
@@ -103,6 +107,9 @@ pub(crate) struct OxcodeServer {
     writers: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<WriterState>>>>,
     /// Roots this process is a standby for (lost the lock; a failover task polls).
     standbys: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    /// Client MCP roots (`roots/list`), cached so omitted `path` defaults to the
+    /// workspace rather than this process's cwd (often `$HOME` under MCP hosts).
+    client_roots: Arc<std::sync::Mutex<Option<Vec<PathBuf>>>>,
     /// File-watcher debounce window.
     debounce: Duration,
     /// Failover poll interval for standbys.
@@ -128,7 +135,8 @@ struct WriterState {
 pub(crate) struct ExploreParams {
     /// The task or question about the codebase, in natural language.
     pub query: String,
-    /// Project root; defaults to the server's working directory.
+    /// Project root; defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR /
+    /// WORKSPACE_FOLDER_PATHS / MCP roots), never silently to `$HOME`.
     pub path: Option<String>,
     /// Maximum source characters to render (default 20000).
     pub max_bytes: Option<usize>,
@@ -139,7 +147,8 @@ pub(crate) struct ExploreParams {
 pub(crate) struct SearchParams {
     /// Keywords matched against symbol names, signatures, and docs.
     pub query: String,
-    /// Project root; defaults to the server's working directory.
+    /// Project root; defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR /
+    /// WORKSPACE_FOLDER_PATHS / MCP roots), never silently to `$HOME`.
     pub path: Option<String>,
     /// Maximum number of matches (default 30).
     pub limit: Option<usize>,
@@ -152,7 +161,8 @@ pub(crate) struct SearchParams {
 pub(crate) struct CallParams {
     /// Selector: a qualified name, `name:<n>`, `element:<id>`, or `file:<path>:<line>`.
     pub selector: String,
-    /// Project root; defaults to the server's working directory.
+    /// Project root; defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR /
+    /// WORKSPACE_FOLDER_PATHS / MCP roots), never silently to `$HOME`.
     pub path: Option<String>,
     /// Maximum hop depth (default 2).
     pub depth: Option<usize>,
@@ -165,7 +175,8 @@ pub(crate) struct CallParams {
 pub(crate) struct SymbolParams {
     /// Selector: a qualified name, `name:<n>`, `element:<id>`, or `file:<path>:<line>`.
     pub selector: String,
-    /// Project root; defaults to the server's working directory.
+    /// Project root; defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR /
+    /// WORKSPACE_FOLDER_PATHS / MCP roots), never silently to `$HOME`.
     pub path: Option<String>,
 }
 
@@ -174,7 +185,8 @@ pub(crate) struct SymbolParams {
 pub(crate) struct FilesParams {
     /// Keywords matched against file paths and their symbols.
     pub query: String,
-    /// Project root; defaults to the server's working directory.
+    /// Project root; defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR /
+    /// WORKSPACE_FOLDER_PATHS / MCP roots), never silently to `$HOME`.
     pub path: Option<String>,
     /// Maximum number of files (default 30).
     pub limit: Option<usize>,
@@ -183,14 +195,17 @@ pub(crate) struct FilesParams {
 /// A project-root pointer.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct StatusParams {
-    /// Project root; defaults to the server's working directory.
+    /// Project root; defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR /
+    /// WORKSPACE_FOLDER_PATHS / MCP roots), never silently to `$HOME`.
     pub path: Option<String>,
 }
 
 /// A project root to watch and keep indexed.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WatchParams {
-    /// Project root to watch; defaults to the server's working directory.
+    /// Project root to watch; defaults to the workspace (OXCODE_ROOT /
+    /// CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS / MCP roots), never silently to
+    /// `$HOME`.
     pub path: Option<String>,
 }
 
@@ -216,20 +231,22 @@ impl OxcodeServer {
             operations: Arc::new(Mutex::new(OperationProcessor::new())),
             writers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             standbys: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            client_roots: Arc::new(std::sync::Mutex::new(None)),
             debounce,
             poll,
         }
     }
 
     #[tool(
-        description = "Start (or join) watching a project so its index is built and kept current as files change. Exactly one MCP instance per folder becomes the writer (it holds a file lock and re-indexes on changes); other instances become readers that just serve queries and automatically take over if the writer exits. Call this once before querying. Optional `path` defaults to the working directory.",
+        description = "Start (or join) watching a project so its index is built and kept current as files change. Exactly one MCP instance per folder becomes the writer (it holds a file lock and re-indexes on changes); other instances become readers that just serve queries and automatically take over if the writer exits. Call this once before querying. Optional `path` defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS / MCP roots); never silently to $HOME.",
         execution(task_support = "optional")
     )]
     async fn oxcode_watch(
         &self,
         Parameters(params): Parameters<WatchParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = resolve_root(params.path);
+        let root = self.resolve_root(params.path, &peer).await?;
 
         // Idempotent: already participating for this root.
         if self.is_writer(&root) {
@@ -286,8 +303,9 @@ impl OxcodeServer {
     async fn oxcode_explore(
         &self,
         Parameters(params): Parameters<ExploreParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path).await?;
+        let index = self.index_for(params.path, &peer).await?;
         let query = params.query;
         let max_bytes = params.max_bytes.unwrap_or(20_000);
         let report = blocking(move || index.context(&query, 8, 1, max_bytes)).await?;
@@ -300,8 +318,9 @@ impl OxcodeServer {
     async fn oxcode_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path).await?;
+        let index = self.index_for(params.path, &peer).await?;
         let query = params.query;
         let limit = params.limit.unwrap_or(30);
         let kinds = parse_kinds(params.kinds.as_deref());
@@ -313,16 +332,18 @@ impl OxcodeServer {
     async fn oxcode_callers(
         &self,
         Parameters(params): Parameters<CallParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_graph(params, GraphDirection::Incoming).await
+        self.call_graph(params, GraphDirection::Incoming, &peer).await
     }
 
     #[tool(description = "Find the functions called by the given symbol (outgoing call graph).")]
     async fn oxcode_callees(
         &self,
         Parameters(params): Parameters<CallParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.call_graph(params, GraphDirection::Outgoing).await
+        self.call_graph(params, GraphDirection::Outgoing, &peer).await
     }
 
     #[tool(
@@ -331,8 +352,9 @@ impl OxcodeServer {
     async fn oxcode_symbol(
         &self,
         Parameters(params): Parameters<SymbolParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path).await?;
+        let index = self.index_for(params.path, &peer).await?;
         let selector = params.selector;
         let value = blocking(move || resolve_symbol(&index, &selector)).await?;
         json_result(&value)
@@ -342,8 +364,9 @@ impl OxcodeServer {
     async fn oxcode_files(
         &self,
         Parameters(params): Parameters<FilesParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path).await?;
+        let index = self.index_for(params.path, &peer).await?;
         let query = params.query;
         let limit = params.limit.unwrap_or(30);
         let report = blocking(move || index.search_files(&query, limit)).await?;
@@ -356,8 +379,9 @@ impl OxcodeServer {
     async fn oxcode_status(
         &self,
         Parameters(params): Parameters<StatusParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let root = resolve_root(params.path);
+        let root = self.resolve_root(params.path, &peer).await?;
         let (role, watching, reindexes) = self.watch_state(&root);
         let status_root = root.clone();
         let database = blocking(move || oxcode_core::project_status(&status_root)).await?;
@@ -373,8 +397,9 @@ impl OxcodeServer {
         &self,
         params: CallParams,
         direction: GraphDirection,
+        peer: &Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let index = self.index_for(params.path).await?;
+        let index = self.index_for(params.path, peer).await?;
         let selector = params.selector;
         let depth = params.depth.unwrap_or(2);
         let limit = params.limit.unwrap_or(50);
@@ -382,12 +407,16 @@ impl OxcodeServer {
         json_result(&report)
     }
 
-    /// Opens the index for `path` (default cwd). If this process is the writer for
-    /// the root, the opened reader is cached and evicted on each reindex; any other
-    /// process opens fresh per query so it reflects the writer's latest commit. A
-    /// missing index is not built here — call `oxcode_watch` first.
-    async fn index_for(&self, path: Option<String>) -> Result<Arc<ProjectIndex>, McpError> {
-        let root = resolve_root(path);
+    /// Opens the index for `path` (default: workspace root). If this process is the
+    /// writer for the root, the opened reader is cached and evicted on each reindex;
+    /// any other process opens fresh per query so it reflects the writer's latest
+    /// commit. A missing index is not built here — call `oxcode_watch` first.
+    async fn index_for(
+        &self,
+        path: Option<String>,
+        peer: &Peer<RoleServer>,
+    ) -> Result<Arc<ProjectIndex>, McpError> {
+        let root = self.resolve_root(path, peer).await?;
         if self.is_writer(&root) {
             if let Some(index) = self.indexes.lock().await.get(&root) {
                 return Ok(Arc::clone(index));
@@ -562,6 +591,83 @@ impl OxcodeServer {
         }
         ("reader", false, 0)
     }
+
+    /// Resolves the project root from an optional `path`, preferring workspace
+    /// signals over this process's cwd. MCP hosts often start servers with
+    /// `cwd=$HOME` even when the agent is in a project folder; omitting `path`
+    /// must not silently index the home directory.
+    async fn resolve_root(
+        &self,
+        path: Option<String>,
+        peer: &Peer<RoleServer>,
+    ) -> Result<PathBuf, McpError> {
+        let explicit = path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let raw = if let Some(explicit_path) = explicit.clone() {
+            explicit_path
+        } else if let Some(from_env) = env_project_root() {
+            from_env
+        } else if let Some(from_roots) = self.workspace_root_from_client(peer).await {
+            from_roots
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
+        let root = canonicalize_root(raw);
+        if explicit.is_none() && is_home_directory(&root) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "refusing to use home directory {} as the project root — MCP hosts often \
+                     start this server with cwd=$HOME even when your workspace is elsewhere. \
+                     Pass `path` (the project folder), or set OXCODE_ROOT / CLAUDE_PROJECT_DIR \
+                     / WORKSPACE_FOLDER_PATHS.",
+                    root.display()
+                ),
+                None,
+            ));
+        }
+        Ok(root)
+    }
+
+    /// First client MCP root, refreshing the cache via `roots/list` when needed.
+    async fn workspace_root_from_client(&self, peer: &Peer<RoleServer>) -> Option<PathBuf> {
+        {
+            let cache = self
+                .client_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(roots) = cache.as_ref() {
+                return roots.first().cloned();
+            }
+        }
+        peer.peer_info()
+            .and_then(|info| info.capabilities.roots.as_ref())?;
+        let roots = match peer.list_roots().await {
+            Ok(result) => result
+                .roots
+                .iter()
+                .filter_map(|root| file_uri_to_path(&root.uri))
+                .collect::<Vec<_>>(),
+            Err(_) => return None,
+        };
+        let first = roots.first().cloned();
+        *self
+            .client_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(roots);
+        first
+    }
+
+    /// Refreshes the cached client MCP roots after `notifications/roots/list_changed`.
+    async fn refresh_client_roots(&self, peer: &Peer<RoleServer>) {
+        *self
+            .client_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = self.workspace_root_from_client(peer).await;
+    }
 }
 
 /// Re-indexes `root` on each debounced change tick until the watcher stops.
@@ -671,15 +777,113 @@ impl ServerHandler for OxcodeServer {
         )
         .with_instructions(INSTRUCTIONS)
     }
+
+    async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
+        self.refresh_client_roots(&context.peer).await;
+    }
 }
 
-/// Resolves the project root from an optional path argument, canonicalizing
-/// best-effort so the reader cache, the writer registry, and the lock file all key
-/// on the same absolute path (FS events report canonical paths). Falls back to the
+/// Project root from host-injected environment variables, in priority order.
+///
+/// MCP hosts frequently leave the server process cwd at `$HOME` while advertising
+/// the real workspace via these variables (Claude Code → `CLAUDE_PROJECT_DIR`,
+/// Cursor → `WORKSPACE_FOLDER_PATHS`). `OXCODE_ROOT` is the explicit override.
+fn env_project_root() -> Option<PathBuf> {
+    for key in ["OXCODE_ROOT", "CLAUDE_PROJECT_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+    std::env::var("WORKSPACE_FOLDER_PATHS")
+        .ok()
+        .and_then(|value| first_workspace_folder(&value))
+}
+
+/// First folder from a `WORKSPACE_FOLDER_PATHS` value (single path or CSV).
+fn first_workspace_folder(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let as_path = PathBuf::from(trimmed);
+    if as_path.is_dir() {
+        return Some(as_path);
+    }
+    // Multi-root workspaces: comma-separated. Do not split on `:` — that breaks
+    // Windows drive letters (`C:\...`).
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Whether `path` is the current user's home directory (best-effort).
+fn is_home_directory(path: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return false;
+    };
+    let home = PathBuf::from(home);
+    canonicalize_root(path.to_path_buf()) == canonicalize_root(home)
+}
+
+/// Canonicalizes best-effort so reader cache / writer registry / lock file key on
+/// the same absolute path (FS events report canonical paths). Falls back to the
 /// raw path when it does not exist yet.
-fn resolve_root(path: Option<String>) -> PathBuf {
-    let raw = PathBuf::from(path.unwrap_or_else(|| ".".to_owned()));
-    std::fs::canonicalize(&raw).unwrap_or(raw)
+fn canonicalize_root(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Converts a `file://` MCP root URI into a filesystem path.
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = if let Some(path) = rest.strip_prefix("localhost") {
+        path
+    } else if rest.starts_with('/') {
+        rest
+    } else {
+        return None;
+    };
+    let decoded = percent_decode(path);
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(decoded))
+}
+
+/// Decodes `%XX` sequences in a URI path; returns the input unchanged when none.
+fn percent_decode(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_owned();
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+        {
+            out.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Parses caller-supplied kind strings into `NodeKind`, dropping unknown ones.
@@ -732,22 +936,109 @@ mod tests {
 
     use std::time::Duration;
 
+    use std::sync::{Mutex, MutexGuard};
+
     use rmcp::{
         ClientHandler, RoleClient,
         model::{
-            CallToolRequestParams, ClientRequest, GetTaskInfoParams, GetTaskResultParams, Request,
+            CallToolRequestParams, ClientCapabilities, ClientInfo, ClientRequest,
+            GetTaskInfoParams, GetTaskResultParams, Implementation, ListRootsResult, Request, Root,
             ServerResult, TaskStatus, TaskSupport,
         },
-        service::RunningService,
+        service::{RequestContext, RunningService},
     };
 
     use super::*;
+
+    /// Serializes tests that mutate process-global project-root env vars.
+    static PROJECT_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Env keys consulted by [`env_project_root`], for save/restore around tests.
+    const PROJECT_ROOT_ENV_KEYS: &[&str] =
+        &["OXCODE_ROOT", "CLAUDE_PROJECT_DIR", "WORKSPACE_FOLDER_PATHS"];
+
+    /// Clears project-root env vars for the duration of a test; restores on drop.
+    struct ProjectRootEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ProjectRootEnvGuard {
+        fn clear() -> Self {
+            let lock = PROJECT_ROOT_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = PROJECT_ROOT_ENV_KEYS
+                .iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            // SAFETY: held exclusively via PROJECT_ROOT_ENV_LOCK for this process.
+            unsafe {
+                for key in PROJECT_ROOT_ENV_KEYS {
+                    std::env::remove_var(key);
+                }
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+
+        fn set(&self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+            // SAFETY: guard holds PROJECT_ROOT_ENV_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    impl Drop for ProjectRootEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: guard still holds PROJECT_ROOT_ENV_LOCK until drop completes.
+            unsafe {
+                for (key, value) in self.previous.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     /// Minimal MCP client; the server is what these tests exercise.
     #[derive(Clone, Default)]
     struct TestClient;
 
     impl ClientHandler for TestClient {}
+
+    /// MCP client that advertises workspace roots (Cursor / Claude Code do this).
+    #[derive(Clone)]
+    struct RootsClient {
+        roots: Vec<PathBuf>,
+    }
+
+    impl ClientHandler for RootsClient {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::new(
+                ClientCapabilities::builder().enable_roots().build(),
+                Implementation::from_build_env(),
+            )
+        }
+
+        fn list_roots(
+            &self,
+            _context: RequestContext<RoleClient>,
+        ) -> impl std::future::Future<Output = Result<ListRootsResult, McpError>> + Send + '_
+        {
+            let roots = self
+                .roots
+                .iter()
+                .map(|path| Root::new(format!("file://{}", path.display())))
+                .collect();
+            std::future::ready(Ok(ListRootsResult::new(roots)))
+        }
+    }
 
     /// Wires a fresh `OxcodeServer` (with the given intervals) to a `TestClient`
     /// over an in-memory duplex pipe and returns the connected client service.
@@ -866,6 +1157,106 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         status
+    }
+
+    #[test]
+    fn env_project_root_prefers_oxcode_root() {
+        let project = tempfile::TempDir::new().expect("temp");
+        let guard = ProjectRootEnvGuard::clear();
+        guard.set("OXCODE_ROOT", project.path());
+        let resolved = env_project_root().expect("OXCODE_ROOT");
+        assert_eq!(
+            canonicalize_root(resolved),
+            canonicalize_root(project.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn first_workspace_folder_accepts_csv_and_single_path() {
+        let project = tempfile::TempDir::new().expect("temp");
+        let path = project.path().to_string_lossy().into_owned();
+        assert_eq!(
+            first_workspace_folder(&path),
+            Some(PathBuf::from(&path)),
+            "existing single path wins without splitting"
+        );
+        assert_eq!(
+            first_workspace_folder(&format!("{path},/does/not/exist")),
+            Some(PathBuf::from(&path))
+        );
+        assert_eq!(
+            first_workspace_folder("/missing/a,/missing/b"),
+            Some(PathBuf::from("/missing/a"))
+        );
+    }
+
+    #[test]
+    fn file_uri_to_path_decodes_file_roots() {
+        assert_eq!(
+            file_uri_to_path("file:///Users/snowmead/opt/jinttai"),
+            Some(PathBuf::from("/Users/snowmead/opt/jinttai"))
+        );
+        assert_eq!(
+            file_uri_to_path("file://localhost/tmp/project%20name"),
+            Some(PathBuf::from("/tmp/project name"))
+        );
+        assert_eq!(file_uri_to_path("https://example.com"), None);
+    }
+
+    #[test]
+    fn is_home_directory_matches_home_env() {
+        let home = tempfile::TempDir::new().expect("home");
+        // Reuse the project-root env lock so HOME mutations never race other tests.
+        let _guard = ProjectRootEnvGuard::clear();
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: PROJECT_ROOT_ENV_LOCK is held via `_guard`.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        assert!(is_home_directory(home.path()));
+        assert!(!is_home_directory(&home.path().join("opt/jinttai")));
+        // SAFETY: restore HOME before `_guard` drops and releases the lock.
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_path_uses_client_mcp_roots_not_process_cwd() {
+        let _env = ProjectRootEnvGuard::clear();
+        let project = rust_project();
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server =
+                OxcodeServer::new_with(Duration::from_millis(50), Duration::from_millis(150))
+                    .serve(server_transport)
+                    .await
+                    .expect("server serve");
+            let _ = server.waiting().await;
+        });
+        let client = RootsClient {
+            roots: vec![project.path().to_path_buf()],
+        }
+        .serve(client_transport)
+        .await
+        .expect("client connect");
+
+        // No `path` argument: must resolve via roots/list to the project, not cwd.
+        let result = client
+            .call_tool(tool_call("oxcode_watch", serde_json::json!({})))
+            .await
+            .expect("watch without path");
+        let body: serde_json::Value =
+            serde_json::from_str(result_text(&result)).expect("watch json");
+        assert_eq!(body["role"], "writer");
+        assert_eq!(
+            canonicalize_root(PathBuf::from(body["root"].as_str().expect("root"))),
+            canonicalize_root(project.path().to_path_buf()),
+            "omitted path must use the client's MCP root, not the server process cwd"
+        );
     }
 
     /// `flock` is per open-file-description on macOS/Linux: a second independent
