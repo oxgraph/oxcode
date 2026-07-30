@@ -60,9 +60,12 @@ Add the server to your agent. For Claude Code (`~/.claude.json`):
 ```
 
 Once wired, have the agent call `oxcode_watch` once: it builds the index and
-keeps it current as files change. Across multiple agents on one repo a file lock
-elects a single writer (the one watcher/re-indexer) while the rest serve reads, so
-you can run as many as you like. Then ask questions with `oxcode_explore`.
+keeps it current as files change. When `path` is omitted, the project root comes
+from `OXCODE_ROOT`, the client's MCP roots, `CLAUDE_PROJECT_DIR`, or
+`WORKSPACE_FOLDER_PATHS` — not from the MCP process cwd (hosts often start servers in
+`$HOME`). Across multiple agents on one repo a file lock elects a single writer
+(the one watcher/re-indexer) while the rest serve reads, so you can run as many
+as you like. Then ask questions with `oxcode_explore`.
 
 Optionally auto-allow the tools in `~/.claude/settings.json` (the query tools are
 read-only; `oxcode_watch` only builds/maintains the local index):
