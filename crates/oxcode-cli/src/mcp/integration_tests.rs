@@ -6,10 +6,7 @@
 //! and the task lifecycle. The cross-process guarantee is proven separately by
 //! `tests/multiprocess.rs` (real spawned processes).
 
-use std::{
-    sync::{Mutex, MutexGuard},
-    time::Duration,
-};
+use std::{sync::MutexGuard, time::Duration};
 
 use rmcp::{
     ClientHandler, RoleClient,
@@ -22,12 +19,9 @@ use rmcp::{
 };
 
 use super::{
-    project_root::{canonicalize_root, oxcode_root_override},
+    project_root::{PROJECT_ROOT_ENV_LOCK, canonicalize_root, oxcode_root_override},
     *,
 };
-
-/// Serializes tests that mutate process-global project-root env vars.
-static PROJECT_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Env keys consulted for omitted-`path` defaults, for save/restore around tests.
 const PROJECT_ROOT_ENV_KEYS: &[&str] = &[

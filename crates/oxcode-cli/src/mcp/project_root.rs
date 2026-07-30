@@ -199,9 +199,13 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+/// Serializes tests that mutate project-root / HOME env vars.
+#[cfg(test)]
+pub(crate) static PROJECT_ROOT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
-    // SAFETY: caller restores test-local env mutations.
+    // SAFETY: caller holds [`PROJECT_ROOT_ENV_LOCK`].
     unsafe {
         match previous {
             Some(value) => std::env::set_var(key, value),
@@ -235,12 +239,15 @@ mod tests {
 
     #[test]
     fn resolve_project_root_prefers_mcp_roots_over_host_env() {
+        let _lock = PROJECT_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let host = tempfile::TempDir::new().expect("host");
         let live = tempfile::TempDir::new().expect("live");
         let previous_claude = std::env::var_os("CLAUDE_PROJECT_DIR");
         let previous_oxcode = std::env::var_os("OXCODE_ROOT");
         let previous_workspace = std::env::var_os("WORKSPACE_FOLDER_PATHS");
-        // SAFETY: test-local env mutation; restored before return.
+        // SAFETY: held exclusively via PROJECT_ROOT_ENV_LOCK.
         unsafe {
             std::env::set_var("CLAUDE_PROJECT_DIR", host.path());
             std::env::remove_var("OXCODE_ROOT");
@@ -272,10 +279,13 @@ mod tests {
 
     #[test]
     fn resolve_project_root_oxcode_root_pins_over_mcp_roots() {
+        let _lock = PROJECT_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pin = tempfile::TempDir::new().expect("pin");
         let live = tempfile::TempDir::new().expect("live");
         let previous = std::env::var_os("OXCODE_ROOT");
-        // SAFETY: test-local env mutation; restored before return.
+        // SAFETY: held exclusively via PROJECT_ROOT_ENV_LOCK.
         unsafe {
             std::env::set_var("OXCODE_ROOT", pin.path());
         }
@@ -308,20 +318,17 @@ mod tests {
 
     #[test]
     fn is_home_directory_matches_home_env() {
+        let _lock = PROJECT_ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::TempDir::new().expect("home");
         let previous_home = std::env::var_os("HOME");
-        // SAFETY: test-local HOME mutation; restored before return.
+        // SAFETY: held exclusively via PROJECT_ROOT_ENV_LOCK.
         unsafe {
             std::env::set_var("HOME", home.path());
         }
         assert!(is_home_directory(home.path()));
         assert!(!is_home_directory(&home.path().join("opt/jinttai")));
-        // SAFETY: restore prior HOME.
-        unsafe {
-            match previous_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        restore_env("HOME", previous_home);
     }
 }
