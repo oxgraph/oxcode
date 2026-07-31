@@ -46,7 +46,7 @@ per update).
 
    # Or with cargo
    cargo binstall oxcode-cli   # prebuilt, no compile
-   cargo install  oxcode-cli   # build from source
+   cargo install --force oxcode-cli   # build from source
    ```
 
 That's it — point the agent at your project, have it call `oxcode_watch`, then ask
