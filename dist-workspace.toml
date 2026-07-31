@@ -22,3 +22,7 @@ targets = [
 publish-jobs = ["./publish-crates", "./publish-npm"]
 # Only run the cheap "plan" check on PRs; full builds on tags.
 pr-run-mode = "plan"
+
+# Pin GitHub Actions used in the generated release.yml (matches ci/publish workflows).
+[dist.github-action-commits]
+"actions/checkout" = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0" # v7.0.0
