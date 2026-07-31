@@ -27,15 +27,11 @@ use oxcode_core::{GraphDirection, IndexStats, NodeKind, ProjectIndex};
 use project_root::{OptionalProjectRoot, resolve_project_root};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
-    handler::server::{
-        router::tool::ToolRouter,
-        tool::ToolCallContext,
-        wrapper::Parameters,
-    },
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
-        ContentBlock, CreateTaskResult, GetTaskParams, GetTaskResult, ServerCapabilities,
-        ServerInfo, UpdateTaskParams,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
+        CreateTaskResult, GetTaskParams, GetTaskResult, ServerCapabilities, ServerInfo,
+        UpdateTaskParams,
     },
     schemars,
     service::RequestContext,
@@ -581,9 +577,8 @@ impl OxcodeServer {
 
     fn spawn_watch_task(&self, params: WatchParams) -> rmcp::model::Task {
         let this = self.clone();
-        self.tasks.spawn(
-            TaskOptions::new().with_poll_interval_ms(100),
-            move |ctx| {
+        self.tasks
+            .spawn(TaskOptions::new().with_poll_interval_ms(100), move |ctx| {
                 Box::pin(async move {
                     tokio::select! {
                         _ = ctx.cancelled() => Err(TaskExit::Cancelled),
@@ -593,15 +588,13 @@ impl OxcodeServer {
                         },
                     }
                 })
-            },
-        )
+            })
     }
 
     fn spawn_explore_task(&self, params: ExploreParams) -> rmcp::model::Task {
         let this = self.clone();
-        self.tasks.spawn(
-            TaskOptions::new().with_poll_interval_ms(100),
-            move |ctx| {
+        self.tasks
+            .spawn(TaskOptions::new().with_poll_interval_ms(100), move |ctx| {
                 Box::pin(async move {
                     tokio::select! {
                         _ = ctx.cancelled() => Err(TaskExit::Cancelled),
@@ -611,8 +604,7 @@ impl OxcodeServer {
                         },
                     }
                 })
-            },
-        )
+            })
     }
 }
 

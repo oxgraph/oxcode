@@ -147,9 +147,8 @@ fn rust_project() -> tempfile::TempDir {
 
 /// Builds a tool-call params object for `name` with JSON `arguments`.
 fn tool_call(name: &'static str, arguments: serde_json::Value) -> CallToolRequestParams {
-    CallToolRequestParams::new(name).with_arguments(
-        serde_json::from_value(arguments).expect("tool arguments object"),
-    )
+    CallToolRequestParams::new(name)
+        .with_arguments(serde_json::from_value(arguments).expect("tool arguments object"))
 }
 
 /// Extracts the single text content block from a tool result.
