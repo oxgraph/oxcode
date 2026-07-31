@@ -32,12 +32,14 @@ page. **With Cargo** instead:
 
 ```sh
 cargo binstall oxcode-cli   # prebuilt, no compile
-cargo install  oxcode-cli   # build from source
+cargo install --force oxcode-cli   # build from source
 ```
 
 This installs one `oxcode` binary — the CLI plus the MCP server (`oxcode mcp`).
 (The crate is `oxcode-cli` because the bare `oxcode` name is taken on crates.io;
-the command is still `oxcode`.)
+the command is still `oxcode`.) Re-run the installer (or `cargo install --force
+oxcode-cli`) to replace an existing install; `oxcode mcp` also self-updates on
+startup once you are on v0.1.2+.
 
 ### 2. Index a project
 
@@ -61,7 +63,7 @@ Add the server to your agent. For Claude Code (`~/.claude.json`):
 
 Once wired, have the agent call `oxcode_watch` once: it builds the index and
 keeps it current as files change. When `path` is omitted, the project root comes
-from `OXCODE_ROOT`, the client's MCP roots, `CLAUDE_PROJECT_DIR`, or
+from `OXCODE_ROOT`, `CLAUDE_PROJECT_DIR`, or
 `WORKSPACE_FOLDER_PATHS` — not from the MCP process cwd (hosts often start servers in
 `$HOME`). Across multiple agents on one repo a file lock elects a single writer
 (the one watcher/re-indexer) while the rest serve reads, so you can run as many

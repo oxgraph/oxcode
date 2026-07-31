@@ -16,7 +16,7 @@ server can be listed in the
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/oxgraph/oxcode/releases/latest/download/oxcode-cli-installer.sh | sh
 # or
 cargo binstall oxcode-cli   # prebuilt, no compile
-cargo install  oxcode-cli   # from source
+cargo install --force oxcode-cli   # from source
 ```
 
 (The crate is `oxcode-cli`; the command is `oxcode`.)

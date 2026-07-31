@@ -7,7 +7,6 @@
 //! process that watches and re-indexes); the rest serve reads.
 
 mod project_root;
-mod roots;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -28,16 +27,18 @@ use oxcode_core::{GraphDirection, IndexStats, NodeKind, ProjectIndex};
 use project_root::{OptionalProjectRoot, resolve_project_root};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, TasksCapability},
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
+        CreateTaskResult, GetTaskParams, GetTaskResult, ServerCapabilities, ServerInfo,
+        UpdateTaskParams,
+    },
     schemars,
-    service::NotificationContext,
-    task_handler,
-    task_manager::OperationProcessor,
+    service::RequestContext,
+    task_manager::{TaskExit, TaskManager, TaskOptions},
     tool, tool_handler, tool_router,
     transport::stdio,
 };
-use roots::{RootsCache, RootsWait};
 use serde::Deserialize;
 use tokio::sync::{
     Mutex,
@@ -80,8 +81,8 @@ pub(crate) fn serve() -> anyhow::Result<()> {
 const INSTRUCTIONS: &str = "This server answers questions about the code repository in the current \
 project. First call `oxcode_watch` (optional `path`): it builds the index if needed and keeps it \
 current as files change. When `path` is omitted, the project root is taken from OXCODE_ROOT, \
-the client's MCP roots, CLAUDE_PROJECT_DIR, or WORKSPACE_FOLDER_PATHS — not from this process's \
-cwd, which MCP hosts often set to $HOME. Pass `path` explicitly when in doubt. Only one MCP \
+CLAUDE_PROJECT_DIR, or WORKSPACE_FOLDER_PATHS — not from this process's cwd, which MCP hosts \
+often set to $HOME. Pass `path` explicitly when in doubt. Only one MCP \
 instance watches a given folder at a time — a file lock elects a single writer; other instances \
 serve reads and take over automatically if the writer exits. Then, for almost any \
 code-understanding question, call `oxcode_explore` first with the user's question verbatim: it \
@@ -95,25 +96,19 @@ not edit source files.";
 
 /// MCP server over oxcode's read-only queries plus the `oxcode_watch` file
 /// watcher. Caches one opened index per root it writes, elects a single writer
-/// per root via a file lock, and drives task-augmented calls through an
-/// [`OperationProcessor`].
+/// per root via a file lock, and materializes task-eligible tool calls through
+/// a [`TaskManager`].
 #[derive(Clone)]
 pub(crate) struct OxcodeServer {
-    #[expect(
-        dead_code,
-        reason = "stored per rmcp's #[tool_router] convention; the #[tool_handler]-generated request router reads it through macro-expanded code the dead-code pass does not attribute"
-    )]
     tool_router: ToolRouter<OxcodeServer>,
     /// Opened readers cached per root this process writes (evicted on reindex).
     indexes: Arc<Mutex<HashMap<PathBuf, Arc<ProjectIndex>>>>,
-    /// Backs the rmcp `#[task_handler]` lifecycle for task-augmented tool calls.
-    operations: Arc<Mutex<OperationProcessor>>,
+    /// Backs the MCP Tasks extension for task-eligible tool calls.
+    tasks: TaskManager,
     /// Roots this process is the elected writer for (holds the lock + watcher).
     writers: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<WriterState>>>>,
     /// Roots this process is a standby for (lost the lock; a failover task polls).
     standbys: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
-    /// Client MCP workspace roots (fetched outside tool handlers).
-    roots: RootsCache,
     /// File-watcher debounce window.
     debounce: Duration,
     /// Failover poll interval for standbys.
@@ -224,18 +219,16 @@ impl OxcodeServer {
         Self {
             tool_router: Self::tool_router(),
             indexes: Arc::new(Mutex::new(HashMap::new())),
-            operations: Arc::new(Mutex::new(OperationProcessor::new())),
+            tasks: TaskManager::new(),
             writers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             standbys: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            roots: RootsCache::new(),
             debounce,
             poll,
         }
     }
 
     #[tool(
-        description = "Start (or join) watching a project so its index is built and kept current as files change. Exactly one MCP instance per folder becomes the writer (it holds a file lock and re-indexes on changes); other instances become readers that just serve queries and automatically take over if the writer exits. Call this once before querying. Optional `path` defaults to the workspace (OXCODE_ROOT / MCP roots / CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS); never silently to $HOME.",
-        execution(task_support = "optional")
+        description = "Start (or join) watching a project so its index is built and kept current as files change. Exactly one MCP instance per folder becomes the writer (it holds a file lock and re-indexes on changes); other instances become readers that just serve queries and automatically take over if the writer exits. Call this once before querying. Optional `path` defaults to the workspace (OXCODE_ROOT / CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS); never silently to $HOME."
     )]
     async fn oxcode_watch(
         &self,
@@ -292,8 +285,7 @@ impl OxcodeServer {
     }
 
     #[tool(
-        description = "Answer a code question in one call: returns the most relevant symbols ranked by graph centrality, their source, relationships, n-ary hyperedges (trait impl groups and container membership, ranked by hypergraph PageRank for architecture-altitude questions), blast radius, and call flow for the query. Use this first for any code-understanding question.",
-        execution(task_support = "optional")
+        description = "Answer a code question in one call: returns the most relevant symbols ranked by graph centrality, their source, relationships, n-ary hyperedges (trait impl groups and container membership, ranked by hypergraph PageRank for architecture-altitude questions), blast radius, and call flow for the query. Use this first for any code-understanding question."
     )]
     async fn oxcode_explore(
         &self,
@@ -579,30 +571,40 @@ impl OxcodeServer {
     /// signals over this process's cwd. MCP hosts often start servers with
     /// `cwd=$HOME` even when the agent is in a project folder; omitting `path`
     /// must not silently index the home directory.
-    ///
-    /// Never calls `roots/list` here — nested client requests during tool handling
-    /// can hang on some hosts. Roots are fetched from `on_initialized` /
-    /// `on_roots_list_changed` only; this waits briefly for that in-flight fetch
-    /// when the cache is still cold.
     async fn resolve_root(&self, path: Option<String>) -> Result<PathBuf, McpError> {
-        // Explicit path / OXCODE_ROOT pin win without waiting on MCP roots.
-        // Host env snapshots (CLAUDE_PROJECT_DIR / WORKSPACE_FOLDER_PATHS) do
-        // not — they are fixed at process start and must lose to a refreshed
-        // roots cache after a folder switch.
-        if path
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-            || project_root::oxcode_root_override().is_some()
-        {
-            return resolve_project_root(path, None, true);
-        }
-        match self.roots.wait_ready().await {
-            RootsWait::Ready(mcp_root) => resolve_project_root(path, mcp_root, true),
-            // Refresh timed out: do not fall through to sticky host env, which
-            // can be older than the MCP root being replaced.
-            RootsWait::RefreshInFlight => resolve_project_root(path, None, false),
-        }
+        resolve_project_root(path)
+    }
+
+    fn spawn_watch_task(&self, params: WatchParams) -> rmcp::model::Task {
+        let this = self.clone();
+        self.tasks
+            .spawn(TaskOptions::new().with_poll_interval_ms(100), move |ctx| {
+                Box::pin(async move {
+                    tokio::select! {
+                        _ = ctx.cancelled() => Err(TaskExit::Cancelled),
+                        result = this.oxcode_watch(Parameters(params)) => match result {
+                            Ok(result) => Ok(result),
+                            Err(error) => Err(TaskExit::Error(error)),
+                        },
+                    }
+                })
+            })
+    }
+
+    fn spawn_explore_task(&self, params: ExploreParams) -> rmcp::model::Task {
+        let this = self.clone();
+        self.tasks
+            .spawn(TaskOptions::new().with_poll_interval_ms(100), move |ctx| {
+                Box::pin(async move {
+                    tokio::select! {
+                        _ = ctx.cancelled() => Err(TaskExit::Cancelled),
+                        result = this.oxcode_explore(Parameters(params)) => match result {
+                            Ok(result) => Ok(result),
+                            Err(error) => Err(TaskExit::Error(error)),
+                        },
+                    }
+                })
+            })
     }
 }
 
@@ -702,24 +704,75 @@ fn watch_body(
 }
 
 #[tool_handler]
-#[task_handler(processor = self.operations)]
 impl ServerHandler for OxcodeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
-                .enable_tasks_with(TasksCapability::server_default())
+                .enable_tasks()
                 .build(),
         )
         .with_instructions(INSTRUCTIONS)
     }
 
-    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        self.roots.fetch(&context.peer).await;
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let client_supports_tasks = context
+            .client_capabilities()
+            .is_some_and(|caps| caps.supports_tasks());
+        let task_tool = matches!(request.name.as_ref(), "oxcode_watch" | "oxcode_explore");
+
+        if client_supports_tasks && task_tool {
+            let task = match request.name.as_ref() {
+                "oxcode_watch" => {
+                    let params: WatchParams = serde_json::from_value(serde_json::Value::Object(
+                        request.arguments.clone().unwrap_or_default(),
+                    ))
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                    self.spawn_watch_task(params)
+                }
+                "oxcode_explore" => {
+                    let params: ExploreParams = serde_json::from_value(serde_json::Value::Object(
+                        request.arguments.clone().unwrap_or_default(),
+                    ))
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+                    self.spawn_explore_task(params)
+                }
+                _ => unreachable!("task_tool guard covers only oxcode_watch and oxcode_explore"),
+            };
+            return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+        }
+
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 
-    async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
-        self.roots.fetch(&context.peer).await;
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        Ok(GetTaskResult::new(self.tasks.get_task(&request.task_id)?))
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel_task(&request.task_id)
     }
 }
 
@@ -760,7 +813,7 @@ where
 fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string(value)
         .map_err(|error| McpError::internal_error(format!("serialize failed: {error}"), None))?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 #[cfg(test)]

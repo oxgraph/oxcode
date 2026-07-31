@@ -9,13 +9,12 @@
 use std::{sync::MutexGuard, time::Duration};
 
 use rmcp::{
-    ClientHandler, RoleClient,
+    ClientHandler, RoleClient, ServiceExt,
     model::{
-        CallToolRequestParams, ClientCapabilities, ClientInfo, ClientRequest, GetTaskInfoParams,
-        GetTaskResultParams, Implementation, ListRootsResult, Request, Root, ServerResult,
-        TaskStatus, TaskSupport,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientInfo,
+        GetTaskParams, Implementation, ResultType, TaskPayload, TaskStatus,
     },
-    service::{RequestContext, RunningService},
+    service::RunningService,
 };
 
 use super::{
@@ -85,30 +84,16 @@ struct TestClient;
 
 impl ClientHandler for TestClient {}
 
-/// MCP client that advertises workspace roots (Cursor / Claude Code do this).
-#[derive(Clone)]
-struct RootsClient {
-    roots: Vec<PathBuf>,
-}
+/// MCP client that declares the Tasks extension.
+#[derive(Clone, Default)]
+struct TasksClient;
 
-impl ClientHandler for RootsClient {
+impl ClientHandler for TasksClient {
     fn get_info(&self) -> ClientInfo {
         ClientInfo::new(
-            ClientCapabilities::builder().enable_roots().build(),
+            ClientCapabilities::builder().enable_tasks().build(),
             Implementation::from_build_env(),
         )
-    }
-
-    fn list_roots(
-        &self,
-        _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<ListRootsResult, McpError>> + Send + '_ {
-        let roots = self
-            .roots
-            .iter()
-            .map(|path| Root::new(format!("file://{}", path.display())))
-            .collect();
-        std::future::ready(Ok(ListRootsResult::new(roots)))
     }
 }
 
@@ -129,6 +114,25 @@ async fn connect(debounce: Duration, poll: Duration) -> RunningService<RoleClien
         .expect("client connect")
 }
 
+/// Wires a fresh `OxcodeServer` to a tasks-capable client.
+async fn connect_with_tasks(
+    debounce: Duration,
+    poll: Duration,
+) -> RunningService<RoleClient, TasksClient> {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = OxcodeServer::new_with(debounce, poll)
+            .serve(server_transport)
+            .await
+            .expect("server serve");
+        let _ = server.waiting().await;
+    });
+    TasksClient
+        .serve(client_transport)
+        .await
+        .expect("client connect")
+}
+
 /// Writes a minimal two-function Rust project into a fresh temp dir.
 fn rust_project() -> tempfile::TempDir {
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -143,9 +147,8 @@ fn rust_project() -> tempfile::TempDir {
 
 /// Builds a tool-call params object for `name` with JSON `arguments`.
 fn tool_call(name: &'static str, arguments: serde_json::Value) -> CallToolRequestParams {
-    let mut params = CallToolRequestParams::new(name);
-    params.arguments = arguments.as_object().cloned();
-    params
+    CallToolRequestParams::new(name)
+        .with_arguments(serde_json::from_value(arguments).expect("tool arguments object"))
 }
 
 /// Extracts the single text content block from a tool result.
@@ -201,33 +204,6 @@ async fn poll_symbol_indexed(
     false
 }
 
-/// Polls `tasks/get` until the task reaches a terminal status (or times out).
-async fn poll_until_terminal(
-    client: &RunningService<RoleClient, TestClient>,
-    task_id: &str,
-) -> TaskStatus {
-    let mut status = TaskStatus::Working;
-    for _ in 0..200 {
-        let info = client
-            .send_request(ClientRequest::GetTaskInfoRequest(Request::new(
-                GetTaskInfoParams {
-                    meta: None,
-                    task_id: task_id.to_owned(),
-                },
-            )))
-            .await
-            .expect("tasks/get");
-        if let ServerResult::GetTaskResult(result) = info {
-            status = result.task.status;
-        }
-        if status != TaskStatus::Working {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    status
-}
-
 #[test]
 fn oxcode_root_override_wins_over_host_env() {
     let project = tempfile::TempDir::new().expect("temp");
@@ -243,26 +219,12 @@ fn oxcode_root_override_wins_over_host_env() {
 }
 
 #[tokio::test]
-async fn omitted_path_uses_client_mcp_roots_not_process_cwd() {
-    let _env = ProjectRootEnvGuard::clear();
+async fn omitted_path_uses_claude_project_dir() {
     let project = rust_project();
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = OxcodeServer::new_with(Duration::from_millis(50), Duration::from_millis(150))
-            .serve(server_transport)
-            .await
-            .expect("server serve");
-        let _ = server.waiting().await;
-    });
-    let client = RootsClient {
-        roots: vec![project.path().to_path_buf()],
-    }
-    .serve(client_transport)
-    .await
-    .expect("client connect");
+    let guard = ProjectRootEnvGuard::clear();
+    guard.set("CLAUDE_PROJECT_DIR", project.path());
+    let client = connect(Duration::from_millis(50), Duration::from_millis(150)).await;
 
-    // No `path` argument: `on_initialized` already cached roots/list; resolve
-    // must use that workspace root (not process cwd) without nested roots/list.
     let result = client
         .call_tool(tool_call("oxcode_watch", serde_json::json!({})))
         .await
@@ -272,7 +234,7 @@ async fn omitted_path_uses_client_mcp_roots_not_process_cwd() {
     assert_eq!(
         canonicalize_root(PathBuf::from(body["root"].as_str().expect("root"))),
         canonicalize_root(project.path().to_path_buf()),
-        "omitted path must use the client's MCP root, not the server process cwd"
+        "omitted path must use CLAUDE_PROJECT_DIR, not the server process cwd"
     );
 }
 
@@ -303,7 +265,7 @@ fn watch_lock_is_exclusive_per_handle() {
 }
 
 #[tokio::test]
-async fn lists_tools_with_watch_and_explore_task_support() {
+async fn lists_tools_and_server_supports_tasks() {
     let client = connect(DEFAULT_DEBOUNCE, DEFAULT_POLL).await;
     let tools = client.list_all_tools().await.expect("list tools");
 
@@ -312,21 +274,21 @@ async fn lists_tools_with_watch_and_explore_task_support() {
         "oxcode_watch is registered"
     );
     assert!(
+        tools.iter().any(|tool| tool.name == "oxcode_explore"),
+        "oxcode_explore is registered"
+    );
+    assert!(
         tools.iter().all(|tool| tool.name != "oxcode_index"),
         "the old write tool is gone"
     );
 
-    let task_support = |name: &str| {
-        tools
-            .iter()
-            .find(|tool| tool.name == name)
-            .and_then(|tool| tool.execution.as_ref())
-            .and_then(|execution| execution.task_support)
-    };
-    assert_eq!(task_support("oxcode_watch"), Some(TaskSupport::Optional));
-    assert_eq!(task_support("oxcode_explore"), Some(TaskSupport::Optional));
-    assert_eq!(task_support("oxcode_search"), None);
-    assert_eq!(task_support("oxcode_status"), None);
+    let server_info = client
+        .peer_info()
+        .expect("server handshake info after connect");
+    assert!(
+        server_info.capabilities.supports_tasks(),
+        "server advertises the Tasks extension"
+    );
 }
 
 #[tokio::test]
@@ -438,47 +400,45 @@ async fn writer_auto_reindexes_on_change() {
 async fn task_augmented_watch_completes() {
     let project = rust_project();
     let path = project.path().to_string_lossy().into_owned();
-    let client = connect(Duration::from_millis(50), Duration::from_millis(150)).await;
+    let client = connect_with_tasks(Duration::from_millis(50), Duration::from_millis(150)).await;
 
-    // Task-augment the call: typed `call_tool` cannot carry a task field, so
-    // send the request directly and expect an immediate CreateTaskResult.
-    let mut params = tool_call("oxcode_watch", serde_json::json!({ "path": path }));
-    params.task = serde_json::json!({ "ttl": 60_000 }).as_object().cloned();
-    let created = client
-        .send_request(ClientRequest::CallToolRequest(Request::new(params)))
+    let response = client
+        .call_tool_once(tool_call(
+            "oxcode_watch",
+            serde_json::json!({ "path": path }),
+        ))
         .await
         .expect("enqueue task");
-    let task_id = match created {
-        ServerResult::CreateTaskResult(result) => {
-            assert_eq!(result.task.status, TaskStatus::Working);
-            result.task.task_id
-        }
+    let create = match response {
+        CallToolResponse::Task(create) => create,
         other => panic!("expected CreateTaskResult, got {other:?}"),
     };
+    assert_eq!(create.result_type, ResultType::TASK);
+    let task_id = create.task.task_id.clone();
 
-    let status = poll_until_terminal(&client, &task_id).await;
-    assert_eq!(
-        status,
-        TaskStatus::Completed,
-        "watch task ran to completion"
-    );
+    let final_task = loop {
+        tokio::time::sleep(Duration::from_millis(
+            create.task.poll_interval_ms.unwrap_or(100),
+        ))
+        .await;
+        let info = client
+            .peer()
+            .get_task(GetTaskParams::new(task_id.clone()))
+            .await
+            .expect("tasks/get");
+        if info.task.status().is_terminal() {
+            break info.task;
+        }
+    };
+    assert_eq!(final_task.status(), TaskStatus::Completed);
 
-    let payload = client
-        .send_request(ClientRequest::GetTaskResultRequest(Request::new(
-            GetTaskResultParams {
-                meta: None,
-                task_id,
-            },
-        )))
-        .await
-        .expect("tasks/result");
-    let text = match payload {
-        ServerResult::CallToolResult(result) => result_text(&result).to_owned(),
-        ServerResult::GetTaskPayloadResult(payload) => payload.0["content"][0]["text"]
-            .as_str()
-            .expect("tool result text")
-            .to_owned(),
-        other => panic!("expected the deferred tool result, got {other:?}"),
+    let text = match final_task.payload {
+        TaskPayload::Completed { result } => {
+            let result: CallToolResult =
+                serde_json::from_value(serde_json::Value::Object(result)).expect("tool result");
+            result_text(&result).to_owned()
+        }
+        other => panic!("expected completed task, got {other:?}"),
     };
     assert!(
         text.contains("writer"),

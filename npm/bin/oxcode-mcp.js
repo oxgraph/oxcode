@@ -18,7 +18,7 @@ if (result.error && result.error.code === "ENOENT") {
     "oxcode not found on PATH. Install it once (it self-updates after that):\n" +
       "  curl --proto '=https' --tlsv1.2 -LsSf https://github.com/oxgraph/oxcode/releases/latest/download/oxcode-cli-installer.sh | sh\n" +
       "  # or: cargo binstall oxcode-cli   (prebuilt, no compile)\n" +
-      "  # or: cargo install  oxcode-cli   (from source)\n",
+      "  # or: cargo install --force oxcode-cli   (from source)\n",
   );
   process.exit(127);
 }

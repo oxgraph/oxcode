@@ -4,7 +4,7 @@ Index source code into a graph and serve it to coding agents. Built on
 [oxgraph](https://github.com/oxgraph/oxgraph).
 
 ```sh
-cargo install oxcode-cli   # installs the `oxcode` binary
+cargo install --force oxcode-cli   # installs the `oxcode` binary
 oxcode index --path .
 oxcode context "How does X work?" --path .
 oxcode symbols "auth middleware" --path .
