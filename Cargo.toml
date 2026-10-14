@@ -30,7 +30,7 @@ tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
 toml = "1.1.2"
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 
 # The profile that 'dist' will build with
 [profile.dist]
